@@ -1,0 +1,15 @@
+# 行カバレッジ 100% の登録簿 (ippoan/alc-vein-worker の同名のファイルの形。Refs ippoan/rust-alc-api#725)。
+#
+#   bash scripts/fetch-migrations.sh
+#   cargo llvm-cov --locked -p alc-dtako-upload --text > cov.txt
+#   bash scripts/check_coverage_100.sh --use-cache cov.txt
+#
+# 計測するのは `cargo test -p alc-dtako-upload` の全部 = tests/sql_db.rs (テストの中で起こす組み込みの PostgreSQL。
+# docker は要らないが、先に `bash scripts/fetch-migrations.sh` が要る — 無ければテストが落ちる)。
+# 登録したファイルが計測に出ない・実行行が 0 のときも落ちる。
+# repo.rs は SQL の定数だけで実行行が無いので登録しない。lib.rs は口の無い Router だけ (口を足す PR で登録する)。
+# worker 本体 (直下の src/、wasm 専用) は native で計測できないので対象外。
+
+# repo::sql の定数を流す tokio-postgres 実装 (tests/sql_db.rs が組み込みの PostgreSQL で通す。CI は本数を固定して回す)
+[[files]]
+path = "crates/alc-dtako-upload/src/pg.rs"

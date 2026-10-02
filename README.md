@@ -52,7 +52,9 @@ tenant ヘッダー無しが 401・有りが 404 (どのリクエストも、そ
 
 本番のタグは Actions の **Tag Release** (`tag-release.yml`、workflow_dispatch) を手動で打つ。マージで自動のタグは付かない。
 手で `v*` のタグを push しない。応答ヘッダー `x-worker-version` / `x-worker-tag` で、どの版が応えたか分かる
-(`server-timing` は `connect;dur=` = DB への接続に掛かった時間。取り込みの口は、その後ろに段ごとの所要が続く)。Cloudflare の token は org の secret を使う
+(`server-timing` は `connect;dur=` = DB への接続に掛かった時間。取り込みの口は、その後ろに段ごとの所要が続く)。
+**本番でも staging でもログを残す** (`wrangler.toml` の `[observability]`。env に継承されないので両方に書く)。口が出すログは、段の名前・kind・件数だけ
+(識別子も、エラーの生の文も出さない)。500 の本文は固定の語なので、失敗の原因はログで追う。Cloudflare の token は org の secret を使う
 (repo 単位の secret を作らない)。
 
 ## DB への経路 (`src/db.rs` の 1 か所で出し分ける)

@@ -5,6 +5,7 @@
 //! - `GET /internal/download/{upload_id}` → 履歴の zip をそのまま返す
 //! - `POST /upload` → デジタコの zip (multipart の `file` field) を取り込む ([`crate::ingest::ingest_upload`])
 //! - `POST /internal/rerun/{upload_id}` → 既に保存先に在る zip を、もう一度取り込む ([`crate::ingest::rerun_upload`])
+//! - `POST /recalculate?year=&month=` → 月の全員の日別を計算し直す ([`crate::recalc`])。応答は `text/event-stream`
 //! - `POST /split-csv/{upload_id}` → アップロード 1 件を分割する ([`crate::split::split_upload`])
 //! - `POST /split-csv-all` → 未分割の運行が在るテナントの、分割の元にできるアップロードを新しい順に
 //!   最大 [`SPLIT_CSV_ALL_LIMIT`] 件、1 件ずつ分割し直す。応答は `text/event-stream` (1 件ごとに `progress`、終わりに `done`)
@@ -19,7 +20,7 @@ use alc_core_wasm::TenantId;
 use alc_worker_db::PgClient;
 use axum::body::{Body, Bytes};
 use axum::extract::multipart::MultipartRejection;
-use axum::extract::{DefaultBodyLimit, Multipart, Path, State};
+use axum::extract::{DefaultBodyLimit, Multipart, Path, Query, State};
 use axum::http::header::{HeaderName, CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_TYPE};
 use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -34,6 +35,7 @@ use uuid::Uuid;
 
 use crate::ingest::{ingest_upload, rerun_upload, IngestError, IngestLimits, IngestOutcome};
 use crate::pg::{self, PendingUploadRow, UploadRow};
+use crate::recalc::{next_recalc_event, RecalcRun};
 use crate::split::{split_upload, LogLevel, LogSink, SplitError};
 use crate::store::{ObjectStore, Sleeper};
 use crate::timing::{Clock, StageTimer};
@@ -88,6 +90,7 @@ pub fn tenant_router_with(limits: IngestLimits) -> Router<DtakoState> {
         .route("/internal/rerun/{upload_id}", rerun)
         .route("/split-csv/{upload_id}", post(split_csv))
         .route("/split-csv-all", post(split_csv_all))
+        .route("/recalculate", post(recalculate))
 }
 
 type ApiError = (StatusCode, Json<Value>);
@@ -478,6 +481,48 @@ async fn next_split_all_event(mut run: SplitAllRun) -> Option<(String, SplitAllR
     Some((sse_frame(event), run))
 }
 
+/// `POST /recalculate` の query。
+#[derive(serde::Deserialize)]
+struct RecalcQuery {
+    year: i32,
+    month: u32,
+}
+
+/// 応答は `text/event-stream` (一括分割の口と同じ形)。処理は応答の stream の中で 1 歩ずつ進む ([`next_recalc_event`])。
+/// HTTP は 200 で、失敗は stream の中の `error`。
+async fn recalculate(
+    State(state): State<DtakoState>,
+    Extension(TenantId(tenant_id)): Extension<TenantId>,
+    Query(query): Query<RecalcQuery>,
+) -> Response {
+    let run = RecalcRun::new(
+        state.pg.clone(),
+        state.store.clone(),
+        state.log.clone(),
+        tenant_id,
+        query.year,
+        query.month,
+    );
+    let events = stream::unfold(run, |run| async {
+        let (event, run) = next_recalc_event(run).await?;
+        Some((sse_frame(event), run))
+    });
+    event_stream_response(events)
+}
+
+/// `text/event-stream` の応答 (`Cache-Control: no-cache`・`X-Accel-Buffering: no`)。
+fn event_stream_response(
+    events: impl futures_util::Stream<Item = String> + Send + 'static,
+) -> Response {
+    let body = Body::from_stream(stream::StreamExt::map(events, Ok::<_, Infallible>));
+    let headers = [
+        (CONTENT_TYPE, "text/event-stream"),
+        (CACHE_CONTROL, "no-cache"),
+        (HeaderName::from_static("x-accel-buffering"), "no"),
+    ];
+    (headers, body).into_response()
+}
+
 /// 応答は `text/event-stream`。1 件処理するごとに `progress`、終わりに `done` (候補の取得に失敗したら `error`) を出す。
 async fn split_csv_all(
     State(state): State<DtakoState>,
@@ -494,11 +539,5 @@ async fn split_csv_all(
         failed: 0,
     };
     let events = stream::unfold(run, next_split_all_event);
-    let body = Body::from_stream(stream::StreamExt::map(events, Ok::<_, Infallible>));
-    let headers = [
-        (CONTENT_TYPE, "text/event-stream"),
-        (CACHE_CONTROL, "no-cache"),
-        (HeaderName::from_static("x-accel-buffering"), "no"),
-    ];
-    (headers, body).into_response()
+    event_stream_response(events)
 }

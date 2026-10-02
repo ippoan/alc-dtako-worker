@@ -46,6 +46,23 @@ pub mod sql {
     pub const SELECT_UPLOAD_DOWNLOAD: &str =
         "SELECT r2_zip_key, filename FROM alc_api.dtako_upload_history WHERE id = $1 AND tenant_id = $2";
 
+    // ---- 再計算 ----
+
+    /// 月の再計算の対象の運行 (運行日か読取日が範囲に入る行) と、その乗務員CD。$1 tenant_id / $2 月初 / $3 月末の翌日 →
+    /// unko_no, reading_date, operation_date, departure_at, return_at, driver_cd (NULL 可), total_distance,
+    /// drive_time_general, drive_time_highway, drive_time_bypass (読取日・運行NO の順)。
+    pub const LIST_OPERATIONS_FOR_RECALC: &str = r#"SELECT DISTINCT o.unko_no, o.reading_date, o.operation_date,
+                      o.departure_at, o.return_at,
+                      d.driver_cd,
+                      o.total_distance,
+                      o.drive_time_general, o.drive_time_highway, o.drive_time_bypass
+               FROM alc_api.dtako_operations o
+               LEFT JOIN alc_api.employees d ON d.id = o.driver_id AND d.tenant_id = o.tenant_id
+               WHERE o.tenant_id = $1
+                 AND (o.operation_date >= $2 AND o.operation_date <= $3
+                      OR o.reading_date >= $2 AND o.reading_date <= $3)
+               ORDER BY o.reading_date, o.unko_no"#;
+
     // ---- アップロードの取り込み (履歴・営業所と車輌と乗務員の解決・運行の入れ替え・変更記録・分類) ----
 
     /// アップロードの履歴を作る (status は `processing`)。$1 tenant_id / $2 filename → id (DB の既定値)。

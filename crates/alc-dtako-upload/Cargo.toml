@@ -14,7 +14,7 @@ alc-worker-db = { workspace = true }
 alc-compare = { workspace = true }
 # 分割の純粋な部分 (backend と共有)
 alc-csv-parser = { workspace = true }
-axum = { version = "0.8", default-features = false, features = ["json", "multipart"] }
+axum = { version = "0.8", default-features = false, features = ["json", "multipart", "query"] }
 # 運行の日付・日時を DB に渡す型 (`pg`)。alc-csv-parser の `KudguriRow` と同じ版
 chrono = { version = "0.4", default-features = false }
 # `store` の `buffer_unordered` (同時に走らせる PUT の数の上限)・`BoxFuture`、state の async の Mutex

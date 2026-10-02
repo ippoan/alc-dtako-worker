@@ -1661,3 +1661,88 @@ async fn upload_lists_are_newest_first_capped_and_scoped_to_the_tenant() {
     drop(c);
     db.shutdown();
 }
+
+// ---- 再計算 ----
+
+/// 月の再計算の対象の運行: 運行日か読取日が範囲 (月初〜月末の翌日) に入る行・テナントごと・2 人乗務は乗務員ごとに 1 行
+/// (同じ乗務員CD なら 1 行)・読取日と運行NO の順。
+#[tokio::test(flavor = "multi_thread")]
+async fn operations_for_recalc_pick_the_month_by_operation_or_reading_date() {
+    let db = Embedded::start().await;
+    let mut held = db.client(APP_ROLE).await;
+    let c = &mut held.inner;
+    let a = tenant(c, "Dtako Recalc Tenant A").await;
+    let b = tenant(c, "Dtako Recalc Tenant B").await;
+    employee(c, a, None, Some("D-ONE"), "TEST-ONE", false).await;
+    employee(c, a, None, Some("D-TWO"), "TEST-TWO", false).await;
+    employee(c, b, None, Some("D-ONE"), "TEST-OTHER", false).await;
+    let ops = "INSERT INTO dtako_operations (tenant_id, unko_no, crew_role, reading_date, operation_date, departure_at, return_at, \
+               driver_id, total_distance, drive_time_general, drive_time_highway, drive_time_bypass) \
+               SELECT $1, v.unko_no, v.crew_role, v.reading_date::date, v.operation_date::date, \
+               TIMESTAMPTZ '2026-03-02 08:15:00+00', TIMESTAMPTZ '2026-03-02 17:15:00+00', \
+               (SELECT id FROM employees WHERE tenant_id = $1 AND driver_cd = v.driver_cd), 12.5, 100, 20, 3 FROM (VALUES \
+               ('R-IN-OP', 1, '2026-04-05', '2026-03-15', 'D-ONE'), \
+               ('R-IN-READ', 1, '2026-03-01', '2026-02-27', 'D-ONE'), \
+               ('R-EDGE-END', 1, '2026-04-01', NULL, 'D-ONE'), \
+               ('R-OUT', 1, '2026-02-28', '2026-02-27', 'D-ONE'), \
+               ('R-OUT-LATE', 1, '2026-04-02', NULL, 'D-ONE'), \
+               ('R-TWO', 1, '2026-03-10', '2026-03-09', 'D-ONE'), \
+               ('R-TWO', 2, '2026-03-10', '2026-03-09', 'D-TWO'), \
+               ('R-SAME', 1, '2026-03-11', '2026-03-11', NULL), \
+               ('R-SAME', 2, '2026-03-11', '2026-03-11', NULL) \
+               ) v(unko_no, crew_role, reading_date, operation_date, driver_cd)";
+    assert_eq!(exec(c, a, ops).await, 9);
+    let other = "INSERT INTO dtako_operations (tenant_id, unko_no, reading_date, driver_id) \
+                 SELECT $1, 'R-OTHER', DATE '2026-03-10', id FROM employees WHERE tenant_id = $1";
+    assert_eq!(exec(c, b, other).await, 1);
+
+    let (start, end) = (
+        NaiveDate::from_ymd_opt(2026, 3, 1).unwrap(),
+        NaiveDate::from_ymd_opt(2026, 4, 1).unwrap(),
+    );
+    let rows = pg::operations_for_recalc(c, a, start, end).await.unwrap();
+    let got: Vec<(&str, NaiveDate, Option<&str>)> = rows
+        .iter()
+        .map(|r| (r.unko_no.as_str(), r.reading_date, r.driver_cd.as_deref()))
+        .collect();
+    let d = |m, day| NaiveDate::from_ymd_opt(2026, m, day).unwrap();
+    let want = [
+        ("R-IN-READ", d(3, 1), Some("D-ONE")),
+        ("R-TWO", d(3, 10), Some("D-ONE")),
+        ("R-TWO", d(3, 10), Some("D-TWO")),
+        ("R-SAME", d(3, 11), None),
+        ("R-EDGE-END", d(4, 1), Some("D-ONE")),
+        ("R-IN-OP", d(4, 5), Some("D-ONE")),
+    ];
+    assert_eq!(got, want);
+    // 列の中身 (日時は UTC の値のまま)
+    let first = rows[0].clone();
+    let at = |h| Utc.with_ymd_and_hms(2026, 3, 2, h, 15, 0).unwrap();
+    assert_eq!(
+        (first.operation_date, first.departure_at, first.return_at),
+        (Some(d(2, 27)), Some(at(8)), Some(at(17)))
+    );
+    let numbers = (
+        first.total_distance,
+        first.drive_time_general,
+        first.drive_time_highway,
+        first.drive_time_bypass,
+    );
+    assert_eq!(numbers, (Some(12.5), Some(100), Some(20), Some(3)));
+    assert_eq!(format!("{first:?}").len(), format!("{:?}", rows[0]).len());
+    // 別テナントには A の行が出ない
+    let other_rows = pg::operations_for_recalc(c, b, start, end).await.unwrap();
+    let names: Vec<&str> = other_rows.iter().map(|r| r.unko_no.as_str()).collect();
+    assert_eq!(names, ["R-OTHER"]);
+    held.close().await;
+
+    let mut c = db.client(APP_ROLE).await.sever().await;
+    assert!(pg::operations_for_recalc(&mut c, a, start, end)
+        .await
+        .unwrap_err()
+        .is_closed());
+    let saved = pg::save_daily_hours_in_tx(&mut c, a, HashMap::new(), Arc::new(Vec::new())).await;
+    assert!(saved.unwrap_err().is_closed());
+    drop(c);
+    db.shutdown();
+}

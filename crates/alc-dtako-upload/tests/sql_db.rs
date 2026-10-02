@@ -22,15 +22,20 @@
 #[allow(dead_code)]
 mod embedded;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
+use alc_compare::upload_daily::{compute_daily_hours, DailyHours, DailySegment};
+use alc_compare::DayKey;
 use alc_csv_parser::kudgivt::KudgivtRow;
 use alc_csv_parser::kudguri::KudguriRow;
 use alc_csv_parser::operation_changes::OperationMinutes;
 use alc_csv_parser::work_segments::EventClass;
-use alc_dtako_upload::pg::{self, CreateUploadError, OperationInput, PreparedRow};
+use alc_dtako_upload::pg::{
+    self, ApplyUploadError, CreateUploadError, OperationInput, PreparedRow,
+};
 use alc_worker_db::PgClient;
-use chrono::NaiveDate;
+use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
 use embedded::{
     employee, exec, kudgivt_flags, operation, operations, rows_json, tenant, upload, Embedded,
     APP_ROLE, TABLES,
@@ -212,6 +217,8 @@ async fn connection_without_tenant_reads_no_rows() {
         "INSERT INTO dtako_vehicles (tenant_id, vehicle_cd, vehicle_name) VALUES ($1, 'V1', 'TEST')",
         "INSERT INTO dtako_event_classifications (tenant_id, event_cd, event_name, classification) VALUES ($1, '201', 'TEST', 'drive')",
         "INSERT INTO dtako_operation_changes (tenant_id, unko_no, crew_role, reason) VALUES ($1, '3001', 0, 'reupload')",
+        "INSERT INTO dtako_daily_work_hours (tenant_id, driver_id, work_date) SELECT $1, id, DATE '2026-03-02' FROM employees WHERE tenant_id = $1",
+        "INSERT INTO dtako_daily_work_segments (tenant_id, driver_id, work_date, unko_no, start_at, end_at, work_minutes) SELECT $1, id, DATE '2026-03-02', '3001', now(), now(), 0 FROM employees WHERE tenant_id = $1",
     ] {
         assert_eq!(exec(c, t, insert).await, 1);
     }
@@ -367,7 +374,7 @@ fn kudgivt(event_cd: &str, event_name: &str) -> KudgivtRow {
     }
 }
 
-/// 準備 (`prepare_upload`) → 入れ替え (`replace_operations`) を、取り込みと同じ順で 1 回流す。
+/// 準備 (`prepare_upload`) → 取り込みの本体 (`apply_upload`。日エントリは無し) を、取り込みと同じ順で 1 回流す。
 /// `before` は「既に在る」行にだけ渡す前回の分数 (保存先の旧 KUDGIVT が取れなかった場合は `None`)。
 async fn import(
     c: &mut PgClient,
@@ -390,7 +397,7 @@ async fn import(
             after_minutes: after,
         })
         .collect();
-    let count = pg::replace_operations(c, tenant_id, upload_id, rows, inputs);
+    let count = pg::apply_upload(c, tenant_id, upload_id, rows, inputs, HashMap::new());
     (prepared, count.await.unwrap())
 }
 
@@ -635,12 +642,25 @@ async fn reupload_records_a_change_only_when_the_snapshot_differs() {
         [json!({ "dep": "05:15:30" })]
     );
     // 後の行は「上げ直し」と同じ扱いになり、出発が違うので記録が 1 件増える
-    let all = changes(c, t).await;
-    assert_eq!(all.len(), 4);
-    assert_eq!(all[3]["unko_no"], "U3");
-    assert_eq!(all[3]["before"]["departure_at"], "2026-03-02T03:15:30Z");
-    assert_eq!(all[3]["after"]["departure_at"], "2026-03-02T05:15:30Z");
-    assert_eq!(all[3]["before"]["before_kudgivt"], "unavailable");
+    let mut after = snapshot("D-ONE", 0);
+    after["departure_at"] = json!("2026-03-02T05:15:30Z");
+    let fourth_change = json!({
+        "unko_no": "U3",
+        "crew_role": 1,
+        "driver_cd": "D-ONE",
+        "upload_id": first,
+        "reason": "reupload",
+        "before": {
+            "driver_cd": "D-ONE",
+            "departure_at": "2026-03-02T03:15:30Z",
+            "return_at": "2026-03-02T22:15:30Z",
+            "before_kudgivt": "unavailable",
+        },
+        "after": after,
+    });
+    let [first_change, second_change, third_change] = so_far;
+    let all = [first_change, second_change, third_change, fourth_change];
+    assert_eq!(changes(c, t).await, all);
 
     held.close().await;
     db.shutdown();
@@ -1010,8 +1030,489 @@ async fn upload_stages_fail_on_a_closed_connection() {
         format!("{:?}", input.clone()).len(),
         format!("{input:?}").len()
     );
-    let replaced = pg::replace_operations(&mut c, t, t, rows, vec![input]).await;
-    assert!(replaced.unwrap_err().is_closed());
+    // 行と入力の数が違えば、DB に触れる前に失敗する (切れた接続でも DB の失敗にならない)
+    let applied = pg::apply_upload(&mut c, t, t, rows.clone(), vec![], HashMap::new()).await;
+    assert!(
+        matches!(applied, Err(ApplyUploadError::LengthMismatch)),
+        "{applied:?}"
+    );
+    let applied = pg::apply_upload(&mut c, t, t, rows, vec![input], HashMap::new()).await;
+    assert!(
+        matches!(&applied, Err(ApplyUploadError::Db(e)) if e.is_closed()),
+        "{applied:?}"
+    );
     drop(c);
+    db.shutdown();
+}
+
+// ---- 日別の労働時間とセグメントの保存・完了の印 ----
+
+/// 2026-03-`day` の `hour`:15:00 (作り物の日時)。
+fn at(day: u32, hour: u32) -> NaiveDateTime {
+    let date = NaiveDate::from_ymd_opt(2026, 3, day).unwrap();
+    date.and_hms_opt(hour, 15, 0).unwrap()
+}
+
+/// 出発・帰着を指定した KUDGURI の 1 行 (crew_role 1)。
+fn trip(
+    unko_no: &str,
+    driver_cd: &str,
+    departure: NaiveDateTime,
+    ret: NaiveDateTime,
+) -> KudguriRow {
+    let mut row = kudguri(unko_no, 1, driver_cd, 0, 0);
+    row.operation_date = Some(departure.date());
+    row.departure_at = Some(departure);
+    row.return_at = Some(ret);
+    row
+}
+
+/// 運行・乗務員・開始・長さ (分) を指定した KUDGIVT の 1 行 (201 運転 / 202 荷役 / 302 休息)。
+fn event(
+    unko_no: &str,
+    driver_cd: &str,
+    start: NaiveDateTime,
+    event_cd: &str,
+    minutes: i32,
+) -> KudgivtRow {
+    let mut row = kudgivt(event_cd, "TEST-EVENT");
+    row.unko_no = unko_no.into();
+    row.driver_cd = driver_cd.into();
+    row.reading_date = start.date();
+    row.start_at = start;
+    row.end_at = Some(start + chrono::Duration::minutes(minutes.into()));
+    row.duration_minutes = Some(minutes);
+    row
+}
+
+/// 取り込みと同じ順で 1 回流す: 準備 → `compute_daily_hours` (backend と同じ関数) → `apply_upload`。
+/// `extra` は、計算の出力に足す日エントリ (計算からは出てこない形を保存に通すため)。
+async fn import_daily(
+    c: &mut PgClient,
+    tenant_id: Uuid,
+    upload_id: Uuid,
+    rows: Vec<KudguriRow>,
+    events: Vec<KudgivtRow>,
+    extra: Vec<(DayKey, DailyHours)>,
+) -> Result<i32, ApplyUploadError> {
+    let (rows, events) = (Arc::new(rows), Arc::new(events));
+    let prepared = pg::prepare_upload(c, tenant_id, rows.clone(), events.clone());
+    let prepared = prepared.await.unwrap();
+    let classifications = prepared.classification_map();
+    let mut daily = compute_daily_hours(&rows, &events, &classifications, &HashMap::new());
+    daily.extend(extra);
+    let inputs: Vec<OperationInput> = prepared
+        .rows
+        .iter()
+        .map(|p| OperationInput {
+            office_id: p.office_id,
+            vehicle_id: p.vehicle_id,
+            driver_id: p.driver_id,
+            before_minutes: None,
+            after_minutes: minutes(0),
+        })
+        .collect();
+    pg::apply_upload(c, tenant_id, upload_id, rows, inputs, daily).await
+}
+
+/// 日別の行 (乗務員は名前で。乗務員・日・開始時刻の順)。
+async fn daily_rows(c: &mut PgClient, tenant_id: Uuid) -> Vec<Value> {
+    let query = "SELECT e.name AS driver, h.work_date, h.start_time, h.total_work_minutes, h.total_drive_minutes, \
+                 h.total_rest_minutes, h.late_night_minutes, h.drive_minutes, h.cargo_minutes, h.total_distance, \
+                 h.operation_count, h.unko_nos, h.overlap_drive_minutes, h.overlap_cargo_minutes, \
+                 h.overlap_break_minutes, h.overlap_restraint_minutes, h.ot_late_night_minutes \
+                 FROM dtako_daily_work_hours h JOIN employees e ON e.id = h.driver_id \
+                 WHERE h.tenant_id = $1 ORDER BY e.name, h.work_date, h.start_time";
+    rows_json(c, tenant_id, query).await
+}
+
+/// セグメントの行 (乗務員は名前で、日時は UTC の文字列で。乗務員・日・開始・番号の順)。
+async fn segment_rows(c: &mut PgClient, tenant_id: Uuid) -> Vec<Value> {
+    let query = "SELECT e.name AS driver, s.work_date, s.unko_no, s.segment_index, \
+                 to_char(s.start_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS start_at, \
+                 to_char(s.end_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS end_at, \
+                 s.work_minutes, s.labor_minutes, s.late_night_minutes, s.drive_minutes, s.cargo_minutes \
+                 FROM dtako_daily_work_segments s JOIN employees e ON e.id = s.driver_id \
+                 WHERE s.tenant_id = $1 ORDER BY e.name, s.work_date, s.start_at, s.segment_index";
+    rows_json(c, tenant_id, query).await
+}
+
+/// 運行の `(unko_no, 乗務員の名前, 出発)` (運行NO の順)。
+async fn operation_rows(c: &mut PgClient, tenant_id: Uuid) -> Vec<Value> {
+    let query = "SELECT o.unko_no, e.name AS driver, to_char(o.departure_at AT TIME ZONE 'UTC', 'DD HH24:MI') AS departure \
+                 FROM dtako_operations o LEFT JOIN employees e ON e.id = o.driver_id \
+                 WHERE o.tenant_id = $1 ORDER BY o.unko_no";
+    rows_json(c, tenant_id, query).await
+}
+
+/// 履歴の `(filename, status, operations_count)` (filename の順)。
+async fn completion(c: &mut PgClient, tenant_id: Uuid) -> Vec<Value> {
+    let query = "SELECT filename, status, operations_count FROM dtako_upload_history \
+                 WHERE tenant_id = $1 ORDER BY filename";
+    rows_json(c, tenant_id, query).await
+}
+
+/// 2 日にまたがる 1 運行 (運転 420 分・荷役 60 分 → 休息 600 分 → 運転 720 分)。日エントリは 2 つ (03-02 と 03-03)。
+fn two_day_trip(unko_no: &str, driver_cd: &str) -> (Vec<KudguriRow>, Vec<KudgivtRow>) {
+    let mut row = trip(unko_no, driver_cd, at(2, 6), at(3, 12));
+    row.total_distance = Some(123.5);
+    let events = vec![
+        event(unko_no, driver_cd, at(2, 6), "201", 420),
+        event(unko_no, driver_cd, at(2, 13), "202", 60),
+        event(unko_no, driver_cd, at(2, 14), "302", 600),
+        event(unko_no, driver_cd, at(3, 0), "201", 720),
+    ];
+    (vec![row], events)
+}
+
+/// 1 日に収まる 1 運行 (運転 480 分)。日エントリは 1 つ (03-02 の 09:15)。
+fn one_day_trip(unko_no: &str, driver_cd: &str) -> (Vec<KudguriRow>, Vec<KudgivtRow>) {
+    let mut row = trip(unko_no, driver_cd, at(2, 9), at(2, 17));
+    row.total_distance = Some(80.25);
+    let events = vec![event(unko_no, driver_cd, at(2, 9), "201", 480)];
+    (vec![row], events)
+}
+
+/// 全部の field に別々の値を入れた日エントリ (引数の順の取り違えを捕まえる。計算からは出てこない値)。
+fn distinct_hours() -> DailyHours {
+    let segment = |unko_no: &str, index: i32, hour: u32, base: i32| DailySegment {
+        unko_no: unko_no.into(),
+        segment_index: index,
+        start_at: at(5, hour),
+        end_at: at(5, hour + 2),
+        work_minutes: base + 1,
+        labor_minutes: base + 2,
+        late_night_minutes: base + 3,
+        drive_minutes: base + 4,
+        cargo_minutes: base + 5,
+    };
+    DailyHours {
+        total_work_minutes: 101,
+        total_labor_minutes: 102,
+        late_night_minutes: 103,
+        drive_minutes: 104,
+        cargo_minutes: 105,
+        total_distance: 106.5,
+        operation_count: 107,
+        unko_nos: vec!["HAND-1".into(), "HAND-2".into()],
+        segments: vec![segment("HAND-1", 0, 4, 200), segment("HAND-2", 1, 7, 210)],
+        rest_event_minutes: 108,
+        overlap_drive_minutes: 109,
+        overlap_cargo_minutes: 110,
+        overlap_break_minutes: 111,
+        overlap_restraint_minutes: 112,
+        ot_late_night_minutes: 7,
+    }
+}
+
+/// 日別の保存: 18 列・12 列を読み戻す。上げ直しで、その運行の古い日別とセグメントが消えて入れ替わる。履歴に完了の印が付く。
+#[tokio::test(flavor = "multi_thread")]
+async fn daily_hours_are_saved_and_replaced_on_reupload() {
+    let db = Embedded::start().await;
+    let mut held = db.client(APP_ROLE).await;
+    let c = &mut held.inner;
+    let t = tenant(c, "Dtako Daily Tenant").await;
+    employee(c, t, None, Some("D-ONE"), "TEST-ONE", false).await;
+    employee(c, t, None, Some("D-TWO"), "TEST-HAND", false).await;
+    let first = pg::create_upload(c, t, "first.zip".into()).await.unwrap();
+    let second = pg::create_upload(c, t, "second.zip".into()).await.unwrap();
+
+    // 前から在る行: (a) 同じ (乗務員, 日, 開始時刻) の日別と、その日のセグメント (b) 同じ運行NO を持つ別の日の日別とセグメント
+    // (c) どれにも当たらない日別とセグメント。(a) (b) は消え、(c) は残る
+    for seed in [
+        "INSERT INTO dtako_daily_work_hours (tenant_id, driver_id, work_date, start_time, total_work_minutes, unko_nos) \
+         SELECT $1, id, d::date, s::time, 1, u::text[] FROM employees, (VALUES \
+         ('2026-03-02', '06:15:00', '{OLD-9}'), ('2026-03-09', '00:00:00', '{OLD-9,DAY-1}'), ('2026-03-10', '00:00:00', '{OLD-9}') \
+         ) v(d, s, u) WHERE tenant_id = $1 AND driver_cd = 'D-ONE'",
+        "INSERT INTO dtako_daily_work_segments (tenant_id, driver_id, work_date, unko_no, start_at, end_at, work_minutes) \
+         SELECT $1, id, d::date, u, (d || ' 01:00:00+00')::timestamptz, (d || ' 02:00:00+00')::timestamptz, 1 FROM employees, (VALUES \
+         ('2026-03-02', 'OLD-9'), ('2026-03-09', 'DAY-1'), ('2026-03-10', 'OLD-9') \
+         ) v(d, u) WHERE tenant_id = $1 AND driver_cd = 'D-ONE'",
+    ] {
+        assert_eq!(exec(c, t, seed).await, 3);
+    }
+    let kept_day = json!({
+        "driver": "TEST-ONE", "work_date": "2026-03-10", "start_time": "00:00:00", "total_work_minutes": 1,
+        "total_drive_minutes": null, "total_rest_minutes": null, "late_night_minutes": 0, "drive_minutes": 0,
+        "cargo_minutes": 0, "total_distance": null, "operation_count": 0, "unko_nos": ["OLD-9"],
+        "overlap_drive_minutes": 0, "overlap_cargo_minutes": 0, "overlap_break_minutes": 0,
+        "overlap_restraint_minutes": 0, "ot_late_night_minutes": 0,
+    });
+    let kept_segment = json!({
+        "driver": "TEST-ONE", "work_date": "2026-03-10", "unko_no": "OLD-9", "segment_index": 0,
+        "start_at": "2026-03-10 01:00:00", "end_at": "2026-03-10 02:00:00", "work_minutes": 1,
+        "labor_minutes": 0, "late_night_minutes": 0, "drive_minutes": 0, "cargo_minutes": 0,
+    });
+
+    // 1 回目: 計算の出力 (2 日ぶん) と、全部の field が別々の値の日エントリ (別の乗務員)
+    let (rows, events) = two_day_trip("DAY-1", "D-ONE");
+    let hand_key = (
+        "D-TWO".to_string(),
+        at(5, 4).date(),
+        NaiveTime::from_hms_opt(4, 5, 6).unwrap(),
+    );
+    let extra = vec![(hand_key, distinct_hours())];
+    let count = import_daily(c, t, first, rows, events, extra).await;
+    assert_eq!(count.unwrap(), 1);
+    // 保存する 2 つの値は method の値: total_drive_minutes = 労働の合計 (102)、late_night_minutes = 103 - 7
+    let hand_day = json!({
+        "driver": "TEST-HAND", "work_date": "2026-03-05", "start_time": "04:05:06", "total_work_minutes": 101,
+        "total_drive_minutes": 102, "total_rest_minutes": 108, "late_night_minutes": 96, "drive_minutes": 104,
+        "cargo_minutes": 105, "total_distance": 106.5, "operation_count": 107, "unko_nos": ["HAND-1", "HAND-2"],
+        "overlap_drive_minutes": 109, "overlap_cargo_minutes": 110, "overlap_break_minutes": 111,
+        "overlap_restraint_minutes": 112, "ot_late_night_minutes": 7,
+    });
+    let hand_segments = [
+        json!({
+            "driver": "TEST-HAND", "work_date": "2026-03-05", "unko_no": "HAND-1", "segment_index": 0,
+            "start_at": "2026-03-05 04:15:00", "end_at": "2026-03-05 06:15:00", "work_minutes": 201,
+            "labor_minutes": 202, "late_night_minutes": 203, "drive_minutes": 204, "cargo_minutes": 205,
+        }),
+        json!({
+            "driver": "TEST-HAND", "work_date": "2026-03-05", "unko_no": "HAND-2", "segment_index": 1,
+            "start_at": "2026-03-05 07:15:00", "end_at": "2026-03-05 09:15:00", "work_minutes": 211,
+            "labor_minutes": 212, "late_night_minutes": 213, "drive_minutes": 214, "cargo_minutes": 215,
+        }),
+    ];
+    let first_day = json!({
+        "driver": "TEST-ONE", "work_date": "2026-03-02", "start_time": "06:15:00", "total_work_minutes": 480,
+        "total_drive_minutes": 480, "total_rest_minutes": 600, "late_night_minutes": 0, "drive_minutes": 420,
+        "cargo_minutes": 60, "total_distance": 123.5, "operation_count": 1, "unko_nos": ["DAY-1"],
+        "overlap_drive_minutes": 360, "overlap_cargo_minutes": 0, "overlap_break_minutes": 0,
+        "overlap_restraint_minutes": 360, "ot_late_night_minutes": 0,
+    });
+    let second_day = json!({
+        "driver": "TEST-ONE", "work_date": "2026-03-03", "start_time": "00:15:00", "total_work_minutes": 720,
+        "total_drive_minutes": 720, "total_rest_minutes": 0, "late_night_minutes": 285, "drive_minutes": 720,
+        "cargo_minutes": 0, "total_distance": 123.5, "operation_count": 1, "unko_nos": ["DAY-1"],
+        "overlap_drive_minutes": 0, "overlap_cargo_minutes": 0, "overlap_break_minutes": 0,
+        "overlap_restraint_minutes": 0, "ot_late_night_minutes": 0,
+    });
+    let want_days = [&hand_day, &first_day, &second_day, &kept_day];
+    assert_eq!(daily_rows(c, t).await.iter().collect::<Vec<_>>(), want_days);
+    let first_segment = json!({
+        "driver": "TEST-ONE", "work_date": "2026-03-02", "unko_no": "DAY-1", "segment_index": 0,
+        "start_at": "2026-03-02 06:15:00", "end_at": "2026-03-02 14:15:00", "work_minutes": 480,
+        "labor_minutes": 480, "late_night_minutes": 0, "drive_minutes": 420, "cargo_minutes": 60,
+    });
+    let second_segment = json!({
+        "driver": "TEST-ONE", "work_date": "2026-03-03", "unko_no": "DAY-1", "segment_index": 0,
+        "start_at": "2026-03-03 00:15:00", "end_at": "2026-03-03 12:15:00", "work_minutes": 720,
+        "labor_minutes": 720, "late_night_minutes": 285, "drive_minutes": 720, "cargo_minutes": 0,
+    });
+    let [hand_a, hand_b] = &hand_segments;
+    let want_segments = [
+        hand_a,
+        hand_b,
+        &first_segment,
+        &second_segment,
+        &kept_segment,
+    ];
+    assert_eq!(
+        segment_rows(c, t).await.iter().collect::<Vec<_>>(),
+        want_segments
+    );
+    let done = |filename: &str, status: &str, n: i32| json!({ "filename": filename, "status": status, "operations_count": n });
+    let after_first = [
+        done("first.zip", "completed", 1),
+        done("second.zip", "processing", 0),
+    ];
+    assert_eq!(completion(c, t).await, after_first);
+
+    // 上げ直し: 同じ運行が 1 日に収まる形に変わった → その運行の古い 2 日ぶんが消えて、新しい 1 日ぶんに入れ替わる。
+    // この zip に出てこない乗務員 (TEST-HAND) の行と、当たらない行は、そのまま
+    let (rows, events) = one_day_trip("DAY-1", "D-ONE");
+    let count = import_daily(c, t, second, rows, events, vec![]).await;
+    assert_eq!(count.unwrap(), 1);
+    let new_day = json!({
+        "driver": "TEST-ONE", "work_date": "2026-03-02", "start_time": "09:15:00", "total_work_minutes": 480,
+        "total_drive_minutes": 480, "total_rest_minutes": 0, "late_night_minutes": 0, "drive_minutes": 480,
+        "cargo_minutes": 0, "total_distance": 80.25, "operation_count": 1, "unko_nos": ["DAY-1"],
+        "overlap_drive_minutes": 0, "overlap_cargo_minutes": 0, "overlap_break_minutes": 0,
+        "overlap_restraint_minutes": 0, "ot_late_night_minutes": 0,
+    });
+    let new_segment = json!({
+        "driver": "TEST-ONE", "work_date": "2026-03-02", "unko_no": "DAY-1", "segment_index": 0,
+        "start_at": "2026-03-02 09:15:00", "end_at": "2026-03-02 17:15:00", "work_minutes": 480,
+        "labor_minutes": 480, "late_night_minutes": 0, "drive_minutes": 480, "cargo_minutes": 0,
+    });
+    let want_days = [&hand_day, &new_day, &kept_day];
+    assert_eq!(daily_rows(c, t).await.iter().collect::<Vec<_>>(), want_days);
+    let want_segments = [hand_a, hand_b, &new_segment, &kept_segment];
+    assert_eq!(
+        segment_rows(c, t).await.iter().collect::<Vec<_>>(),
+        want_segments
+    );
+    let after_second = [
+        done("first.zip", "completed", 1),
+        done("second.zip", "completed", 1),
+    ];
+    assert_eq!(completion(c, t).await, after_second);
+
+    held.close().await;
+    db.shutdown();
+}
+
+/// 同じ乗務員・同じ日に日エントリが 2 つ在っても、両方のセグメントが残る (何度流しても同じ)。乗務員 id が引けない CD と
+/// 空の CD の日エントリは保存しない。運行の乗務員 (`upsert_driver`) と日別の乗務員 (`get_employee_id_by_driver_cd`) は別に引く。
+#[tokio::test(flavor = "multi_thread")]
+async fn daily_hours_keep_both_entries_of_a_day_and_skip_unresolved_drivers() {
+    let db = Embedded::start().await;
+    let mut held = db.client(APP_ROLE).await;
+    let c = &mut held.inner;
+    let t = tenant(c, "Dtako Daily Order Tenant").await;
+    // 乗務員CD が、ある行の `code` と、別の行の `driver_cd` の両方に在る
+    employee(c, t, Some("D-SPLIT"), None, "TEST-BY-CODE", false).await;
+    employee(c, t, None, Some("D-SPLIT"), "TEST-BY-DRIVER-CD", false).await;
+    let upload_id = pg::create_upload(c, t, "order.zip".into()).await.unwrap();
+
+    // 1 運行の中に休息が在り、同じ日 (03-04) に日エントリが 2 つ出る (01:15 と 15:15)。もう 1 運行は乗務員CD が空
+    let rows = vec![
+        trip("TWICE-1", "D-SPLIT", at(4, 1), at(4, 23)),
+        trip("EMPTY-1", "", at(5, 8), at(5, 12)),
+    ];
+    let events = vec![
+        event("TWICE-1", "D-SPLIT", at(4, 1), "201", 240),
+        event("TWICE-1", "D-SPLIT", at(4, 5), "302", 600),
+        event("TWICE-1", "D-SPLIT", at(4, 15), "201", 480),
+        event("EMPTY-1", "", at(5, 8), "201", 240),
+    ];
+    let ghost_key = ("D-GHOST".to_string(), at(6, 0).date(), NaiveTime::MIN);
+    let extra = vec![(ghost_key, distinct_hours())];
+    let days = "SELECT e.name AS driver, h.work_date, h.start_time, h.total_work_minutes \
+                FROM dtako_daily_work_hours h JOIN employees e ON e.id = h.driver_id \
+                WHERE h.tenant_id = $1 ORDER BY h.work_date, h.start_time";
+    let segments = "SELECT e.name AS driver, s.work_date, s.work_minutes, to_char(s.start_at AT TIME ZONE 'UTC', 'HH24:MI') AS start_at \
+                    FROM dtako_daily_work_segments s JOIN employees e ON e.id = s.driver_id \
+                    WHERE s.tenant_id = $1 ORDER BY s.start_at";
+    let want_days = [
+        json!({ "driver": "TEST-BY-CODE", "work_date": "2026-03-04", "start_time": "01:15:00", "total_work_minutes": 240 }),
+        json!({ "driver": "TEST-BY-CODE", "work_date": "2026-03-04", "start_time": "15:15:00", "total_work_minutes": 480 }),
+    ];
+    let want_segments = [
+        json!({ "driver": "TEST-BY-CODE", "work_date": "2026-03-04", "work_minutes": 240, "start_at": "01:15" }),
+        json!({ "driver": "TEST-BY-CODE", "work_date": "2026-03-04", "work_minutes": 480, "start_at": "15:15" }),
+    ];
+    let want_operations = [
+        json!({ "unko_no": "EMPTY-1", "driver": null, "departure": "05 08:15" }),
+        json!({ "unko_no": "TWICE-1", "driver": "TEST-BY-DRIVER-CD", "departure": "04 01:15" }),
+    ];
+    // 2 回流す (2 回目は上げ直し)。どちらの後も同じ
+    for _ in 0..2 {
+        let count =
+            import_daily(c, t, upload_id, rows.clone(), events.clone(), extra.clone()).await;
+        assert_eq!(count.unwrap(), 2);
+        // 日別は `code` の行に、運行は `driver_cd` の行に付く。空の CD と、id が引けない CD (D-GHOST) の日エントリは無い
+        assert_eq!(rows_json(c, t, days).await, want_days);
+        // 同じ日の 2 つめの日エントリを保存しても、1 つめのセグメントは消えない
+        assert_eq!(rows_json(c, t, segments).await, want_segments);
+        assert_eq!(operation_rows(c, t).await, want_operations);
+        // 日別の保存は乗務員を作らない・`driver_cd` を埋めない
+        assert_eq!(live_employees(c, t).await.len(), 2);
+    }
+    let completed =
+        json!({ "filename": "order.zip", "status": "completed", "operations_count": 2 });
+    assert_eq!(completion(c, t).await, [completed]);
+
+    held.close().await;
+    db.shutdown();
+}
+
+/// 別テナントの日別・セグメント・履歴には触れない。段の途中で失敗したら、運行の入れ替えも日別も履歴も元のまま (transaction は 1 つ)。
+#[tokio::test(flavor = "multi_thread")]
+async fn daily_hours_stay_inside_the_tenant_and_roll_back_with_the_operations() {
+    let db = Embedded::start().await;
+    let mut held = db.client(APP_ROLE).await;
+    let c = &mut held.inner;
+    let a = tenant(c, "Dtako Daily Tenant A").await;
+    let b = tenant(c, "Dtako Daily Tenant B").await;
+    let a_up = pg::create_upload(c, a, "a1.zip".into()).await.unwrap();
+    let b_up = pg::create_upload(c, b, "b1.zip".into()).await.unwrap();
+    let b_pending = pg::create_upload(c, b, "b2.zip".into()).await.unwrap();
+
+    // 同じ運行NO・同じ乗務員CD を 2 つのテナントで取り込む
+    for (tenant_id, upload_id) in [(a, a_up), (b, b_up)] {
+        let (rows, events) = one_day_trip("SAME-1", "D-ONE");
+        let count = import_daily(c, tenant_id, upload_id, rows, events, vec![]).await;
+        assert_eq!(count.unwrap(), 1);
+    }
+    let b_days = daily_rows(c, b).await;
+    let b_segments = segment_rows(c, b).await;
+    let b_history = completion(c, b).await;
+    assert_eq!((b_days.len(), b_segments.len()), (1, 1));
+    let done = |filename: &str, status: &str, n: i32| json!({ "filename": filename, "status": status, "operations_count": n });
+    assert_eq!(
+        b_history,
+        [
+            done("b1.zip", "completed", 1),
+            done("b2.zip", "processing", 0)
+        ]
+    );
+
+    // テナント A が上げ直す (2 日ぶんに変わる)。upload_id にテナント B の履歴の id を渡しても、B の履歴は completed にならない
+    let (rows, events) = two_day_trip("SAME-1", "D-ONE");
+    let count = import_daily(c, a, b_pending, rows, events, vec![]).await;
+    assert_eq!(count.unwrap(), 1);
+    assert_eq!(
+        (daily_rows(c, a).await.len(), segment_rows(c, a).await.len()),
+        (2, 2)
+    );
+    assert_eq!(daily_rows(c, b).await, b_days);
+    assert_eq!(segment_rows(c, b).await, b_segments);
+    assert_eq!(completion(c, b).await, b_history);
+    assert_eq!(completion(c, a).await, [done("a1.zip", "completed", 1)]);
+
+    // 段の途中の失敗: 運行を入れ替え、日別を入れた後の、セグメントの INSERT が落ちる (文字列に NUL)
+    let a_failing = pg::create_upload(c, a, "a2.zip".into()).await.unwrap();
+    let a_days = daily_rows(c, a).await;
+    let a_segments = segment_rows(c, a).await;
+    let a_operations = operation_rows(c, a).await;
+    let a_changes = changes(c, a).await;
+    assert_eq!(a_changes.len(), 1);
+    let departed =
+        json!({ "unko_no": "SAME-1", "driver": "TEST-DRIVER D-ONE", "departure": "02 06:15" });
+    assert_eq!(a_operations, [departed]);
+    let (rows, events) = one_day_trip("SAME-1", "D-ONE");
+    let mut broken = distinct_hours();
+    broken.segments[1].unko_no = "BAD\0".into();
+    let extra = vec![(
+        ("D-ONE".to_string(), at(8, 0).date(), NaiveTime::MIN),
+        broken,
+    )];
+    let failed = import_daily(c, a, a_failing, rows, events, extra).await;
+    assert!(
+        matches!(&failed, Err(ApplyUploadError::Db(e)) if !e.is_closed()),
+        "{failed:?}"
+    );
+    assert_eq!(operation_rows(c, a).await, a_operations);
+    assert_eq!(changes(c, a).await, a_changes);
+    assert_eq!(daily_rows(c, a).await, a_days);
+    assert_eq!(segment_rows(c, a).await, a_segments);
+    assert_eq!(
+        completion(c, a).await,
+        [
+            done("a1.zip", "completed", 1),
+            done("a2.zip", "processing", 0)
+        ]
+    );
+
+    // 行と入力の数が違えば、DB に触れる前に失敗する (何も変わらない)
+    let (rows, _) = one_day_trip("SAME-1", "D-ONE");
+    let mismatched =
+        pg::apply_upload(c, a, a_failing, Arc::new(rows), vec![], HashMap::new()).await;
+    assert!(
+        matches!(mismatched, Err(ApplyUploadError::LengthMismatch)),
+        "{mismatched:?}"
+    );
+    assert_eq!(operation_rows(c, a).await, a_operations);
+    assert_eq!(
+        completion(c, a).await,
+        [
+            done("a1.zip", "completed", 1),
+            done("a2.zip", "processing", 0)
+        ]
+    );
+
+    held.close().await;
     db.shutdown();
 }

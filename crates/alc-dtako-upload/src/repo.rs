@@ -1,5 +1,6 @@
 //! デジタコの運行 CSV のアップロードの SQL の定数 (Refs ippoan/rust-alc-api#725)。表は alc-migrations の migration 054
-//! (`dtako_upload_history`・`dtako_operations`・`dtako_offices`・`dtako_vehicles`・`dtako_event_classifications`) と
+//! (`dtako_upload_history`・`dtako_operations`・`dtako_offices`・`dtako_vehicles`・`dtako_event_classifications`・
+//! `dtako_daily_work_hours`・`dtako_daily_work_segments`) と
 //! 152 (`dtako_operation_changes`)、乗務員は `employees`。
 //!
 //! ここに在るのは SQL の定数だけで、流すのは [`crate::pg`] の 1 か所 (worker と `tests/sql_db.rs` が同じものを使う)。
@@ -136,4 +137,55 @@ pub mod sql {
     pub const INSERT_EVENT_CLASSIFICATION: &str = r#"INSERT INTO alc_api.dtako_event_classifications (tenant_id, event_cd, event_name, classification)
     VALUES ($1, $2, $3, $4)
     ON CONFLICT (tenant_id, event_cd) DO NOTHING"#;
+
+    // ---- 日別の労働時間とセグメントの保存・完了の印 ----
+
+    /// 日別の保存先の乗務員を引く ①: 乗務員CD を `code` 列で引く (生存行。**更新しない**)。$1 tenant_id / $2 driver_cd → id。
+    /// 無ければ [`SELECT_EMPLOYEE_BY_DRIVER_CD`] で引く。
+    pub const SELECT_EMPLOYEE_ID_BY_CODE: &str =
+        "SELECT id FROM alc_api.employees WHERE tenant_id = $1 AND code = $2 AND deleted_at IS NULL";
+
+    /// 乗務員のセグメントを、運行NO の配列で消す (上げ直しで帰属日が変わっても古い行が残らないように)。
+    /// $1 tenant_id / $2 driver_id / $3 unko_no の配列 (TEXT[])。
+    pub const DELETE_SEGMENTS_BY_UNKO_NOS: &str =
+        "DELETE FROM alc_api.dtako_daily_work_segments WHERE tenant_id = $1 AND driver_id = $2 AND unko_no = ANY($3)";
+
+    /// 乗務員の日別のうち、`unko_nos` 列が運行NO の配列と 1 つでも重なる行を消す。
+    /// $1 tenant_id / $2 driver_id / $3 unko_no の配列 (TEXT[])。
+    pub const DELETE_DAILY_HOURS_BY_UNKO_NOS: &str =
+        "DELETE FROM alc_api.dtako_daily_work_hours WHERE tenant_id = $1 AND driver_id = $2 AND unko_nos && $3";
+
+    /// 日別 1 行を (乗務員, 日, 開始時刻) で消す (入れ直しの前)。$1 tenant_id / $2 driver_id / $3 work_date / $4 start_time。
+    pub const DELETE_DAILY_HOURS_EXACT: &str =
+        "DELETE FROM alc_api.dtako_daily_work_hours WHERE tenant_id = $1 AND driver_id = $2 AND work_date = $3 AND start_time = $4";
+
+    /// 日別 1 行を入れる。$1 tenant_id / $2 driver_id / $3 work_date / $4 start_time / $5 total_work_minutes /
+    /// $6 total_drive_minutes / $7 total_rest_minutes / $8 late_night_minutes / $9 drive_minutes / $10 cargo_minutes /
+    /// $11 total_distance / $12 operation_count / $13 unko_nos (TEXT[]) / $14 overlap_drive_minutes /
+    /// $15 overlap_cargo_minutes / $16 overlap_break_minutes / $17 overlap_restraint_minutes / $18 ot_late_night_minutes。
+    pub const INSERT_DAILY_WORK_HOURS: &str = r#"INSERT INTO alc_api.dtako_daily_work_hours (
+                tenant_id, driver_id, work_date, start_time,
+                total_work_minutes, total_drive_minutes, total_rest_minutes,
+                late_night_minutes, drive_minutes, cargo_minutes,
+                total_distance, operation_count, unko_nos,
+                overlap_drive_minutes, overlap_cargo_minutes,
+                overlap_break_minutes, overlap_restraint_minutes,
+                ot_late_night_minutes
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)"#;
+
+    /// 乗務員のその日のセグメントを消す (入れ直しの前)。$1 tenant_id / $2 driver_id / $3 work_date。
+    pub const DELETE_SEGMENTS_BY_DATE: &str =
+        "DELETE FROM alc_api.dtako_daily_work_segments WHERE tenant_id = $1 AND driver_id = $2 AND work_date = $3";
+
+    /// セグメント 1 行を入れる。$1 tenant_id / $2 driver_id / $3 work_date / $4 unko_no / $5 segment_index / $6 start_at /
+    /// $7 end_at / $8 work_minutes / $9 labor_minutes / $10 late_night_minutes / $11 drive_minutes / $12 cargo_minutes。
+    pub const INSERT_SEGMENT: &str = r#"INSERT INTO alc_api.dtako_daily_work_segments (
+                tenant_id, driver_id, work_date, unko_no, segment_index,
+                start_at, end_at, work_minutes, labor_minutes, late_night_minutes,
+                drive_minutes, cargo_minutes
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)"#;
+
+    /// 履歴に完了の印を付ける。$1 operations_count / $2 id / $3 tenant_id。
+    pub const MARK_UPLOAD_COMPLETED: &str =
+        "UPDATE alc_api.dtako_upload_history SET status = 'completed', operations_count = $1 WHERE id = $2 AND tenant_id = $3";
 }

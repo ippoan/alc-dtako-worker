@@ -15,12 +15,15 @@
 //! - **文の関数** (`&TenantTx` を取る): transaction を開かず、段の関数の中から呼ぶ。`TenantTx` は `tenant_tx` の中でしか
 //!   手に入らないので、テナントを設定していない transaction では呼べない。
 //!
-//! アップロードの取り込みの段は、[`create_upload`] → [`set_upload_zip_key`] → [`prepare_upload`] → [`replace_operations`]
-//! (失敗したら [`mark_upload_failed`])。
+//! アップロードの取り込みの段は、[`create_upload`] → [`set_upload_zip_key`] → [`prepare_upload`] → [`apply_upload`]
+//! (失敗したら [`mark_upload_failed`])。[`apply_upload`] は「運行の入れ替え → 日別の保存 → 完了の印」を 1 つの
+//! transaction で行う (途中で落ちたら、運行も日別も履歴も元のまま)。
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use alc_compare::upload_daily::DailyHours;
+use alc_compare::DayKey;
 use alc_csv_parser::kudgivt::KudgivtRow;
 use alc_csv_parser::kudguri::KudguriRow;
 use alc_csv_parser::operation_changes::{
@@ -28,7 +31,7 @@ use alc_csv_parser::operation_changes::{
 };
 use alc_csv_parser::work_segments::{default_classification, EventClass};
 use alc_worker_db::{PgClient, TenantTx, TxOutput};
-use chrono::NaiveDateTime;
+use chrono::{NaiveDate, NaiveDateTime};
 use tokio_postgres::error::SqlState;
 use tokio_postgres::types::Type;
 use uuid::Uuid;
@@ -580,18 +583,183 @@ pub async fn replace_operations_in(
     Ok(operations_count)
 }
 
-/// 運行の入れ替え (1 transaction): [`replace_operations_in`] を流し、流した行数を返す。
-pub async fn replace_operations(
+/// 日別の保存先の乗務員を引く: [`sql::SELECT_EMPLOYEE_ID_BY_CODE`] → 無ければ [`sql::SELECT_EMPLOYEE_BY_DRIVER_CD`]。
+/// **読むだけ** (`driver_cd` を埋めない・作らない)。[`upsert_driver`] とは別の id を返しうるので、1 つにまとめない。
+pub async fn get_employee_id_by_driver_cd(
+    tx: &TenantTx<'_>,
+    tenant_id: Uuid,
+    driver_cd: &str,
+) -> Result<Option<Uuid>, tokio_postgres::Error> {
+    let key: [(&(dyn tokio_postgres::types::ToSql + Sync), Type); 2] =
+        [(&tenant_id, Type::UUID), (&driver_cd, Type::TEXT)];
+    let by_code = tx
+        .query_typed_opt(sql::SELECT_EMPLOYEE_ID_BY_CODE, &key)
+        .await?;
+    if let Some(row) = by_code {
+        return Ok(Some(row.get(0)));
+    }
+    let by_driver_cd = tx
+        .query_typed_opt(sql::SELECT_EMPLOYEE_BY_DRIVER_CD, &key)
+        .await?;
+    Ok(by_driver_cd.map(|row| row.get(0)))
+}
+
+/// 日別の労働時間とセグメントを保存する (transaction は開かない。呼び手の transaction の中で使う)。
+/// `daily` は `alc_compare::upload_daily::compute_daily_hours` の出力そのまま (ここでは計算しない)。
+///
+/// 1. 日エントリの乗務員CD のうち空でないものの id を [`get_employee_id_by_driver_cd`] で引く (同じ CD は 1 回)。
+///    id が引けない CD と空の CD の日エントリは、消す対象にも保存の対象にもしない。
+/// 2. 引けた乗務員ごとに、全日エントリの運行NO で [`sql::DELETE_SEGMENTS_BY_UNKO_NOS`] → [`sql::DELETE_DAILY_HOURS_BY_UNKO_NOS`]
+///    (帰属日が変わっても古い行が残らないように)。
+/// 3. 日エントリを **[`DayKey`] の順** (乗務員CD・日・開始時刻) に保存する: [`sql::DELETE_DAILY_HOURS_EXACT`] →
+///    [`sql::INSERT_DAILY_WORK_HOURS`] → [`sql::DELETE_SEGMENTS_BY_DATE`] → [`sql::INSERT_SEGMENT`]。
+///    `DELETE_SEGMENTS_BY_DATE` は **(乗務員, 日) ごとに最初の 1 回だけ**流す (同じ乗務員・同じ日に日エントリが 2 つ以上
+///    在っても、先に入れたセグメントを消さない)。
+pub async fn save_daily_hours(
+    tx: &TenantTx<'_>,
+    tenant_id: Uuid,
+    daily: &HashMap<DayKey, DailyHours>,
+) -> Result<(), tokio_postgres::Error> {
+    let mut entries: Vec<(&DayKey, &DailyHours)> = daily.iter().collect();
+    entries.sort_by(|a, b| a.0.cmp(b.0));
+
+    let mut driver_ids: HashMap<&str, Option<Uuid>> = HashMap::new();
+    let mut targets: Vec<Uuid> = Vec::new();
+    let mut all_unko_nos: Vec<String> = Vec::new();
+    for ((driver_cd, _, _), hours) in &entries {
+        if !driver_cd.is_empty() && !driver_ids.contains_key(driver_cd.as_str()) {
+            let id = get_employee_id_by_driver_cd(tx, tenant_id, driver_cd).await?;
+            driver_ids.insert(driver_cd, id);
+            targets.extend(id.filter(|id| !targets.contains(id)));
+        }
+        for unko_no in &hours.unko_nos {
+            if !all_unko_nos.contains(unko_no) {
+                all_unko_nos.push(unko_no.clone());
+            }
+        }
+    }
+
+    for driver_id in &targets {
+        let stale: [(&(dyn tokio_postgres::types::ToSql + Sync), Type); 3] = [
+            (&tenant_id, Type::UUID),
+            (driver_id, Type::UUID),
+            (&all_unko_nos, Type::TEXT_ARRAY),
+        ];
+        tx.execute_typed(sql::DELETE_SEGMENTS_BY_UNKO_NOS, &stale)
+            .await?;
+        tx.execute_typed(sql::DELETE_DAILY_HOURS_BY_UNKO_NOS, &stale)
+            .await?;
+    }
+
+    let mut cleared: HashSet<(Uuid, NaiveDate)> = HashSet::new();
+    for ((driver_cd, work_date, start_time), hours) in entries {
+        let Some(driver_id) = driver_ids.get(driver_cd.as_str()).copied().flatten() else {
+            continue;
+        };
+
+        let exact: [(&(dyn tokio_postgres::types::ToSql + Sync), Type); 4] = [
+            (&tenant_id, Type::UUID),
+            (&driver_id, Type::UUID),
+            (work_date, Type::DATE),
+            (start_time, Type::TIME),
+        ];
+        tx.execute_typed(sql::DELETE_DAILY_HOURS_EXACT, &exact)
+            .await?;
+
+        let total_drive_minutes = hours.saved_total_drive_minutes();
+        let late_night_minutes = hours.saved_late_night_minutes();
+        let day: [(&(dyn tokio_postgres::types::ToSql + Sync), Type); 18] = [
+            (&tenant_id, Type::UUID),
+            (&driver_id, Type::UUID),
+            (work_date, Type::DATE),
+            (start_time, Type::TIME),
+            (&hours.total_work_minutes, Type::INT4),
+            (&total_drive_minutes, Type::INT4),
+            (&hours.rest_event_minutes, Type::INT4),
+            (&late_night_minutes, Type::INT4),
+            (&hours.drive_minutes, Type::INT4),
+            (&hours.cargo_minutes, Type::INT4),
+            (&hours.total_distance, Type::FLOAT8),
+            (&hours.operation_count, Type::INT4),
+            (&hours.unko_nos, Type::TEXT_ARRAY),
+            (&hours.overlap_drive_minutes, Type::INT4),
+            (&hours.overlap_cargo_minutes, Type::INT4),
+            (&hours.overlap_break_minutes, Type::INT4),
+            (&hours.overlap_restraint_minutes, Type::INT4),
+            (&hours.ot_late_night_minutes, Type::INT4),
+        ];
+        tx.execute_typed(sql::INSERT_DAILY_WORK_HOURS, &day).await?;
+
+        if cleared.insert((driver_id, *work_date)) {
+            let date: [(&(dyn tokio_postgres::types::ToSql + Sync), Type); 3] = [
+                (&tenant_id, Type::UUID),
+                (&driver_id, Type::UUID),
+                (work_date, Type::DATE),
+            ];
+            tx.execute_typed(sql::DELETE_SEGMENTS_BY_DATE, &date)
+                .await?;
+        }
+
+        for seg in &hours.segments {
+            let start_at = seg.start_at.and_utc();
+            let end_at = seg.end_at.and_utc();
+            let segment: [(&(dyn tokio_postgres::types::ToSql + Sync), Type); 12] = [
+                (&tenant_id, Type::UUID),
+                (&driver_id, Type::UUID),
+                (work_date, Type::DATE),
+                (&seg.unko_no, Type::TEXT),
+                (&seg.segment_index, Type::INT4),
+                (&start_at, Type::TIMESTAMPTZ),
+                (&end_at, Type::TIMESTAMPTZ),
+                (&seg.work_minutes, Type::INT4),
+                (&seg.labor_minutes, Type::INT4),
+                (&seg.late_night_minutes, Type::INT4),
+                (&seg.drive_minutes, Type::INT4),
+                (&seg.cargo_minutes, Type::INT4),
+            ];
+            tx.execute_typed(sql::INSERT_SEGMENT, &segment).await?;
+        }
+    }
+    Ok(())
+}
+
+/// [`apply_upload`] の失敗。
+#[derive(Debug)]
+pub enum ApplyUploadError {
+    /// KUDGURI の行と入力の数が合わない (DB には触れていない)
+    LengthMismatch,
+    Db(tokio_postgres::Error),
+}
+
+/// 取り込みの本体 (1 transaction): [`replace_operations_in`] → [`save_daily_hours`] → [`sql::MARK_UPLOAD_COMPLETED`]
+/// (`operations_count` は流した行数)。返すのも、その行数。
+/// `rows` と `inputs` の数が違えば、DB を触る前に [`ApplyUploadError::LengthMismatch`] を返す。
+pub async fn apply_upload(
     pg: &mut PgClient,
     tenant_id: Uuid,
     upload_id: Uuid,
     rows: Arc<Vec<KudguriRow>>,
     inputs: Vec<OperationInput>,
-) -> Result<i32, tokio_postgres::Error> {
+    daily: HashMap<DayKey, DailyHours>,
+) -> Result<i32, ApplyUploadError> {
+    if rows.len() != inputs.len() {
+        return Err(ApplyUploadError::LengthMismatch);
+    }
     pg.tenant_tx(tenant_id, move |tx| {
-        Box::pin(
-            async move { replace_operations_in(tx, tenant_id, upload_id, &rows, &inputs).await },
-        )
+        Box::pin(async move {
+            let operations_count =
+                replace_operations_in(tx, tenant_id, upload_id, &rows, &inputs).await?;
+            save_daily_hours(tx, tenant_id, &daily).await?;
+            let completed: [(&(dyn tokio_postgres::types::ToSql + Sync), Type); 3] = [
+                (&operations_count, Type::INT4),
+                (&upload_id, Type::UUID),
+                (&tenant_id, Type::UUID),
+            ];
+            tx.execute_typed(sql::MARK_UPLOAD_COMPLETED, &completed)
+                .await?;
+            Ok(operations_count)
+        })
     })
     .await
+    .map_err(ApplyUploadError::Db)
 }

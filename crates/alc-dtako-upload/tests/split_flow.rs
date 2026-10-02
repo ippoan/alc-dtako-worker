@@ -17,12 +17,14 @@ use std::io::Write;
 use std::sync::Arc;
 
 use alc_core_wasm::TenantId;
-use alc_dtako_upload::routes::{tenant_router, DtakoState, SPLIT_UNKO_NOS_DISPLAY_LIMIT};
+use alc_dtako_upload::routes::{
+    tenant_router, DtakoState, SPLIT_CSV_ALL_LIMIT, SPLIT_UNKO_NOS_DISPLAY_LIMIT,
+};
 use alc_dtako_upload::split::{LogLevel, SplitError};
 use alc_worker_db::PgClient;
 use axum::body::Body;
-use axum::http::{Request, StatusCode};
-use axum::Extension;
+use axum::http::{HeaderMap, Request, StatusCode};
+use axum::{middleware, Extension};
 use embedded::{kudgivt_flags, operation, tenant, upload, Embedded, Held, APP_ROLE};
 use fakes::{FakeSleeper, FakeStore, Logs};
 use futures_util::lock::Mutex;
@@ -123,6 +125,16 @@ fn state_of(
 }
 
 async fn post(state: DtakoState, tenant_id: Uuid, path: &str) -> (StatusCode, String) {
+    let (status, _, body) = post_full(state, tenant_id, path).await;
+    (status, body)
+}
+
+/// 応答ヘッダーも返す形。本文は最後まで読む (stream の口は、ここで全部の event が流れ切る)。
+async fn post_full(
+    state: DtakoState,
+    tenant_id: Uuid,
+    path: &str,
+) -> (StatusCode, HeaderMap, String) {
     let app = tenant_router()
         .with_state(state)
         .layer(Extension(TenantId(tenant_id)));
@@ -132,11 +144,29 @@ async fn post(state: DtakoState, tenant_id: Uuid, path: &str) -> (StatusCode, St
         .body(Body::empty())
         .unwrap();
     let res = app.oneshot(req).await.unwrap();
-    let status = res.status();
+    let (status, headers) = (res.status(), res.headers().clone());
     let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
         .await
         .unwrap();
-    (status, String::from_utf8(bytes.to_vec()).unwrap())
+    (status, headers, String::from_utf8(bytes.to_vec()).unwrap())
+}
+
+/// `text/event-stream` の本文を、呼び手 (管理画面の `splitCsvAllStream`) と同じ読み方で event の列にする:
+/// 空行 (`\n\n`) で message に割り、`data:` で始まる行の残りを JSON として読む。
+fn sse_events(body: &str) -> Vec<Value> {
+    let mut events = Vec::new();
+    let mut buffer = body;
+    while let Some(idx) = buffer.find("\n\n") {
+        let message = &buffer[..idx];
+        buffer = &buffer[idx + 2..];
+        for line in message.split('\n') {
+            if let Some(data) = line.strip_prefix("data:") {
+                events.push(serde_json::from_str(data.trim()).unwrap());
+            }
+        }
+    }
+    assert_eq!(buffer, "", "空行で終わっていない event が残っている");
+    events
 }
 
 fn json_of(body: &str) -> Value {
@@ -674,4 +704,264 @@ fn split_error_display_is_stage_and_kind_only() {
     assert_eq!(SplitError::Zip.to_string(), "zip");
     let source: &dyn std::error::Error = &SplitError::Zip;
     assert!(source.source().is_none());
+}
+
+// ---- 一括分割の口 POST /split-csv-all ----
+
+fn progress(current: usize, total: usize, filename: &str) -> Value {
+    json!({ "event": "progress", "current": current, "total": total, "filename": filename })
+}
+
+fn done(candidates: usize, success: usize, failed: usize, skipped: usize) -> Value {
+    json!({
+        "event": "done", "candidates": candidates, "total": success + failed,
+        "success": success, "failed": failed, "skipped": skipped
+    })
+}
+
+/// 候補 0 件 → `done` 1 個だけ (全部 0)。別テナントに未分割が在っても、自テナントの候補には入らない。
+#[tokio::test(flavor = "multi_thread")]
+async fn split_all_without_candidates_emits_only_done() {
+    let ctx = Ctx::start().await;
+    let zip = zip_of(&[("KUDGIVT.csv", b"unko,event\n1001,TEST-A\n", Deflated)]);
+    // 自テナント: 履歴は在るが、未分割の運行が無い
+    let (mine, _) = ctx.tenant_with_zip("Dtako SplitAll Mine", zip).await;
+    // 別テナント: 未分割の運行と、分割の元にできる履歴が在る
+    let other = {
+        let mut c = ctx.pg.inner.lock().await;
+        let other = tenant(&mut c, "Dtako SplitAll Other").await;
+        operation(&mut c, other, "1001", 0, false).await;
+        upload(&mut c, other, "other.zip", "completed", Some(ZIP_KEY), 0.0).await;
+        other
+    };
+
+    let (status, headers, body) = post_full(ctx.state(), mine, "/split-csv-all").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers["content-type"], "text/event-stream");
+    assert_eq!(headers["cache-control"], "no-cache");
+    assert_eq!(headers["x-accel-buffering"], "no");
+    assert_eq!(sse_events(&body), [done(0, 0, 0, 0)]);
+    assert_eq!(body, "data: {\"candidates\":0,\"event\":\"done\",\"failed\":0,\"skipped\":0,\"success\":0,\"total\":0}\n\n");
+
+    assert_eq!(ctx.store.total_put_calls(), 0);
+    assert_eq!(ctx.flags(other).await, [("1001".to_owned(), 0, false)]);
+    assert_eq!(ctx.logs.all(), []);
+    ctx.finish().await;
+}
+
+/// 2 件とも成功 → 新しい順に 1 件ずつ `progress`、終わりに `done`。両方の出力が置かれ、印が付く。
+#[tokio::test(flavor = "multi_thread")]
+async fn split_all_processes_candidates_newest_first() {
+    let ctx = Ctx::start().await;
+    let old_entries: &[Entry] = &[("KUDGIVT.csv", b"unko,event\n1101,TEST-OLD\n", Deflated)];
+    let new_entries: &[Entry] = &[("KUDGIVT.csv", b"unko,event\n1102,TEST-NEW\n", Deflated)];
+    let t = {
+        let mut c = ctx.pg.inner.lock().await;
+        let t = tenant(&mut c, "Dtako SplitAll Two").await;
+        upload(
+            &mut c,
+            t,
+            "old.zip",
+            "completed",
+            Some("zips/old.zip"),
+            300.0,
+        )
+        .await;
+        upload(
+            &mut c,
+            t,
+            "new.zip",
+            "completed",
+            Some("zips/new.zip"),
+            10.0,
+        )
+        .await;
+        operation(&mut c, t, "1101", 0, false).await;
+        operation(&mut c, t, "1102", 0, false).await;
+        t
+    };
+    ctx.store
+        .seed("zips/old.zip", zip_of(old_entries), ZIP_TYPE);
+    ctx.store
+        .seed("zips/new.zip", zip_of(new_entries), ZIP_TYPE);
+
+    let (status, body) = ctx.post(t, "/split-csv-all").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        sse_events(&body),
+        [
+            progress(1, 2, "new.zip"),
+            progress(2, 2, "old.zip"),
+            done(2, 2, 0, 0)
+        ]
+    );
+
+    let mut expected = expected_objects(t, old_entries);
+    expected.extend(expected_objects(t, new_entries));
+    let mut written = ctx.store.objects();
+    written.retain(|key, _| !key.starts_with("zips/"));
+    assert_eq!(written, expected);
+    assert_eq!(written.len(), 2);
+    let flags = ctx.flags(t).await;
+    assert_eq!(
+        flags,
+        [("1101".to_owned(), 0, true), ("1102".to_owned(), 0, true)]
+    );
+    assert_eq!(ctx.logs.all(), []);
+    ctx.finish().await;
+}
+
+/// 1 件が失敗 (zip が保存先に無い) しても続け、`done` は出る。ログは段の名前だけ (id・filename を出さない)。
+#[tokio::test(flavor = "multi_thread")]
+async fn split_all_counts_a_failed_upload_and_continues() {
+    let ctx = Ctx::start().await;
+    let entries: &[Entry] = &[("KUDGIVT.csv", b"unko,event\n1201,TEST-A\n", Deflated)];
+    let (t, missing_id, ok_id) = {
+        let mut c = ctx.pg.inner.lock().await;
+        let t = tenant(&mut c, "Dtako SplitAll Failed").await;
+        // 新しい方の zip は保存先に無い
+        let missing = upload(
+            &mut c,
+            t,
+            "missing.zip",
+            "completed",
+            Some("zips/missing.zip"),
+            10.0,
+        )
+        .await;
+        let ok = upload(&mut c, t, "ok.zip", "completed", Some(ZIP_KEY), 300.0).await;
+        operation(&mut c, t, "1201", 0, false).await;
+        (t, missing, ok)
+    };
+    ctx.store.seed(ZIP_KEY, zip_of(entries), ZIP_TYPE);
+
+    let (status, body) = ctx.post(t, "/split-csv-all").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        sse_events(&body),
+        [
+            progress(1, 2, "missing.zip"),
+            progress(2, 2, "ok.zip"),
+            done(2, 1, 1, 0)
+        ]
+    );
+    assert_eq!(ctx.written(), expected_objects(t, entries));
+    assert_eq!(ctx.flags(t).await, [("1201".to_owned(), 0, true)]);
+
+    let warn = "split-csv-all: split failed: storage".to_owned();
+    assert_eq!(ctx.logs.all(), [(LogLevel::Warn, warn)]);
+    // 本文に出てよいのは filename だけ。id・key・運行NO・テナント ID は本文にもログにも出ない
+    let ids = [
+        t.to_string(),
+        missing_id.to_string(),
+        ok_id.to_string(),
+        "1201".to_owned(),
+    ];
+    assert_no_identifiers(&ctx, &[&body], &ids);
+    assert!(!body.contains("zips/") && !ctx.logs.all()[0].1.contains("missing.zip"));
+    ctx.finish().await;
+}
+
+/// 候補が上限を超える → 新しい方から 50 件だけ処理し、残りは `skipped`。`progress` の `total` は 50。
+#[tokio::test(flavor = "multi_thread")]
+async fn split_all_stops_at_the_limit_and_reports_skipped() {
+    let ctx = Ctx::start().await;
+    let zip = zip_of(&[("KUDGIVT.csv", b"unko,event\n1301,TEST-A\n", Deflated)]);
+    let n = SPLIT_CSV_ALL_LIMIT + 1;
+    let t = {
+        let mut c = ctx.pg.inner.lock().await;
+        let t = tenant(&mut c, "Dtako SplitAll Limit").await;
+        // 履歴の行だけ 51 個 (zip は 1 つを共有)。番号が小さいほど新しい
+        for i in 0..n {
+            let name = format!("up-{i:02}.zip");
+            upload(
+                &mut c,
+                t,
+                &name,
+                "completed",
+                Some(ZIP_KEY),
+                i as f64 * 10.0,
+            )
+            .await;
+        }
+        operation(&mut c, t, "1301", 0, false).await;
+        t
+    };
+    ctx.store.seed(ZIP_KEY, zip, ZIP_TYPE);
+
+    let (status, body) = ctx.post(t, "/split-csv-all").await;
+    assert_eq!(status, StatusCode::OK);
+    let events = sse_events(&body);
+    assert_eq!(events.len(), 51);
+    for (i, event) in events[..50].iter().enumerate() {
+        assert_eq!(event, &progress(i + 1, 50, &format!("up-{i:02}.zip")));
+    }
+    assert_eq!(events[50], done(51, 50, 0, 1));
+    // 同じ key へ 50 回置いている (1 件ずつ・冪等)
+    assert_eq!(
+        ctx.store.put_calls(&format!("{t}/unko/1301/KUDGIVT.csv")),
+        50
+    );
+    assert_eq!(ctx.store.max_running(), 1);
+    assert_eq!(ctx.logs.all(), []);
+    ctx.finish().await;
+}
+
+/// 候補の取得が DB の失敗 → `error` 1 個 (message は固定の語)。`done` は出ない。ログは段と kind。
+#[tokio::test(flavor = "multi_thread")]
+async fn split_all_db_failure_emits_a_fixed_error_event() {
+    let ctx = Ctx::start().await;
+    let Ctx {
+        db,
+        pg,
+        store,
+        sleeper,
+        logs,
+    } = ctx;
+    let pg = pg.sever().await;
+    let t = Uuid::new_v4();
+
+    let state = state_of(pg.clone(), &store, &sleeper, &logs);
+    let (status, body) = post(state, t, "/split-csv-all").await;
+    // 本文を流し始めた後の失敗なので、ステータスは 200 のまま
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        sse_events(&body),
+        [json!({ "event": "error", "message": "internal_error" })]
+    );
+    let error = "split-csv-all failed: db (closed)".to_owned();
+    assert_eq!(logs.all(), [(LogLevel::Error, error)]);
+    assert!(!body.contains(&t.to_string()) && !logs.all()[0].1.contains(&t.to_string()));
+    assert_eq!(store.total_put_calls(), 0);
+    drop(pg);
+    db.shutdown();
+}
+
+/// tenant ヘッダーの layer (直下の worker が掛けるもの) を通すと、ヘッダー無しは 401 で口に届かない。
+#[tokio::test(flavor = "multi_thread")]
+async fn split_all_without_tenant_header_is_401() {
+    let ctx = Ctx::start().await;
+    let app = tenant_router()
+        .layer(middleware::from_fn(alc_core_wasm::require_tenant_header))
+        .with_state(ctx.state());
+    let post_to = |path: &str| {
+        Request::builder()
+            .method("POST")
+            .uri(path)
+            .body(Body::empty())
+            .unwrap()
+    };
+    let res = app
+        .clone()
+        .oneshot(post_to("/split-csv-all"))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    let res = app
+        .oneshot(post_to(&format!("/split-csv/{}", Uuid::new_v4())))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(ctx.logs.all(), []);
+    ctx.finish().await;
 }

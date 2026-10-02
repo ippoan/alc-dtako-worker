@@ -6,14 +6,14 @@ ippoan/alc-vein-worker に合わせている。
 
 **業務の口はまだ無い。** どの path も、tenant ヘッダー無しは 401・有りは 404 を返す
 (その前に DB へ繋ぐので、繋げなければ 503 / 500)。口は後続の PR で `crates/alc-dtako-upload` に足す。
-いま在るのは骨組みと、口が使う DB の層 (SQL の定数とそれを流す実装、その検査)。
+いま在るのは骨組みと、口が使う DB の層 (SQL の定数とそれを流す実装、その検査)・保存先の層 (R2 の抽象と PUT のやり直し)。
 
 ## 配置
 
 | 場所 | 中身 |
 |---|---|
 | 直下 (`Cargo.toml`・`wrangler.toml`・`src/`) | Worker 本体 (package `alc-dtako-worker`、wasm32-unknown-unknown)。workspace の root で、`Cargo.lock` はここの 1 つだけ。`src/lib.rs` (workers-rs への載せ方)・`src/db.rs` (DB への経路)・`src/tcp.rs` (VPC の binding の extern) |
-| `crates/alc-dtako-upload/` | route の crate (package `alc-dtako-upload`)。口の無い `tenant_router()`・SQL の定数 (`src/repo.rs` の `sql`)・それを流す tokio-postgres 実装 (`src/pg.rs`)。接続は持たない (張るのは Worker とテスト。テストの DB は process の中で起こす組み込みの PostgreSQL — 下の「DB の検査」) |
+| `crates/alc-dtako-upload/` | route の crate (package `alc-dtako-upload`)。口の無い `tenant_router()`・SQL の定数 (`src/repo.rs` の `sql`)・それを流す tokio-postgres 実装 (`src/pg.rs`)・保存先の抽象と PUT のやり直し (`src/store.rs`)。接続も R2 の実装も持たない (張るのは Worker とテスト。テストの DB は process の中で起こす組み込みの PostgreSQL — 下の「DB の検査」) |
 | `scripts/` | 公開範囲の検査 (`check-exposure.sh` と陰性対照 `check-exposure-test.sh`)、`fetch-migrations.sh` (版は `ALC_MIGRATIONS_REV`)、coverage の gate (`check_coverage_100.sh`、登録簿は直下の `coverage_100.toml`) |
 | `.github/workflows/` | `ci.yml` (検査) / `deploy.yml` (デプロイ) / `tag-release.yml` (本番用のタグ) |
 
@@ -86,6 +86,19 @@ SQL は `src/repo.rs` の `sql` の 1 か所、流すのは `src/pg.rs` の 1 �
 
 口はまだこれらを呼んでいない (Worker の `src/lib.rs` は繋いだ `PgClient` を使わずに落とす)。
 
+## 保存先の層 (`crates/alc-dtako-upload/src/store.rs`)
+
+口のコードから R2 を切り離すための小さな層。R2 の binding (`worker::Bucket`) は wasm32 でしか動かないので、口の流れを native の
+テストで通すときは偽の保存先を差す。**R2 を包む実装はまだ無い** (口を足す PR で、直下の worker に入る)。
+
+- `trait ObjectStore`: `get(key)` → `Option<Vec<u8>>` (object が無ければ `None`) / `put(key, bytes, content_type)`。
+  `trait Sleeper`: `sleep_ms(ms)` (worker では `worker::Delay`)。どちらも `Send` を要求しない (Workers の R2 の future は `Send` でない)。
+- `StoreError` が持つのは段の名前 (コードに書いた固定の語) だけ。key・bucket 名・ランタイムの生のエラー文を載せない。
+- `put_all_with_retry(store, sleeper, items)`: **失敗した PUT だけ**を最大 3 回 (`PUT_RETRY_ATTEMPTS`) までやり直す (成功済みは再送しない)。
+  回の中は同時 6 本 (`PUT_CONCURRENCY`。backend は 20。Workers の同時接続の上限に合わせた)。回の後に失敗が残り、次の回が在るときだけ
+  300ms・800ms (`PUT_RETRY_DELAYS_MS`) を待つ。回数と待ちは backend と同じ。返すのは item の `tag` だけ (`succeeded` / `failed`、順不同)。
+- 待ちに `tokio::time` を使わない (wasm32 で動かない)。`tokio` は route の crate の dev-dependency だけ。
+
 ## R2
 
 | env | binding | bucket |
@@ -139,7 +152,12 @@ cargo test -p alc-dtako-upload --test sql_db
 cargo llvm-cov --locked -p alc-dtako-upload --text > cov.txt && bash scripts/check_coverage_100.sh --use-cache cov.txt
 ```
 
-確かめること (7 本。CI は `7 passed; 0 failed; 0 ignored` を固定で見るので、減らすと落ちる。足したら `ci.yml` の数も上げる):
+`tests/store.rs` (9 本。偽の保存先と偽の待ち。DB も R2 も要らない) は保存先の層を確かめる: 1 回で全部成功なら待たない /
+1 回失敗は 2 回目で成功し、成功済みは再送しない / 2 回失敗は 3 回目で成功 (待ちは 300・800) / 3 回とも失敗は `failed` (3 回目の後は待たない) /
+同時に走る PUT は 6 本まで / 空の入力は何も呼ばない / `get` の 3 通り / `StoreError` の文に key が出ない。
+
+CI は target ごとに本数を固定で見る (`sql_db` は `7 passed`、`store` は `9 passed`、どちらも `0 failed; 0 ignored`)。減らすと落ちる。
+足したら `ci.yml` の数も上げる。`sql_db` が確かめること (7 本):
 
 - ZIP の key: 自テナントの id で引ける / 別テナントの id・key が NULL の行・存在しない id は `None`
 - 分割済みの印: 渡した運行NO の行だけに付き `RETURNING` が返る / 同じ運行NO が 2 行なら 2 つ返る / 別テナントの同じ運行NO は変わらない /
@@ -148,7 +166,7 @@ cargo llvm-cov --locked -p alc-dtako-upload --text > cov.txt && bash scripts/che
 - テナントを設定しない素の接続では `dtako_upload_history`・`dtako_operations` の行が読めない (エラーか 0 行)
 - DB のエラーがそのまま `Err` で返り、失敗した transaction が残らない / 権限の無いロールは 42501 / 切れた接続は `Err`
 
-`crates/alc-dtako-upload/src/pg.rs` は行カバレッジ 100% を保つ (登録簿は直下の `coverage_100.toml`。`repo.rs` は定数だけで実行行が無いので登録しない)。
+`crates/alc-dtako-upload/src/pg.rs` と `src/store.rs` は行カバレッジ 100% を保つ (登録簿は直下の `coverage_100.toml`。`repo.rs` は定数だけで実行行が無いので登録しない)。
 
 作りと、本物の DB との違い:
 

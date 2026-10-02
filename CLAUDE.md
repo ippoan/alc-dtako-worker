@@ -2,9 +2,9 @@
 
 デジタコの運行 CSV のアップロード・分割の Cloudflare Worker `alc-dtako` と、その route の crate `alc-dtako-upload`。
 rust-alc-api を Cloudflare Workers へ分ける 2 本目 (Refs ippoan/rust-alc-api#725)。型は 1 本目の ippoan/alc-vein-worker と同じ。
-**業務の口はまだ無い** (在るのは骨組みと DB の層)。構造は `.claude/skills/alc-dtako-worker-map`、詳細は `README.md`。
+**業務の口はまだ無い** (在るのは骨組みと DB の層・保存先の層)。構造は `.claude/skills/alc-dtako-worker-map`、詳細は `README.md`。
 
-直下 = Worker 本体 (workspace の root)。`crates/alc-dtako-upload/` = route の crate (口の無い `tenant_router()`・SQL の定数 `repo::sql`・それを流す `pg`。接続は持たない)。
+直下 = Worker 本体 (workspace の root)。`crates/alc-dtako-upload/` = route の crate (口の無い `tenant_router()`・SQL の定数 `repo::sql`・それを流す `pg`・保存先の層 `store`。接続も R2 の実装も持たない)。
 
 ## コマンド
 
@@ -12,7 +12,7 @@ rust-alc-api を Cloudflare Workers へ分ける 2 本目 (Refs ippoan/rust-alc-
 bash scripts/check-exposure.sh && bash scripts/check-exposure-test.sh   # 公開範囲の検査と陰性対照
 cargo fmt --check
 cargo clippy --locked --target wasm32-unknown-unknown --release -- -D warnings
-# DB のテスト (組み込みの PostgreSQL) + coverage 100% の gate
+# テスト (DB = 組み込みの PostgreSQL、保存先 = 偽物) + coverage 100% の gate
 bash scripts/fetch-migrations.sh && cargo llvm-cov --locked -p alc-dtako-upload --text > cov.txt && bash scripts/check_coverage_100.sh --use-cache cov.txt
 worker-build --release                                                  # worker-build 0.8.7
 npx wrangler@4.144.0 deploy --dry-run [--env staging]                   # 配信しない
@@ -28,8 +28,7 @@ npx wrangler@4.144.0 deploy --dry-run [--env staging]                   # 配信
 - **Hyperdrive の binding `DTAKO_HYPERDRIVE` はトップレベル (本番) にだけ置く。** 設定は実行用ロールのもの 1 つを複数の worker で
   共有する (worker ごとに作らない)。`env.*` の下に `hyperdrive` を置かない (本番の DB へ届くため)。
   平文の DB binding (`vpc_services` 等) を本番に置かない。Durable Object と Container は持たない。どれも `check-exposure.sh` が検査する。
-- **staging の R2 は staging 用の bucket。** `env.*` から本番の bucket (`ohishi-dtako`) を指さない (`check-exposure.sh` が検査)。
-- **secret・binding・入口 (route) を増やさない。** Cloudflare の token は org の secret を使う (repo 単位の secret を作らない)。
+- **staging の R2 は staging 用の bucket** (`env.*` から本番の bucket を指さない)。**secret・binding・入口 (route) を増やさない** (token は org の secret)。
 - **public repo。** ホスト名・IP・account ID・Tunnel ID・project ref・テナント ID・メール・接続文字列・workers.dev の subdomain の実物を、
   コード・コメント・commit・PR に書かない (`wrangler.toml` に既に在る binding 用の ID は別。ほかの場所へ写さない)。
 - **タグ `v*` = 本番。** main へのマージは staging に出るだけ。本番は Actions の Tag Release を手動で打つ。手で `v*` のタグを push しない。
@@ -38,7 +37,8 @@ npx wrangler@4.144.0 deploy --dry-run [--env staging]                   # 配信
   (`execute`・`query`・`query_one`・`query_opt`・`prepare`) を足さない** — 使うのは `TenantTx` の `query_typed` 系と `execute_typed` だけ
   (Hyperdrive 経由では名前付きの文で接続が切れる)。生の `tokio_postgres::Client` を `src/db.rs` の外へ出さない。
 - **DB の検査と coverage の gate を弱めない。** `tests/sql_db.rs` は migration が未取得なら失敗する作り (skip・`#[ignore]` にしない)。
-  CI は本数を固定して回す (`ci.yml` の `7 passed`。足したら数も上げる)。`coverage_100.toml` の登録を外さない。
+  CI は本数を target ごとに固定して回す (`ci.yml` の `sql_db` 7・`store` 9。足したら数も上げる)。`coverage_100.toml` の登録を外さない。
+  route の crate の通常の依存に `tokio` を入れない (待ちは `store::Sleeper` 越し。R2 の読み書きは `store::ObjectStore` 越し)。
 - **`pglite-oxide` は `=0.5.0` に固定**、wasmer 系 13 crate は `Cargo.lock` で alpha 版に pin (Rust 1.92.0 で通る版。toolchain は上げない)。
   lock を作り直したら pin し直す (README の「lock の pin」)。本番の wasm に pglite / wasmer を入れない。
 

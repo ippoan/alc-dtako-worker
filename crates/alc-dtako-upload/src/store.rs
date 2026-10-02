@@ -4,12 +4,13 @@
 //! 口のコードから保存先を切り離すための抽象。R2 の binding (`worker::Bucket`) は wasm32 でしか動かないので、
 //! 口の流れを native のテストで通すときは偽の保存先を差す。**R2 を包む実装はここには無い** (載せる側 = 直下の worker が持つ)。
 //!
-//! trait は `Send` を要求しない (Workers の R2 の future は `Send` でない)。待ちも [`Sleeper`] 越しで、
-//! この crate は `tokio::time` を使わない (wasm32 で動かないため)。
+//! trait は `Send + Sync` で、返す future も `Send` (axum の state と handler が `Send` を要求するため。
+//! Workers の R2 の値と future は `Send` でないので、実装する側が `worker::send` の型で包む)。
+//! 待ちも [`Sleeper`] 越しで、この crate は `tokio::time` を使わない (wasm32 で動かないため)。
 
 use std::fmt;
 
-use futures_util::future::LocalBoxFuture;
+use futures_util::future::BoxFuture;
 use futures_util::stream::{self, StreamExt};
 
 /// PUT の回 (attempt) の上限 (初回 + やり直し)。backend の `SPLIT_RETRY_ATTEMPTS` と同じ。
@@ -46,9 +47,9 @@ impl fmt::Display for StoreError {
 impl std::error::Error for StoreError {}
 
 /// 保存先 (key → bytes)。
-pub trait ObjectStore {
+pub trait ObjectStore: Send + Sync {
     /// object を読む。無ければ `Ok(None)`。
-    fn get<'a>(&'a self, key: &'a str) -> LocalBoxFuture<'a, Result<Option<Vec<u8>>, StoreError>>;
+    fn get<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<Option<Vec<u8>>, StoreError>>;
 
     /// object を書く (同じ key は上書き)。
     fn put<'a>(
@@ -56,12 +57,12 @@ pub trait ObjectStore {
         key: &'a str,
         bytes: Vec<u8>,
         content_type: &'a str,
-    ) -> LocalBoxFuture<'a, Result<(), StoreError>>;
+    ) -> BoxFuture<'a, Result<(), StoreError>>;
 }
 
 /// 待ち (worker では `worker::Delay`、テストでは待たずに値を記録する偽物)。
-pub trait Sleeper {
-    fn sleep_ms(&self, ms: u64) -> LocalBoxFuture<'_, ()>;
+pub trait Sleeper: Send + Sync {
+    fn sleep_ms(&self, ms: u64) -> BoxFuture<'_, ()>;
 }
 
 /// PUT 1 件。`tag` は呼び手のもの (結果の仕分けに使う値。この層は中身を見ない)。
@@ -94,6 +95,7 @@ pub async fn put_all_with_retry<S, P, T>(
 where
     S: ObjectStore + ?Sized,
     P: Sleeper + ?Sized,
+    T: Send,
 {
     let mut succeeded = Vec::new();
     let mut pending = items;

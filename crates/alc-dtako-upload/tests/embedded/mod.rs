@@ -10,6 +10,7 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use alc_worker_db::PgClient;
@@ -129,8 +130,8 @@ impl Embedded {
         }
     }
 
-    /// superuser の接続 (migration だけに使う)。
-    async fn superuser(&self) -> Held<Client> {
+    /// superuser の接続 (migration と、テスト用のロールを作る準備だけに使う)。
+    pub async fn superuser(&self) -> Held<Client> {
         self.connect(SUPERUSER, Some(SEARCH_PATH)).await
     }
 
@@ -183,6 +184,16 @@ impl Embedded {
         let Held { inner, task } = self.connect(role, None).await;
         Held {
             inner: PgClient::new(inner),
+            task,
+        }
+    }
+
+    /// `role` で繋いだ `PgClient` を、口の State と同じ持ち方 (async の Mutex) にしたもの。
+    /// 準備の helper には `lock().await` で `&mut PgClient` を渡す (接続は 1 本なので、口と準備で同じものを使う)。
+    pub async fn shared(&self, role: &str) -> Held<Arc<futures_util::lock::Mutex<PgClient>>> {
+        let Held { inner, task } = self.client(role).await;
+        Held {
+            inner: Arc::new(futures_util::lock::Mutex::new(inner)),
             task,
         }
     }

@@ -5,10 +5,11 @@
 #   bash scripts/check_coverage_100.sh --use-cache cov.txt
 #
 # 計測するのは `cargo test -p alc-dtako-upload` の全部 = tests/sql_db.rs (テストの中で起こす組み込みの PostgreSQL。
-# docker は要らないが、先に `bash scripts/fetch-migrations.sh` が要る — 無ければテストが落ちる) と tests/store.rs (偽の保存先)。
+# docker は要らないが、先に `bash scripts/fetch-migrations.sh` が要る — 無ければテストが落ちる)・tests/store.rs (偽の保存先)・
+# tests/split_flow.rs (口から DB・偽の保存先まで)。
 # 登録したファイルが計測に出ない・実行行が 0 のときも落ちる。
-# repo.rs は SQL の定数だけで実行行が無いので登録しない。lib.rs は口の無い Router だけ (口を足す PR で登録する)。
-# worker 本体 (直下の src/、wasm 専用) は native で計測できないので対象外。
+# repo.rs は SQL の定数だけ、lib.rs は mod 宣言だけで実行行が無いので登録しない。
+# worker 本体 (直下の src/、wasm 専用。R2 の実装 src/r2.rs を含む) は native で計測できないので対象外 (staging の実物で確かめる)。
 
 # repo::sql の定数を流す tokio-postgres 実装 (tests/sql_db.rs が組み込みの PostgreSQL で通す。CI は本数を固定して回す)
 [[files]]
@@ -17,3 +18,11 @@ path = "crates/alc-dtako-upload/src/pg.rs"
 # 保存先の抽象と PUT のやり直し (tests/store.rs が偽の保存先で通す。CI は本数を固定して回す)
 [[files]]
 path = "crates/alc-dtako-upload/src/store.rs"
+
+# 分割の流れ (tests/split_flow.rs が組み込みの PostgreSQL と偽の保存先で通す)
+[[files]]
+path = "crates/alc-dtako-upload/src/split.rs"
+
+# 口 (同上。404 / 500 の本文とログまで)
+[[files]]
+path = "crates/alc-dtako-upload/src/routes.rs"

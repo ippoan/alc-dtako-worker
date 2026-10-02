@@ -2,8 +2,8 @@
 # (Refs ippoan/rust-alc-api#725)。型は 1 本目の ippoan/alc-vein-worker に合わせる。
 # 直下の package が worker、route の crate は crates/alc-dtako-upload (同じ workspace・lock は直下の 1 つ)。
 #
-# いまは骨組みだけで、業務の口は 1 本も無い (後続の PR で crates/alc-dtako-upload に足す)。
-# この Worker が持つのは DB への経路 (`src/db.rs`) と workers-rs への載せ方 (`src/lib.rs`) だけ。
+# 口と分割の流れは crates/alc-dtako-upload に在り、この Worker が持つのは DB への経路 (`src/db.rs`)・
+# R2 の binding を保存先の層に載せる実装 (`src/r2.rs`)・workers-rs への載せ方 (`src/lib.rs`) だけ。
 [package]
 name = "alc-dtako-worker"
 version = "0.1.0"
@@ -21,17 +21,22 @@ members = ["crates/alc-dtako-upload"]
 # 別の型になり、コンパイルは通るのに全リクエストが 500 になる (layer が入れる型と route が取り出す型が合わない)。
 # rev を上げるときは Cargo.lock も一緒に更新する (CLAUDE.md)。
 # alc-worker-db (ippoan/alc-worker-kit) も同じ (出どころを 2 つにしない。`PgClient` が別の型になる)。
-# rev は ippoan/alc-vein-worker と揃えている。
+# alc-csv-parser (ippoan/rust-alc-api) も同じ。alc-worker-db の rev は ippoan/alc-vein-worker と揃えている。
 [workspace.dependencies]
-alc-core-wasm = { git = "https://github.com/ippoan/rust-alc-api", rev = "4f96141f6db258c36b28c880e27000b14391edba" }
+alc-core-wasm = { git = "https://github.com/ippoan/rust-alc-api", rev = "e8cdf85b45ba75fa63ba222ca59c9348795fdb68" }
+# 分割の純粋な部分 (`split_csv_entry`・`cap_sorted`)。backend と同じ関数を呼ぶ (写さない)。alc-core-wasm と同じ repo なので rev を揃える。
+# zip の展開 (feature `zip-extract`) は引かない (zip の既定 features が C の依存を連れてきて wasm32 に載らない)
+alc-csv-parser = { git = "https://github.com/ippoan/rust-alc-api", rev = "e8cdf85b45ba75fa63ba222ca59c9348795fdb68", default-features = false }
 alc-worker-db = { git = "https://github.com/ippoan/alc-worker-kit", rev = "6e8b169846e068a93fa367f963a578b7422f5db8", features = ["chrono"] }
 
-# 使わない依存は入れない (口を足す PR が、要るものを足す)
+# 使わない依存は入れない
 [dependencies]
 alc-core-wasm = { workspace = true }
 alc-dtako-upload = { path = "crates/alc-dtako-upload" }
 alc-worker-db = { workspace = true }
 axum = { version = "0.8", default-features = false }
+# state に持たせる `PgClient` の async の Mutex と、R2 の future を返す `BoxFuture`
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 tokio-postgres = { version = "0.7", default-features = false, features = ["js"] }
 tower-service = "0.3"
 wasm-bindgen = "0.2"

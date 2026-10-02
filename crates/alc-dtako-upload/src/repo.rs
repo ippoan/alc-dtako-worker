@@ -27,6 +27,25 @@ pub mod sql {
                  AND uh.r2_zip_key IS NOT NULL
                ORDER BY uh.created_at DESC, uh.id DESC"#;
 
+    // ---- 履歴の読み取り (一覧 2 つ・zip のダウンロード) ----
+
+    /// テナントの履歴の一覧 (新しい順に 50 件。同じ時刻は id の降順)。
+    /// $1 tenant_id → id, filename, status, error_message (NULL 可), created_at, r2_zip_key (NULL 可)。
+    pub const LIST_UPLOADS: &str = r#"SELECT id, filename, status, error_message, created_at, r2_zip_key
+               FROM alc_api.dtako_upload_history WHERE tenant_id = $1
+               ORDER BY created_at DESC, id DESC LIMIT 50"#;
+
+    /// テナントの、やり直し待ち (`pending_retry`) か失敗 (`failed`) の履歴の一覧 (新しい順に 50 件。同じ時刻は id の降順)。
+    /// $1 tenant_id → id, tenant_id, filename, status, error_message (NULL 可), created_at。
+    pub const LIST_PENDING_UPLOADS: &str = r#"SELECT id, tenant_id, filename, status, error_message, created_at
+               FROM alc_api.dtako_upload_history
+               WHERE tenant_id = $1 AND status IN ('pending_retry', 'failed')
+               ORDER BY created_at DESC, id DESC LIMIT 50"#;
+
+    /// 履歴 1 件の zip の key と filename (ダウンロード用)。$1 id / $2 tenant_id → r2_zip_key (NULL 可), filename (行が無ければ 0 行)。
+    pub const SELECT_UPLOAD_DOWNLOAD: &str =
+        "SELECT r2_zip_key, filename FROM alc_api.dtako_upload_history WHERE id = $1 AND tenant_id = $2";
+
     // ---- アップロードの取り込み (履歴・営業所と車輌と乗務員の解決・運行の入れ替え・変更記録・分類) ----
 
     /// アップロードの履歴を作る (status は `processing`)。$1 tenant_id / $2 filename → id (DB の既定値)。

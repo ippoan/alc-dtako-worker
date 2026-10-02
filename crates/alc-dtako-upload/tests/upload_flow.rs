@@ -17,14 +17,16 @@ use std::sync::Arc;
 
 use alc_core_wasm::TenantId;
 use alc_dtako_upload::ingest::IngestLimits;
-use alc_dtako_upload::routes::{tenant_router, tenant_router_with, DtakoState};
+use alc_dtako_upload::routes::{
+    safe_download_filename, tenant_router, tenant_router_with, DtakoState,
+};
 use alc_dtako_upload::split::LogLevel;
 use alc_dtako_upload::store::GET_CONCURRENCY;
 use alc_worker_db::PgClient;
 use axum::body::Body;
-use axum::http::{Request, StatusCode};
+use axum::http::{HeaderMap, Request, StatusCode};
 use axum::{middleware, Extension, Router};
-use embedded::{rows_json, tenant, upload, Embedded, Held, APP_ROLE};
+use embedded::{exec, rows_json, tenant, upload, Embedded, Held, APP_ROLE};
 use fakes::{
     declare_uncompressed_size, flag_data_descriptor, FakeClock, FakeSleeper, FakeStore, Logs,
 };
@@ -1251,4 +1253,246 @@ async fn rerun_of_a_missing_or_unreadable_upload_fails_without_identifiers() {
         (LogLevel::Error, "rerun failed: db (closed)".to_owned())
     );
     db.shutdown();
+}
+
+// ---- 履歴の読み取り口 ----
+
+/// 本文を bytes のまま返す形 (zip のダウンロード用) → (status, ヘッダー, 本文)。
+async fn call_raw(app: Router, method: &str, path: &str) -> (StatusCode, HeaderMap, Vec<u8>) {
+    let req = Request::builder().method(method).uri(path);
+    let res = app.oneshot(req.body(Body::empty()).unwrap()).await.unwrap();
+    let (status, headers) = (res.status(), res.headers().clone());
+    let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await;
+    (status, headers, bytes.unwrap().to_vec())
+}
+
+/// GET → (status, 本文の文字列)。
+async fn get_text(app: Router, path: &str) -> (StatusCode, String) {
+    let (status, _, body) = call_raw(app, "GET", path).await;
+    (status, String::from_utf8(body).unwrap())
+}
+
+/// ダウンロードの filename に残るのは、ASCII の英数字と `.`・`-`・`_` だけ。空になったら `download.zip`。
+#[test]
+fn download_filename_keeps_only_ascii_alphanumerics_dot_dash_underscore() {
+    assert_eq!(safe_download_filename("csvdata.zip"), "csvdata.zip");
+    assert_eq!(safe_download_filename("A-z_0.9.ZIP"), "A-z_0.9.ZIP");
+    // 記号・空白・引用符・path の区切り・改行は落ちる
+    let noisy = "my \"data\" (1)/..\\x;y=z\r\n.zip";
+    assert_eq!(safe_download_filename(noisy), "mydata1..xyz.zip");
+    // 非 ASCII (全角の英数字を含む) は落ちる
+    assert_eq!(safe_download_filename("運行データ１２.zip"), ".zip");
+    assert_eq!(safe_download_filename("運行データ"), "download.zip");
+    assert_eq!(safe_download_filename(""), "download.zip");
+    assert_eq!(safe_download_filename(" \"/ "), "download.zip");
+}
+
+/// 一覧 2 口の本文: キーの順と日時の書式を、文字列で固定する。テナントごとで、DB の失敗は 500。
+#[tokio::test(flavor = "multi_thread")]
+async fn upload_lists_return_fixed_key_order_and_datetime_formats() {
+    let ctx = Ctx::start().await;
+    let t = ctx.tenant("Dtako List Route Tenant").await;
+    let other = ctx.tenant("Dtako List Route Other").await;
+    let (one, two, three) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    // created_at は 3 通り: 小数が 6 桁・マイクロ秒の末尾が 0・小数が 0
+    let insert = format!(
+        "INSERT INTO dtako_upload_history (id, tenant_id, filename, status, error_message, r2_zip_key, created_at) VALUES \
+         ('{one}', $1, 'one.zip', 'completed', NULL, 'k/one.zip', TIMESTAMPTZ '2026-03-02 01:02:03.123456+00'), \
+         ('{two}', $1, 'two.zip', 'failed', 'invalid_zip', NULL, TIMESTAMPTZ '2026-03-02 01:02:02.120000+00'), \
+         ('{three}', $1, 'three.zip', 'pending_retry', NULL, 'k/three.zip', TIMESTAMPTZ '2026-03-02 01:02:01+00')"
+    );
+    {
+        let mut c = ctx.pg.inner.lock().await;
+        assert_eq!(exec(&mut c, t, &insert).await, 3);
+    }
+
+    let uploads = get_text(ctx.app(t), "/uploads").await;
+    let want = format!(
+        r#"[{{"created_at":"2026-03-02T01:02:03.123456Z","error":null,"filename":"one.zip","id":"{one}","r2_zip_key":"k/one.zip","status":"completed"}},{{"created_at":"2026-03-02T01:02:02.120Z","error":"invalid_zip","filename":"two.zip","id":"{two}","r2_zip_key":null,"status":"failed"}},{{"created_at":"2026-03-02T01:02:01Z","error":null,"filename":"three.zip","id":"{three}","r2_zip_key":"k/three.zip","status":"pending_retry"}}]"#
+    );
+    assert_eq!(uploads, (StatusCode::OK, want));
+
+    let pending = get_text(ctx.app(t), "/internal/pending").await;
+    let want = format!(
+        r#"[{{"created_at":"2026-03-02T01:02:02.120+00:00","error_message":"invalid_zip","filename":"two.zip","id":"{two}","status":"failed","tenant_id":"{t}"}},{{"created_at":"2026-03-02T01:02:01+00:00","error_message":null,"filename":"three.zip","id":"{three}","status":"pending_retry","tenant_id":"{t}"}}]"#
+    );
+    assert_eq!(pending, (StatusCode::OK, want));
+
+    // 別のテナントのヘッダーでは空の配列
+    let empty = (StatusCode::OK, "[]".to_owned());
+    assert_eq!(get_text(ctx.app(other), "/uploads").await, empty);
+    assert_eq!(get_text(ctx.app(other), "/internal/pending").await, empty);
+    // 読み取りだけ (GET 以外は 405)。tenant ヘッダーの layer を通すと、ヘッダー無しは 401
+    for path in ["/uploads", "/internal/pending"] {
+        let (status, _, _) = call_raw(ctx.app(t), "POST", path).await;
+        assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+        let guarded = tenant_router()
+            .layer(middleware::from_fn(alc_core_wasm::require_tenant_header))
+            .with_state(ctx.state());
+        let (status, _, _) = call_raw(guarded, "GET", path).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+    assert_eq!(ctx.log_lines(), []);
+
+    // 切れた接続: 500 と固定の語 (原因はログに段の名前と kind だけ)
+    let Ctx {
+        db,
+        pg,
+        store,
+        sleeper,
+        logs,
+    } = ctx;
+    let pg = pg.sever().await;
+    let state = DtakoState {
+        pg,
+        store,
+        sleeper,
+        clock: Arc::new(FakeClock::default()),
+        log: logs.sink(),
+    };
+    let app = tenant_router()
+        .with_state(state)
+        .layer(Extension(TenantId(t)));
+    let internal = (StatusCode::INTERNAL_SERVER_ERROR, INTERNAL_ERROR.to_owned());
+    assert_eq!(get_text(app.clone(), "/uploads").await, internal);
+    assert_eq!(get_text(app.clone(), "/internal/pending").await, internal);
+    assert_eq!(
+        get_text(app, &format!("/internal/download/{one}")).await,
+        internal
+    );
+    let want_logs = [
+        (LogLevel::Error, "uploads failed: db (closed)".to_owned()),
+        (LogLevel::Error, "pending failed: db (closed)".to_owned()),
+        (LogLevel::Error, "download failed: db (closed)".to_owned()),
+    ];
+    assert_eq!(logs.all(), want_logs);
+    db.shutdown();
+}
+
+/// ダウンロードの口: 保存先の zip をそのまま返す。行が無い・別テナント・key が無いは 404、保存先に無い・読めないは 500。
+#[tokio::test(flavor = "multi_thread")]
+async fn download_returns_the_stored_zip_with_a_safe_filename() {
+    let ctx = Ctx::start().await;
+    let a = ctx.tenant("Dtako Download Tenant A").await;
+    let b = ctx.tenant("Dtako Download Tenant B").await;
+    let zip = sample_zip(60);
+    let (plain, noisy, non_ascii, no_key, missing) = {
+        let mut c = ctx.pg.inner.lock().await;
+        let plain = upload(
+            &mut c,
+            a,
+            "csvdata.zip",
+            "completed",
+            Some("zips/plain.zip"),
+            0.0,
+        )
+        .await;
+        let noisy = upload(
+            &mut c,
+            a,
+            "my \"data\" (1)/x;y.zip",
+            "completed",
+            Some("zips/noisy.zip"),
+            0.0,
+        )
+        .await;
+        let non_ascii = upload(
+            &mut c,
+            a,
+            "運行データ",
+            "completed",
+            Some("zips/kana.zip"),
+            0.0,
+        )
+        .await;
+        let no_key = upload(&mut c, a, "nokey.zip", "processing", None, 0.0).await;
+        let missing = upload(
+            &mut c,
+            a,
+            "missing.zip",
+            "completed",
+            Some("zips/missing.zip"),
+            0.0,
+        )
+        .await;
+        (plain, noisy, non_ascii, no_key, missing)
+    };
+    for key in ["zips/plain.zip", "zips/noisy.zip", "zips/kana.zip"] {
+        ctx.store.seed(key, zip.clone(), "application/zip");
+    }
+    let path = |id: Uuid| format!("/internal/download/{id}");
+    let header =
+        |headers: &HeaderMap, name: &str| headers.get(name).unwrap().to_str().unwrap().to_owned();
+
+    // 200: 本文は保存先の bytes と同じ。Content-Type と Content-Disposition
+    let (status, headers, body) = call_raw(ctx.app(a), "GET", &path(plain)).await;
+    assert_eq!((status, body == zip), (StatusCode::OK, true));
+    assert_eq!(header(&headers, "content-type"), "application/zip");
+    assert_eq!(
+        header(&headers, "content-disposition"),
+        r#"attachment; filename="csvdata.zip""#
+    );
+    // 記号・空白・引用符を含む filename → 英数と . - _ だけが残る / 全部非 ASCII → download.zip
+    let (status, headers, _) = call_raw(ctx.app(a), "GET", &path(noisy)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        header(&headers, "content-disposition"),
+        r#"attachment; filename="mydata1xy.zip""#
+    );
+    let (status, headers, _) = call_raw(ctx.app(a), "GET", &path(non_ascii)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        header(&headers, "content-disposition"),
+        r#"attachment; filename="download.zip""#
+    );
+
+    // 404: 行が無い / 別のテナントのヘッダーで同じ id / zip の key が入っていない
+    let not_found = (StatusCode::NOT_FOUND, r#"{"error":"not_found"}"#.to_owned());
+    let random = Uuid::new_v4();
+    let unknown = get_text(ctx.app(a), &path(random)).await;
+    assert_eq!(unknown, not_found);
+    let other_tenant = get_text(ctx.app(b), &path(plain)).await;
+    assert_eq!(other_tenant, not_found);
+    let null_key = get_text(ctx.app(a), &path(no_key)).await;
+    assert_eq!(null_key, not_found);
+    assert_eq!(ctx.log_lines(), []);
+
+    // 500: 保存先に無い / 保存先の失敗
+    let internal = (StatusCode::INTERNAL_SERVER_ERROR, INTERNAL_ERROR.to_owned());
+    let no_object = get_text(ctx.app(a), &path(missing)).await;
+    assert_eq!(no_object, internal);
+    ctx.store.fail_gets_containing("zips/plain.zip", 1);
+    let get_failed = get_text(ctx.app(a), &path(plain)).await;
+    assert_eq!(get_failed, internal);
+    let storage = (LogLevel::Error, "download failed: storage".to_owned());
+    assert_eq!(ctx.log_lines(), [storage.clone(), storage]);
+
+    // 読み取りだけ: POST / PUT / DELETE は 405。UUID でない id は 400。tenant ヘッダー無しは 401。保存先に書いていない
+    for method in ["POST", "PUT", "DELETE"] {
+        let (status, _, _) = call_raw(ctx.app(a), method, &path(plain)).await;
+        assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED, "{method}");
+    }
+    let (status, _, _) = call_raw(ctx.app(a), "GET", "/internal/download/not-a-uuid").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let guarded = tenant_router()
+        .layer(middleware::from_fn(alc_core_wasm::require_tenant_header))
+        .with_state(ctx.state());
+    let (status, _, _) = call_raw(guarded, "GET", &path(plain)).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(ctx.store.total_put_calls(), 0);
+
+    // エラーの本文とログに、id・filename・key が出ない
+    let bodies = [
+        &unknown.1,
+        &other_tenant.1,
+        &null_key.1,
+        &no_object.1,
+        &get_failed.1,
+    ];
+    let bodies: Vec<&str> = bodies.iter().map(|b| b.as_str()).collect();
+    let ids = [random, plain, no_key, missing].map(|id| id.to_string());
+    let mut needles: Vec<&str> = ids.iter().map(String::as_str).collect();
+    needles.extend(["zips/", ".zip", "csvdata"]);
+    ctx.assert_no_identifiers(a, &bodies, &needles);
+    ctx.finish().await;
 }

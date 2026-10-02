@@ -1,5 +1,8 @@
 //! 口 (Refs ippoan/rust-alc-api#725)。
 //!
+//! - `GET /uploads` → テナントの履歴の一覧 (新しい順に 50 件)
+//! - `GET /internal/pending` → やり直し待ち・失敗の履歴の一覧 (新しい順に 50 件)
+//! - `GET /internal/download/{upload_id}` → 履歴の zip をそのまま返す
 //! - `POST /upload` → デジタコの zip (multipart の `file` field) を取り込む ([`crate::ingest::ingest_upload`])
 //! - `POST /internal/rerun/{upload_id}` → 既に保存先に在る zip を、もう一度取り込む ([`crate::ingest::rerun_upload`])
 //! - `POST /split-csv/{upload_id}` → アップロード 1 件を分割する ([`crate::split::split_upload`])
@@ -17,11 +20,12 @@ use alc_worker_db::PgClient;
 use axum::body::{Body, Bytes};
 use axum::extract::multipart::MultipartRejection;
 use axum::extract::{DefaultBodyLimit, Multipart, Path, State};
-use axum::http::header::{HeaderName, CACHE_CONTROL, CONTENT_TYPE};
+use axum::http::header::{HeaderName, CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_TYPE};
 use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::post;
+use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
+use chrono::SecondsFormat;
 use futures_util::lock::Mutex;
 use futures_util::stream;
 use serde::Serialize;
@@ -29,7 +33,7 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::ingest::{ingest_upload, rerun_upload, IngestError, IngestLimits, IngestOutcome};
-use crate::pg;
+use crate::pg::{self, PendingUploadRow, UploadRow};
 use crate::split::{split_upload, LogLevel, LogSink, SplitError};
 use crate::store::{ObjectStore, Sleeper};
 use crate::timing::{Clock, StageTimer};
@@ -74,6 +78,9 @@ pub fn tenant_router_with(limits: IngestLimits) -> Router<DtakoState> {
         },
     );
     Router::new()
+        .route("/uploads", get(list_uploads))
+        .route("/internal/pending", get(list_pending_uploads))
+        .route("/internal/download/{upload_id}", get(download))
         .route(
             "/upload",
             upload.layer(DefaultBodyLimit::max(UPLOAD_BODY_LIMIT)),
@@ -93,6 +100,136 @@ fn split_error(log: &LogSink, e: SplitError) -> ApiError {
     log(LogLevel::Error, &format!("split-csv failed: {e}"));
     let body = json!({ "error": "internal_error" });
     (StatusCode::INTERNAL_SERVER_ERROR, Json(body))
+}
+
+fn not_found() -> ApiError {
+    (StatusCode::NOT_FOUND, Json(json!({ "error": "not_found" })))
+}
+
+/// こちら側の失敗 (500)。本文は固定の語で、原因は `log` に `what` と段の名前 (と kind) だけを出す。
+fn internal_error(log: &LogSink, what: &str, stage: &str) -> ApiError {
+    log(LogLevel::Error, &format!("{what} failed: {stage}"));
+    let body = json!({ "error": "internal_error" });
+    (StatusCode::INTERNAL_SERVER_ERROR, Json(body))
+}
+
+fn db_failure(log: &LogSink, what: &str, e: &tokio_postgres::Error) -> ApiError {
+    internal_error(log, what, &format!("db ({})", alc_worker_db::kind(e)))
+}
+
+/// 履歴の一覧の 1 件。**field の順 = 本文のキーの順** (rust-alc-api の同じ口に合わせている)。
+/// `created_at` は UTC の RFC 3339 (末尾 `Z`。小数は在るぶんだけ 3 桁ずつ)。
+#[derive(Serialize)]
+struct UploadJson {
+    created_at: String,
+    error: Option<String>,
+    filename: String,
+    id: Uuid,
+    r2_zip_key: Option<String>,
+    status: String,
+}
+
+impl From<UploadRow> for UploadJson {
+    fn from(row: UploadRow) -> Self {
+        Self {
+            created_at: row.created_at.to_rfc3339_opts(SecondsFormat::AutoSi, true),
+            error: row.error_message,
+            filename: row.filename,
+            id: row.id,
+            r2_zip_key: row.r2_zip_key,
+            status: row.status,
+        }
+    }
+}
+
+/// やり直し待ち・失敗の履歴の一覧の 1 件。**field の順 = 本文のキーの順** (rust-alc-api の同じ口に合わせている)。
+/// `created_at` は RFC 3339 (末尾 `+00:00`)。
+#[derive(Serialize)]
+struct PendingUploadJson {
+    created_at: String,
+    error_message: Option<String>,
+    filename: String,
+    id: Uuid,
+    status: String,
+    tenant_id: Uuid,
+}
+
+impl From<PendingUploadRow> for PendingUploadJson {
+    fn from(row: PendingUploadRow) -> Self {
+        Self {
+            created_at: row.created_at.to_rfc3339(),
+            error_message: row.error_message,
+            filename: row.filename,
+            id: row.id,
+            status: row.status,
+            tenant_id: row.tenant_id,
+        }
+    }
+}
+
+/// ヘッダーのテナントの履歴の一覧 (テナントを設定した接続で流し、`WHERE tenant_id` でも絞る)。
+async fn list_uploads(
+    State(state): State<DtakoState>,
+    Extension(TenantId(tenant_id)): Extension<TenantId>,
+) -> Result<Json<Vec<UploadJson>>, ApiError> {
+    let rows = {
+        let mut client = state.pg.lock().await;
+        pg::list_uploads(&mut client, tenant_id).await
+    };
+    let rows = rows.map_err(|e| db_failure(&state.log, "uploads", &e))?;
+    Ok(Json(rows.into_iter().map(UploadJson::from).collect()))
+}
+
+/// ヘッダーのテナントの、やり直し待ち・失敗の履歴の一覧。
+async fn list_pending_uploads(
+    State(state): State<DtakoState>,
+    Extension(TenantId(tenant_id)): Extension<TenantId>,
+) -> Result<Json<Vec<PendingUploadJson>>, ApiError> {
+    let rows = {
+        let mut client = state.pg.lock().await;
+        pg::list_pending_uploads(&mut client, tenant_id).await
+    };
+    let rows = rows.map_err(|e| db_failure(&state.log, "pending", &e))?;
+    Ok(Json(
+        rows.into_iter().map(PendingUploadJson::from).collect(),
+    ))
+}
+
+/// ダウンロードの filename: 履歴の filename から ASCII の英数字と `.`・`-`・`_` だけを残す。空になったら `download.zip`。
+pub fn safe_download_filename(filename: &str) -> String {
+    let keep = |c: &char| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_');
+    let safe: String = filename.chars().filter(keep).collect();
+    if safe.is_empty() {
+        return "download.zip".to_owned();
+    }
+    safe
+}
+
+/// 履歴の zip をそのまま返す。行が無い・zip の key が入っていないは 404、保存先に無い・読めないは 500。
+async fn download(
+    State(state): State<DtakoState>,
+    Extension(TenantId(tenant_id)): Extension<TenantId>,
+    Path(upload_id): Path<Uuid>,
+) -> Result<Response, ApiError> {
+    let row = {
+        let mut client = state.pg.lock().await;
+        pg::upload_download(&mut client, tenant_id, upload_id).await
+    };
+    let row = row.map_err(|e| db_failure(&state.log, "download", &e))?;
+    let Some((Some(key), filename)) = row else {
+        return Err(not_found());
+    };
+    let bytes = state.store.get(&key).await.ok().flatten();
+    let bytes = bytes.ok_or_else(|| internal_error(&state.log, "download", "storage"))?;
+    let disposition = format!(
+        "attachment; filename=\"{}\"",
+        safe_download_filename(&filename)
+    );
+    let headers = [
+        (CONTENT_TYPE, "application/zip".to_owned()),
+        (CONTENT_DISPOSITION, disposition),
+    ];
+    Ok((headers, bytes).into_response())
 }
 
 fn bad_request(label: &'static str) -> ApiError {

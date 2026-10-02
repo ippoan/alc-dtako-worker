@@ -35,7 +35,7 @@ use alc_dtako_upload::pg::{
     self, ApplyUploadError, CreateUploadError, OperationInput, PreparedRow,
 };
 use alc_worker_db::PgClient;
-use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
+use chrono::{Duration, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
 use embedded::{
     employee, exec, kudgivt_flags, operation, operations, rows_json, tenant, upload, Embedded,
     APP_ROLE, TABLES,
@@ -1516,5 +1516,148 @@ async fn daily_hours_stay_inside_the_tenant_and_roll_back_with_the_operations() 
     );
 
     held.close().await;
+    db.shutdown();
+}
+
+// ---- 履歴の読み取り ----
+
+/// 履歴の一覧 2 つ (新しい順・同じ時刻は id の降順・50 件まで・テナントごと・NULL の列) と、ダウンロード用の行。
+#[tokio::test(flavor = "multi_thread")]
+async fn upload_lists_are_newest_first_capped_and_scoped_to_the_tenant() {
+    let db = Embedded::start().await;
+    let mut held = db.client(APP_ROLE).await;
+    let c = &mut held.inner;
+    let a = tenant(c, "Dtako List Tenant A").await;
+    let b = tenant(c, "Dtako List Tenant B").await;
+
+    // テナント A: 1 分おきの 49 行 (f-1 が最も古い) と、それより新しい同じ時刻の 2 行 = 51 行。全部 failed
+    let series = "INSERT INTO dtako_upload_history (tenant_id, filename, status, error_message, r2_zip_key, created_at)                   SELECT $1, 'f-' || g || '.zip', 'failed', 'invalid_zip', 'k/' || g,                   TIMESTAMPTZ '2026-03-01 00:00:00+00' + g * interval '1 minute' FROM generate_series(1, 49) g";
+    assert_eq!(exec(c, a, series).await, 49);
+    let tie = "INSERT INTO dtako_upload_history (tenant_id, filename, status, created_at)                SELECT $1, 'tie.zip', 'failed', TIMESTAMPTZ '2026-03-02 00:00:00+00' FROM generate_series(1, 2)";
+    assert_eq!(exec(c, a, tie).await, 2);
+    // テナント B: 状態の違う 4 行 (時刻は小数つき)。key と error_message が NULL の行を含む
+    let mixed = "INSERT INTO dtako_upload_history (tenant_id, filename, status, error_message, r2_zip_key, created_at) VALUES                  ($1, 'done.zip', 'completed', NULL, 'k/done', TIMESTAMPTZ '2026-03-02 01:02:04+00'),                  ($1, 'failed.zip', 'failed', 'kudguri_invalid', NULL, TIMESTAMPTZ '2026-03-02 01:02:03.123456+00'),                  ($1, 'retry.zip', 'pending_retry', NULL, 'k/retry', TIMESTAMPTZ '2026-03-02 01:02:02+00'),                  ($1, 'running.zip', 'processing', NULL, NULL, TIMESTAMPTZ '2026-03-02 01:02:01+00')";
+    assert_eq!(exec(c, b, mixed).await, 4);
+
+    // A: 50 件で切れる (最も古い f-1 が落ちる)。先頭は同じ時刻の 2 行で、id の降順
+    let listed = pg::list_uploads(c, a).await.unwrap();
+    let names: Vec<&str> = listed.iter().map(|r| r.filename.as_str()).collect();
+    let mut want: Vec<String> = vec!["tie.zip".into(), "tie.zip".into()];
+    want.extend((2..=49).rev().map(|g| format!("f-{g}.zip")));
+    assert_eq!(names, want);
+    assert!(listed[0].id > listed[1].id);
+    let pending = pg::list_pending_uploads(c, a).await.unwrap();
+    let pending_names: Vec<&str> = pending.iter().map(|r| r.filename.as_str()).collect();
+    assert_eq!(pending_names, want);
+    assert!(pending[0].id > pending[1].id);
+    assert!(pending.iter().all(|r| r.tenant_id == a));
+    // 列の中身 (f-49 の行)
+    let at = |h, m, s| Utc.with_ymd_and_hms(2026, 3, 2, h, m, s).unwrap();
+    let newest = &listed[2];
+    let got = (
+        newest.status.as_str(),
+        newest.error_message.as_deref(),
+        newest.r2_zip_key.as_deref(),
+        newest.created_at,
+    );
+    let created = Utc.with_ymd_and_hms(2026, 3, 1, 0, 49, 0).unwrap();
+    assert_eq!(got, ("failed", Some("invalid_zip"), Some("k/49"), created));
+
+    // B: 別テナントの行は混ざらない。NULL の列は None。一覧は 4 行とも、pending は failed と pending_retry だけ
+    let listed = pg::list_uploads(c, b).await.unwrap();
+    let rows: Vec<_> = listed
+        .iter()
+        .map(|r| {
+            (
+                r.filename.as_str(),
+                r.status.as_str(),
+                r.error_message.as_deref(),
+                r.r2_zip_key.as_deref(),
+                r.created_at,
+            )
+        })
+        .collect();
+    let want_rows = [
+        ("done.zip", "completed", None, Some("k/done"), at(1, 2, 4)),
+        (
+            "failed.zip",
+            "failed",
+            Some("kudguri_invalid"),
+            None,
+            at(1, 2, 3) + Duration::microseconds(123_456),
+        ),
+        (
+            "retry.zip",
+            "pending_retry",
+            None,
+            Some("k/retry"),
+            at(1, 2, 2),
+        ),
+        ("running.zip", "processing", None, None, at(1, 2, 1)),
+    ];
+    assert_eq!(rows, want_rows);
+    let pending = pg::list_pending_uploads(c, b).await.unwrap();
+    let rows: Vec<_> = pending
+        .iter()
+        .map(|r| {
+            (
+                r.tenant_id,
+                r.filename.as_str(),
+                r.status.as_str(),
+                r.error_message.as_deref(),
+                r.created_at,
+            )
+        })
+        .collect();
+    let want_rows = [
+        (
+            b,
+            "failed.zip",
+            "failed",
+            Some("kudguri_invalid"),
+            at(1, 2, 3) + Duration::microseconds(123_456),
+        ),
+        (b, "retry.zip", "pending_retry", None, at(1, 2, 2)),
+    ];
+    assert_eq!(rows, want_rows);
+    assert_eq!(pending[0].id, listed[1].id);
+    assert_eq!(
+        format!("{:?}", pending[0].clone()),
+        format!("{:?}", pending[0])
+    );
+    assert_eq!(
+        format!("{:?}", listed[0].clone()),
+        format!("{:?}", listed[0])
+    );
+
+    // ダウンロード用の行: key と filename。key が NULL の行は (None, filename)。行が無い・別テナントの id は None
+    let (done, failed) = (listed[0].id, listed[1].id);
+    let row = pg::upload_download(c, b, done).await.unwrap();
+    assert_eq!(
+        row,
+        Some((Some("k/done".to_owned()), "done.zip".to_owned()))
+    );
+    let row = pg::upload_download(c, b, failed).await.unwrap();
+    assert_eq!(row, Some((None, "failed.zip".to_owned())));
+    assert_eq!(
+        pg::upload_download(c, b, Uuid::new_v4()).await.unwrap(),
+        None
+    );
+    assert_eq!(pg::upload_download(c, a, done).await.unwrap(), None);
+
+    held.close().await;
+
+    // 切れた接続では 3 つとも DB の失敗
+    let mut c = db.client(APP_ROLE).await.sever().await;
+    assert!(pg::list_uploads(&mut c, a).await.unwrap_err().is_closed());
+    assert!(pg::list_pending_uploads(&mut c, a)
+        .await
+        .unwrap_err()
+        .is_closed());
+    assert!(pg::upload_download(&mut c, a, done)
+        .await
+        .unwrap_err()
+        .is_closed());
+    drop(c);
     db.shutdown();
 }

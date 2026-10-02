@@ -89,6 +89,29 @@ SQL は `src/repo.rs` の `sql` の 1 か所、流すのは `src/pg.rs` の 1 �
 
 分割 1 件の口が使うのは `upload_zip_key` と `mark_has_kudgivt`、一括分割の口は候補を `uploads_needing_split` で引く。
 
+### アップロードの取り込みの段 (口はまだ無い。後続の PR で足す)
+
+zip の取り込みのうち DB に書く部分の前半。**SQL は backend (ippoan/rust-alc-api) の文と同じ** (同じ入力が同じ行になることを、文が同じであることで担保する。
+まとめ直さない)。`pg.rs` は 2 つの層に分かれる: `&mut PgClient` を取って transaction を 1 回開く**段の関数**と、その中から呼ぶ
+`&TenantTx` を取る**文の関数** (transaction を開かない。`TenantTx` はテナントを設定した transaction の中でしか手に入らない)。
+
+| 段の関数 | すること |
+|---|---|
+| `create_upload(pg, tenant_id, filename)` | 履歴を作り id を返す (id は DB の既定値)。**テナントが存在しない**ときは `CreateUploadError::TenantNotFound` (ほかの DB の失敗と区別する) |
+| `set_upload_zip_key(pg, tenant_id, upload_id, key)` | 履歴に zip の key を記録する。**単独の transaction** (後の段が落ちても key は残る)。返すのは更新した行数 |
+| `prepare_upload(pg, tenant_id, rows, kudgivt_rows)` | 1 transaction の中で、**KUDGURI の行の順に** 営業所・車輌・乗務員を解決し、運行が既に在るかを見て、続けて分類を読み、未登録のイベントCD を既定の分類で足す。「既に在る」= DB に在る、または同じ zip の中で先の行に同じ (運行NO, crew_role) が出た |
+| `replace_operations(pg, tenant_id, upload_id, rows, inputs)` | 1 transaction の中で、行の順に運行を入れ替え、前の行と違えば変更記録を残す。返すのは流した**行数** (運行NO の種類の数ではない)。中身は `replace_operations_in(tx, …)` (同じ transaction の後ろに続きを足せる形) |
+| `mark_upload_failed(pg, tenant_id, upload_id, label)` | 履歴に失敗の印を付ける。`label` は呼び手が渡す固定の語 (生のエラー文を入れない) |
+
+- **乗務員の解決 (`upsert_driver`)**: 乗務員CD は `code` 列に入っていることも `driver_cd` 列に入っていることも在るので、順に当てる —
+  `code` の行 (`driver_cd` が NULL なら埋める。同じ driver_cd の別の生存行が在れば埋めない) → `driver_cd` の行 → 新規 → 一意の制約に当たったら引き直す。
+  これは運行の `driver_id` 用で、日別の集計が使う乗務員の引き当てとは別 (1 つにまとめない)。
+- **運行の入れ替え (`replace_operation`)**: 旧 snapshot → 消す → 入れる → 旧が在ったときだけ新 snapshot と比べ、違えば変更記録
+  (`reason = "reupload"`)。snapshot への分数の足し方・比べ方・記録に載せる乗務員CD は、backend と共有の `alc_csv_parser::operation_changes` を呼ぶ。
+  変更記録は追記だけ (UPDATE・DELETE を書かない)。
+- 日時 (出発・帰着・出庫・入庫) は、KUDGURI の壁時計を**そのまま UTC の時刻として**入れる。営業所・車輌・乗務員の cd が空なら DB を引かず NULL。
+- 分類は `(event_cd, 分類の文字列)` で返す。`PreparedUpload::classification_map()` が `EventClass` の map にする。
+
 ## 分割の口 `POST /split-csv/{upload_id}`
 
 アップロード済みの zip を R2 から読み、CSV を運行NO ごとに分けて R2 に置き、KUDGIVT を置けた運行に印 (`has_kudgivt`) を付ける。
@@ -228,14 +251,27 @@ cargo llvm-cov --locked -p alc-dtako-upload --text > cov.txt && bash scripts/che
 1 回失敗は 2 回目で成功し、成功済みは再送しない / 2 回失敗は 3 回目で成功 (待ちは 300・800) / 3 回とも失敗は `failed` (3 回目の後は待たない) /
 同時に走る PUT は 6 本まで / 空の入力は何も呼ばない / `get` の 3 通り / `StoreError` の文に key が出ない。
 
-CI は target ごとに本数を固定で見る (`sql_db` は `7 passed`、`store` は `9 passed`、`split_flow` は `20 passed`、どれも `0 failed; 0 ignored`)。減らすと落ちる。
-足したら `ci.yml` の数も上げる。`sql_db` が確かめること (7 本):
+CI は target ごとに本数を固定で見る (`sql_db` は `12 passed`、`store` は `9 passed`、`split_flow` は `20 passed`、どれも `0 failed; 0 ignored`)。減らすと落ちる。
+足したら `ci.yml` の数も上げる (テスト 1 本ごとに DB を起動して全 migration を流すので、本数を増やさず 1 本に筋書きを束ねる)。
+`sql_db` が確かめること (12 本)。取り込みの DB の層 (5 本):
+
+- 乗務員の解決: `code` の行を使って `driver_cd` を埋める / `driver_cd` の行へ落ちる / 新規 / 別の生存行が同じ driver_cd を持つときは埋めない /
+  論理削除済みは対象外 / INSERT が一意の制約に当たったら引き直す
+- 上げ直しと変更記録: 初回は記録なし / 同じ値は記録なし / 値が変わったら 1 件 (before・after の JSON をリテラルで比べる) / 2 人乗務は crew_role ごと /
+  前回の分数が取れないときの印 / 同じ zip の中の重複行 (後の行が残り、流した数は行の数)
+- 運行の 23 列: 全 field に別々の値を入れ、列ごとに読み戻して比べる (引数の順の取り違えを捕まえる)。日時は壁時計がそのまま UTC として入る。
+  省ける field が空の行は NULL。同じ cd の営業所・車輌は名前だけ更新する
+- テナントの分離・履歴・分類: 同じ cd・同じ運行NO でもテナントごとに別の行 / 別テナントの履歴の id には 0 行 / 存在しないテナントは区別された失敗 /
+  未登録のイベントCD を既定の分類で足す (2 回目は増えない)
+- 切れた接続では各段が DB の失敗を返す
+
+分割の口が使う 3 関数 (7 本):
 
 - ZIP の key: 自テナントの id で引ける / 別テナントの id・key が NULL の行・存在しない id は `None`
 - 分割済みの印: 渡した運行NO の行だけに付き `RETURNING` が返る / 同じ運行NO が 2 行なら 2 つ返る / 別テナントの同じ運行NO は変わらない /
   空の入力は何もしない / 101 件以上を 1 回で渡せる
 - 分割待ちの一覧: 未分割が在れば completed かつ key ありの履歴が新しい順 / 未分割が無ければ空 / completed でない・key が NULL・別テナントは出ない
-- テナントを設定しない素の接続では `dtako_upload_history`・`dtako_operations` の行が読めない (エラーか 0 行)
+- テナントを設定しない素の接続では、この crate が触る 7 つの表の行が読めない (エラーか 0 行)
 - DB のエラーがそのまま `Err` で返り、失敗した transaction が残らない / 権限の無いロールは 42501 / 切れた接続は `Err`
 
 `crates/alc-dtako-upload/src/` の `pg.rs`・`store.rs`・`split.rs`・`routes.rs` は行カバレッジ 100% を保つ (登録簿は直下の `coverage_100.toml`。`repo.rs` は定数だけで実行行が無いので登録しない)。

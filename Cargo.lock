@@ -29,7 +29,7 @@ dependencies = [
 [[package]]
 name = "alc-core-wasm"
 version = "0.1.0"
-source = "git+https://github.com/ippoan/rust-alc-api?rev=4aa019cb9da149c01d7b04fae2f646410b439c4f#4aa019cb9da149c01d7b04fae2f646410b439c4f"
+source = "git+https://github.com/ippoan/rust-alc-api?rev=19b29c45feb6742441f2331ebc820df45d12939c#19b29c45feb6742441f2331ebc820df45d12939c"
 dependencies = [
  "axum",
  "serde",
@@ -42,7 +42,7 @@ dependencies = [
 [[package]]
 name = "alc-csv-parser"
 version = "0.1.0"
-source = "git+https://github.com/ippoan/rust-alc-api?rev=4aa019cb9da149c01d7b04fae2f646410b439c4f#4aa019cb9da149c01d7b04fae2f646410b439c4f"
+source = "git+https://github.com/ippoan/rust-alc-api?rev=19b29c45feb6742441f2331ebc820df45d12939c#19b29c45feb6742441f2331ebc820df45d12939c"
 dependencies = [
  "anyhow",
  "chrono",
@@ -58,6 +58,7 @@ dependencies = [
  "alc-csv-parser",
  "alc-worker-db",
  "axum",
+ "chrono",
  "futures-util",
  "pglite-oxide",
  "serde",
@@ -2244,8 +2245,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "851ca9db4932932d69f3ea811b1abe63087a0f740a47692619dd40d4899b68be"
 dependencies = [
  "bytes",
+ "chrono",
  "fallible-iterator",
  "postgres-protocol",
+ "serde_core",
+ "serde_json",
  "uuid",
 ]
 

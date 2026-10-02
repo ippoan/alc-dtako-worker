@@ -37,7 +37,7 @@ npx wrangler@4.144.0 deploy --dry-run [--env staging]                   # 配信
 - **分割の出力 (R2 の key と中身のバイト列) を backend と変えない** — 分ける本体は `alc_csv_parser::split_csv_entry` を呼ぶ (写さない・整えない)。
   ログ (`split::LogSink`) と応答の本文に key・運行NO・upload_id・テナント ID・エラーの生の文を出さない。`unsafe` を書かない (`Send` は `worker::send` の型で)。
 - **DB の検査と coverage の gate を弱めない。** `tests/sql_db.rs` は migration が未取得なら失敗する作り (skip・`#[ignore]` にしない)。
-  CI は本数を target ごとに固定して回す (`ci.yml` の `sql_db` 7・`store` 9・`split_flow` 20。足したら数も上げる)。`coverage_100.toml` の登録を外さない。
+  CI は本数を target ごとに固定して回す (`ci.yml` の `sql_db` 12・`store` 9・`split_flow` 20。足したら数も上げる)。`coverage_100.toml` の登録を外さない。
   route の crate の通常の依存に `tokio` を入れない (待ちは `store::Sleeper` 越し。R2 の読み書きは `store::ObjectStore` 越し)。
 - **`pglite-oxide` は `=0.5.0` に固定**、wasmer 系 13 crate は `Cargo.lock` で alpha 版に pin (Rust 1.92.0 で通る版。toolchain は上げない)。
   lock を作り直したら pin し直す (README の「lock の pin」)。本番の wasm に pglite / wasmer を入れない。

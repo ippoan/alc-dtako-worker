@@ -22,6 +22,16 @@ use uuid::Uuid;
 
 /// 表の所有者でない・NOBYPASSRLS のロール (`local_app_grants.sql` が権限を付ける)。
 pub const APP_ROLE: &str = "alc_api_app";
+/// この crate が読み書きする表 (全部 RLS が効く前提。所有者でないこと・テナントなしで読めないことを検査する)。
+pub const TABLES: [&str; 7] = [
+    "dtako_upload_history",
+    "dtako_operations",
+    "dtako_offices",
+    "dtako_vehicles",
+    "dtako_event_classifications",
+    "dtako_operation_changes",
+    "employees",
+];
 const SUPERUSER: &str = "postgres";
 const SOCKET_FILE: &str = ".s.PGSQL.5432";
 const SEARCH_PATH: &str = "-c search_path=alc_api,public";
@@ -222,25 +232,28 @@ impl Drop for Embedded {
 }
 
 /// superuser / BYPASSRLS で繋ぐと RLS を素通りして、テナント分離のテストが意味を失う。
-/// `dtako_upload_history`・`dtako_operations` には FORCE ROW LEVEL SECURITY が無いので、表の所有者でも同じ。
+/// この crate が触る表 ([`TABLES`]) には FORCE ROW LEVEL SECURITY が無いので、表の所有者でも同じ。
 async fn assert_rls_applies(db: &mut PgClient) {
-    let (bypass, owned): (bool, i64) = db
-        .tenant_tx(Uuid::new_v4(), |tx| {
+    let tables: Vec<String> = TABLES.iter().map(|t| t.to_string()).collect();
+    let (bypass, known, owned): (bool, i64, i64) = db
+        .tenant_tx(Uuid::new_v4(), move |tx| {
             Box::pin(async move {
                 let row = tx
                     .query_typed_one(
                         "SELECT (SELECT rolsuper OR rolbypassrls FROM pg_roles WHERE rolname = current_user), \
+                         (SELECT COUNT(*) FROM pg_tables WHERE schemaname = 'alc_api' AND tablename = ANY($1)), \
                          (SELECT COUNT(*) FROM pg_tables WHERE schemaname = 'alc_api' \
-                          AND tablename IN ('dtako_upload_history', 'dtako_operations') AND tableowner = current_user)",
-                        &[],
+                          AND tablename = ANY($1) AND tableowner = current_user)",
+                        &[(&tables, Type::TEXT_ARRAY)],
                     )
                     .await?;
-                Ok((row.get(0), row.get(1)))
+                Ok((row.get(0), row.get(1), row.get(2)))
             })
         })
         .await
         .unwrap();
     assert!(!bypass, "RLS を素通りするロールで繋いでいる");
+    assert_eq!(known, TABLES.len() as i64, "検査の対象の表が見つからない");
     assert_eq!(owned, 0, "表の所有者で繋いでいる");
 }
 
@@ -373,4 +386,66 @@ pub async fn kudgivt_flags(db: &mut PgClient, tenant_id: Uuid) -> Vec<(String, i
     })
     .await
     .unwrap()
+}
+
+/// 任意の文を流す (`$1` = tenant_id を必ず使う文)。影響した行数を返す。値はテストの固定値を文に直に書く。
+pub async fn exec(db: &mut PgClient, tenant_id: Uuid, sql: &str) -> u64 {
+    let sql = sql.to_owned();
+    db.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move { tx.execute_typed(&sql, &[(&tenant_id, Type::UUID)]).await })
+    })
+    .await
+    .unwrap()
+}
+
+/// `query` (`$1` = tenant_id を必ず使う SELECT) の結果を、行ごとの JSON にして返す (列名 → 値)。
+pub async fn rows_json(db: &mut PgClient, tenant_id: Uuid, query: &str) -> Vec<serde_json::Value> {
+    let sql = format!("SELECT to_jsonb(t)::text FROM ({query}) t");
+    let rows: Vec<String> = db
+        .tenant_tx(tenant_id, move |tx| {
+            Box::pin(async move {
+                let rows = tx.query_typed(&sql, &[(&tenant_id, Type::UUID)]).await?;
+                Ok(rows.into_iter().map(|r| r.get(0)).collect())
+            })
+        })
+        .await
+        .unwrap();
+    let parse = |text: &String| serde_json::from_str(text).unwrap();
+    rows.iter().map(parse).collect()
+}
+
+/// 乗務員 1 行。`code` (社員番号) と `driver_cd` はどちらも無しにできる。`deleted` なら論理削除済みにする。
+pub async fn employee(
+    db: &mut PgClient,
+    tenant_id: Uuid,
+    code: Option<&str>,
+    driver_cd: Option<&str>,
+    name: &str,
+    deleted: bool,
+) -> Uuid {
+    let id = Uuid::new_v4();
+    let (code, driver_cd) = (code.map(str::to_owned), driver_cd.map(str::to_owned));
+    let name = name.to_owned();
+    let n = db
+        .tenant_tx(tenant_id, move |tx| {
+            Box::pin(async move {
+                tx.execute_typed(
+                    "INSERT INTO employees (id, tenant_id, code, driver_cd, name, deleted_at) \
+                     VALUES ($1, $2, $3, $4, $5, CASE WHEN $6 THEN now() END)",
+                    &[
+                        (&id, Type::UUID),
+                        (&tenant_id, Type::UUID),
+                        (&code, Type::TEXT),
+                        (&driver_cd, Type::TEXT),
+                        (&name, Type::TEXT),
+                        (&deleted, Type::BOOL),
+                    ],
+                )
+                .await
+            })
+        })
+        .await
+        .unwrap();
+    assert_eq!(n, 1, "INSERT INTO employees");
+    id
 }

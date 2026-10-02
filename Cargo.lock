@@ -46,6 +46,7 @@ dependencies = [
  "alc-core-wasm",
  "alc-worker-db",
  "axum",
+ "futures-util",
  "pglite-oxide",
  "tokio",
  "tokio-postgres",

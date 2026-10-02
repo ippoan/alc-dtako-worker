@@ -26,7 +26,7 @@ use axum::body::Body;
 use axum::http::{HeaderMap, Request, StatusCode};
 use axum::{middleware, Extension};
 use embedded::{kudgivt_flags, operation, tenant, upload, Embedded, Held, APP_ROLE};
-use fakes::{declare_uncompressed_size, FakeSleeper, FakeStore, Logs};
+use fakes::{declare_uncompressed_size, FakeClock, FakeSleeper, FakeStore, Logs};
 use futures_util::lock::Mutex;
 use serde_json::{json, Value};
 use tower::ServiceExt;
@@ -120,6 +120,7 @@ fn state_of(
         pg,
         store: store.clone(),
         sleeper: sleeper.clone(),
+        clock: Arc::new(FakeClock::default()),
         log: logs.sink(),
     }
 }

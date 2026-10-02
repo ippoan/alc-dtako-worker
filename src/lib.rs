@@ -3,7 +3,8 @@
 //! DB への経路 (staging = Workers VPC の先の PgBouncer、本番 = Hyperdrive) は [`db::connect`] の 1 か所で出し分ける。
 //! monolith と同じく `/api` 付きでも受ける。
 //!
-//! 口は `POST /split-csv/{upload_id}` (アップロード 1 件の分割) の 1 本。口と分割の流れは crates/alc-dtako-upload に在り、
+//! 口は `POST /upload` (zip の取り込み)・`POST /internal/rerun/{upload_id}` (やり直し)・`POST /split-csv/{upload_id}` (分割 1 件)・
+//! `POST /split-csv-all` (一括分割) の 4 本。口と流れは crates/alc-dtako-upload に在り、
 //! ここが足すのは DB の接続・R2 の binding ([`r2`])・ログの出し先だけ。
 //!
 //! **この Worker は JWT を検証せず、auth-worker が付け直した tenant ヘッダーを信頼する**
@@ -22,6 +23,7 @@ use std::sync::Arc;
 use alc_core_wasm::require_tenant_header;
 use alc_dtako_upload::routes::{tenant_router, DtakoState};
 use alc_dtako_upload::split::{LogLevel, LogSink};
+use alc_dtako_upload::timing::Clock;
 use axum::body::Body;
 use axum::http::{HeaderValue, Response, StatusCode};
 use axum::{middleware, Router};
@@ -36,6 +38,15 @@ use crate::r2::{R2Store, WorkerSleeper};
 
 /// R2 の binding (wrangler.toml の `[[r2_buckets]]`。本番と staging で別の bucket)
 const DTAKO_R2_BINDING: &str = "DTAKO_R2";
+
+/// ランタイムの時計 (取り込みの口が、段ごとの所要を測るのに使う)。
+struct WorkerClock;
+
+impl Clock for WorkerClock {
+    fn now_ms(&self) -> u64 {
+        Date::now().as_millis()
+    }
+}
 
 /// 口は素と `/api` の nest の両方に出す (auth-worker の proxy は `/api/…` を転送する)。
 /// どの route にも当たらない path の fallback にも tenant の layer が掛かる (ヘッダー無しは 401)。
@@ -96,14 +107,19 @@ async fn fetch(req: HttpRequest, env: Env, _ctx: Context) -> Result<Response<Bod
         pg: Arc::new(Mutex::new(pg)),
         store: Arc::new(R2Store::new(bucket)),
         sleeper: Arc::new(WorkerSleeper),
+        clock: Arc::new(WorkerClock),
         log: log_sink(),
     };
     let mut resp = match router(state).call(req).await {
         Ok(r) => r,
         Err(e) => match e {},
     };
-    // 測定用: 接続に掛かった時間だけ
-    let timing = format!("connect;dur={connect_ms}");
+    // 測定用: 接続に掛かった時間。口が段ごとの所要を載せていれば、その前に足す (どちらも名前と数字だけ)
+    let stages = resp.headers().get("server-timing");
+    let timing = match stages.and_then(|v| v.to_str().ok()) {
+        Some(stages) => format!("connect;dur={connect_ms}, {stages}"),
+        None => format!("connect;dur={connect_ms}"),
+    };
     if let Ok(v) = HeaderValue::from_str(&timing) {
         resp.headers_mut().insert("server-timing", v);
     }

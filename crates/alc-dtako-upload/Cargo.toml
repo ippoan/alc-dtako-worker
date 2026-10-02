@@ -1,0 +1,11 @@
+[package]
+name = "alc-dtako-upload"
+version = "0.1.0"
+edition = "2021"
+
+# デジタコの運行 CSV のアップロード・分割の route の crate (Refs ippoan/rust-alc-api#725)。
+# いまは口の無い Router だけ。口・trait・SQL は後続の PR で足す。
+[dependencies]
+# 出どころは直下の Cargo.toml の [workspace.dependencies] の 1 か所 (ここに git / path を書かない)
+alc-core-wasm = { workspace = true }
+axum = { version = "0.8", default-features = false }

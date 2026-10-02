@@ -1,0 +1,72 @@
+name: CI
+
+# デジタコの運行 CSV の Worker alc-dtako の検査 (ippoan/alc-vein-worker の ci.yml の形。Refs ippoan/rust-alc-api#725)。
+# デプロイは deploy.yml (別 workflow)。
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  # PR の古い run は捨てるが、main は途中で切らない
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  # `wrangler dev` を使う検査 (後続の PR で入る) の版。deploy.yml の WRANGLER_VERSION と揃える
+  WRANGLER_VERSION: 4.144.0
+
+jobs:
+  # 先頭の check-exposure.sh は「外から素で届かない」(本番は workers_dev / preview_urls = false、
+  # route / routes 無し。workers_dev = true は Cloudflare Access で守る env.staging だけ) の検査 —
+  # この Worker は X-Tenant-ID を信頼するので、崩れたら ippoan/rust-alc-api#556 と同じ穴になる。
+  # check-exposure-test.sh はその陰性対照 (wrangler.toml を崩すと exit 1 になること)。
+  dtako-worker:
+    name: Dtako Worker (wasm)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 外から直接届かないことの検査 (wrangler.toml)
+        run: bash scripts/check-exposure.sh
+      - name: check-exposure.sh の陰性対照
+        run: bash scripts/check-exposure-test.sh
+      - uses: dtolnay/rust-toolchain@1.92.0
+        with:
+          targets: wasm32-unknown-unknown
+          components: rustfmt, clippy
+      - uses: swatinem/rust-cache@v2
+        with:
+          shared-key: dtako-worker
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --target wasm32-unknown-unknown --release -- -D warnings
+      # worker-build の版は wrangler.toml の [build] command と揃える
+      - run: cargo install -q worker-build@0.8.7 --locked
+      - run: worker-build --release
+      - name: bundle サイズ (上限 10MB は gzip 後)
+        run: |
+          raw=$(stat -c%s build/index_bg.wasm)
+          gz=$(gzip -9c build/index_bg.wasm | wc -c)
+          echo "alc-dtako wasm: raw=${raw} B / gzip=${gz} B" | tee -a "$GITHUB_STEP_SUMMARY"
+          [ "$gz" -lt 10000000 ] || { echo "::error::gzip 後 ${gz} B が 10MB を超えた"; exit 1; }
+
+  # green の PR を merge する (ippoan/ci-workflows の reusable。merge は GitHub App の token で行う)。
+  # この workflow に deploy 系の job は無い (デプロイは deploy.yml。PR では --dry-run だけで、
+  # reusable が head SHA の全 check の完了を待つので dry-run の失敗でも merge されない)
+  auto-merge:
+    name: Auto Merge
+    needs: [dtako-worker]
+    if: github.event_name == 'pull_request' && needs.dtako-worker.result == 'success'
+    uses: ippoan/ci-workflows/.github/workflows/auto-merge.yml@main
+    permissions:
+      contents: write
+      pull-requests: write
+      # 無いと startup_failure になる
+      checks: read
+    secrets:
+      CI_APP_ID: ${{ secrets.CI_APP_ID }}
+      CI_APP_PRIVATE_KEY: ${{ secrets.CI_APP_PRIVATE_KEY }}

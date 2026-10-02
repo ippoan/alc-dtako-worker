@@ -23,12 +23,12 @@ members = ["crates/alc-dtako-upload"]
 # alc-worker-db (ippoan/alc-worker-kit) も同じ (出どころを 2 つにしない。`PgClient` が別の型になる)。
 # alc-csv-parser (ippoan/rust-alc-api) も同じ。alc-worker-db の rev は ippoan/alc-vein-worker と揃えている。
 [workspace.dependencies]
-alc-core-wasm = { git = "https://github.com/ippoan/rust-alc-api", rev = "0075c3f605f763403ff5deb2a7264c3b6bd867a7" }
+alc-core-wasm = { git = "https://github.com/ippoan/rust-alc-api", rev = "e14431855deb4ac6d3937af3c7db86addc7db9e7" }
 # 分割の純粋な部分 (`split_csv_entry`・`cap_sorted`)。backend と同じ関数を呼ぶ (写さない)。alc-core-wasm と同じ repo なので rev を揃える。
 # zip の展開 (feature `zip-extract`) は引かない (zip の既定 features が C の依存を連れてきて wasm32 に載らない)
-alc-csv-parser = { git = "https://github.com/ippoan/rust-alc-api", rev = "0075c3f605f763403ff5deb2a7264c3b6bd867a7", default-features = false }
+alc-csv-parser = { git = "https://github.com/ippoan/rust-alc-api", rev = "e14431855deb4ac6d3937af3c7db86addc7db9e7", default-features = false }
 # 日別の集計の計算 (`upload_daily::compute_daily_hours`)。backend と同じ関数を呼ぶ。alc-core-wasm・alc-csv-parser と同じ rev
-alc-compare = { git = "https://github.com/ippoan/rust-alc-api", rev = "0075c3f605f763403ff5deb2a7264c3b6bd867a7" }
+alc-compare = { git = "https://github.com/ippoan/rust-alc-api", rev = "e14431855deb4ac6d3937af3c7db86addc7db9e7" }
 alc-worker-db = { git = "https://github.com/ippoan/alc-worker-kit", rev = "6e8b169846e068a93fa367f963a578b7422f5db8", features = ["chrono"] }
 
 # 使わない依存は入れない

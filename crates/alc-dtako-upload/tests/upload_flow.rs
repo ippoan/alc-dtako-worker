@@ -1496,3 +1496,305 @@ async fn download_returns_the_stored_zip_with_a_safe_filename() {
     ctx.assert_no_identifiers(a, &bodies, &needles);
     ctx.finish().await;
 }
+
+// ---- 月の全員の再計算 ----
+
+/// `text/event-stream` の本文を event の列にする (空行で割り、`data:` の行を JSON に)。
+fn sse_events(body: &str) -> Vec<Value> {
+    let mut events = Vec::new();
+    for message in body.split("\n\n").filter(|m| !m.is_empty()) {
+        let data = message.strip_prefix("data: ").unwrap();
+        events.push(serde_json::from_str(data).unwrap());
+    }
+    events
+}
+
+/// `POST /recalculate?{query}` → (status, event の列)。
+async fn recalc(app: Router, query: &str) -> (StatusCode, Vec<Value>, String) {
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/recalculate?{query}"));
+    let (status, _, body) = call(app, req.body(Body::empty()).unwrap()).await;
+    let events = if status == StatusCode::OK {
+        sse_events(&body)
+    } else {
+        Vec::new()
+    };
+    (status, events, body)
+}
+
+/// 2 人乗務の運行 (休息つき) と 1 人の運行の zip。2026-03 の運行。
+fn recalc_zip() -> Vec<u8> {
+    let kudguri = [
+        kudguri_line("U-6001", 1, "D-ONE", 2, 6, 23),
+        kudguri_line("U-6001", 2, "D-TWO", 2, 6, 23),
+        kudguri_line("U-6002", 1, "D-ONE", 5, 9, 15),
+    ];
+    let kudgivt = [
+        kudgivt_line("U-6001", 1, "D-ONE", 2, "06:15", "201", 240),
+        kudgivt_line("U-6001", 1, "D-ONE", 2, "10:15", "302", 300),
+        kudgivt_line("U-6001", 1, "D-ONE", 2, "15:15", "201", 420),
+        kudgivt_line("U-6001", 2, "D-TWO", 2, "06:15", "302", 360),
+        kudgivt_line("U-6001", 2, "D-TWO", 2, "12:15", "201", 600),
+        kudgivt_line("U-6002", 1, "D-ONE", 5, "09:15", "201", 360),
+    ];
+    upload_zip(&kudguri, &kudgivt)
+}
+
+const DAYS_QUERY: &str = "SELECT e.driver_cd, h.work_date, h.start_time, h.total_work_minutes, h.total_drive_minutes, h.total_rest_minutes, \
+     h.late_night_minutes, h.drive_minutes, h.cargo_minutes, h.total_distance, h.operation_count, h.unko_nos, \
+     h.overlap_drive_minutes, h.overlap_cargo_minutes, h.overlap_break_minutes, h.overlap_restraint_minutes, h.ot_late_night_minutes \
+     FROM dtako_daily_work_hours h JOIN employees e ON e.id = h.driver_id \
+     WHERE h.tenant_id = $1 ORDER BY e.driver_cd, h.work_date, h.start_time";
+const SEGMENTS_QUERY: &str = "SELECT e.driver_cd, s.work_date, s.unko_no, s.segment_index, s.work_minutes, s.labor_minutes, \
+     s.late_night_minutes, s.drive_minutes, s.cargo_minutes, \
+     to_char(s.start_at AT TIME ZONE 'UTC', 'MM-DD HH24:MI') AS start_at, to_char(s.end_at AT TIME ZONE 'UTC', 'MM-DD HH24:MI') AS end_at \
+     FROM dtako_daily_work_segments s JOIN employees e ON e.id = s.driver_id \
+     WHERE s.tenant_id = $1 ORDER BY e.driver_cd, s.work_date, s.start_at";
+
+/// 再計算は、アップロードしたときと同じ日別とセグメントを作り直す (分割の出力は運行NO ごとに 1 回だけ読む = 2 人乗務の
+/// 運行でも休息の分数は 1 倍)。event の並び。フェリーの記録 (KUDGFRY) が在れば、それも計算に入る。
+#[tokio::test(flavor = "multi_thread")]
+async fn recalculate_rebuilds_the_same_daily_hours_as_the_upload() {
+    let ctx = Ctx::start().await;
+    let t = ctx.tenant("Dtako Recalc Route Tenant").await;
+    ctx.upload_ok(t, "recalc.zip", &recalc_zip()).await;
+    let days = ctx.rows(t, DAYS_QUERY).await;
+    let segments = ctx.rows(t, SEGMENTS_QUERY).await;
+    let rest = |rows: &[Value]| -> Vec<(String, i64)> {
+        let pick = |r: &Value| {
+            (
+                r["driver_cd"].as_str().unwrap().to_owned(),
+                r["total_rest_minutes"].as_i64().unwrap(),
+            )
+        };
+        rows.iter().map(pick).collect()
+    };
+    let want_rest = [
+        ("D-ONE".to_owned(), 300),
+        ("D-ONE".to_owned(), 0),
+        ("D-TWO".to_owned(), 360),
+    ];
+    assert_eq!(rest(&days), want_rest);
+
+    // 日別とセグメントを消してから再計算する → 同じ行が戻る (休息の分数も同じ = 1 倍)
+    {
+        let mut c = ctx.pg.inner.lock().await;
+        exec(
+            &mut c,
+            t,
+            "DELETE FROM dtako_daily_work_segments WHERE tenant_id = $1",
+        )
+        .await;
+        exec(
+            &mut c,
+            t,
+            "DELETE FROM dtako_daily_work_hours WHERE tenant_id = $1",
+        )
+        .await;
+    }
+    let (status, events, _) = recalc(ctx.app(t), "year=2026&month=3").await;
+    assert_eq!(status, StatusCode::OK);
+    // 運行の行は 3 (2 人乗務の運行は乗務員ごと)、日エントリは 3
+    let want_events = [
+        json!({ "event": "progress", "current": 0, "total": 3, "step": "start" }),
+        json!({ "event": "progress", "current": 3, "total": 3, "step": "save" }),
+        json!({ "event": "done", "total": 3, "success": 3, "failed": 0 }),
+    ];
+    assert_eq!(events, want_events);
+    assert_eq!(ctx.rows(t, DAYS_QUERY).await, days);
+    assert_eq!(ctx.rows(t, SEGMENTS_QUERY).await, segments);
+    // もう一度呼んでも同じ (上げ直しと同じく、その運行の古い行を消してから入れる)
+    let (_, again, _) = recalc(ctx.app(t), "year=2026&month=3").await;
+    assert_eq!(again, want_events);
+    assert_eq!(ctx.rows(t, DAYS_QUERY).await, days);
+
+    // フェリーの記録が在る運行は、その分数が計算に入る (1 時間のフェリー)
+    let ferry = "運行NO,1,2,3,4,5,6,7,8,9,開始,終了\nU-6002,1,2,3,4,5,6,7,8,9,2026/03/05 10:15:00,2026/03/05 11:15:00\n";
+    ctx.store.seed(
+        &format!("{t}/unko/U-6002/KUDGFRY.csv"),
+        encoding_rs::SHIFT_JIS.encode(ferry).0.into_owned(),
+        "text/csv",
+    );
+    let (_, events, _) = recalc(ctx.app(t), "year=2026&month=3").await;
+    assert_eq!(events, want_events);
+    let with_ferry = ctx.rows(t, DAYS_QUERY).await;
+    assert_eq!((&with_ferry[0], &with_ferry[2]), (&days[0], &days[2]));
+    // U-6002 の日 (運転 360 分) からフェリーの 60 分が引かれる。ほかの欄は同じ
+    let mut want_ferry_day = days[1].clone();
+    for column in ["total_work_minutes", "total_drive_minutes", "drive_minutes"] {
+        assert_eq!(days[1][column], 360, "{column}");
+        want_ferry_day[column] = json!(300);
+    }
+    assert_eq!(with_ferry[1], want_ferry_day);
+    assert_eq!(ctx.log_lines(), []);
+    ctx.finish().await;
+}
+
+/// 失敗は stream の中の `error` (固定の語)。月が不正・KUDGIVT が無い・DB の失敗。1 人の保存が失敗したら、その人の分は
+/// 戻り、そこで止まる (先に保存した人の分は残る)。別テナントには触れない。本文とログに識別子が出ない。
+#[tokio::test(flavor = "multi_thread")]
+async fn recalculate_reports_fixed_words_and_saves_per_driver() {
+    let ctx = Ctx::start().await;
+    let t = ctx.tenant("Dtako Recalc Error Tenant").await;
+    let other = ctx.tenant("Dtako Recalc Other Tenant").await;
+    let error = |message: &str| json!({ "event": "error", "message": message });
+
+    // 運行が無い月: start (0 件) → done
+    let (status, events, _) = recalc(ctx.app(t), "year=2026&month=3").await;
+    assert_eq!(status, StatusCode::OK);
+    let empty = [
+        json!({ "event": "progress", "current": 0, "total": 0, "step": "start" }),
+        json!({ "event": "done", "total": 0, "success": 0, "failed": 0 }),
+    ];
+    assert_eq!(events, empty);
+    // 月が不正: 最初の event が error
+    let (status, events, invalid_body) = recalc(ctx.app(t), "year=2026&month=13").await;
+    assert_eq!(
+        (status, events),
+        (StatusCode::OK, vec![error("month_invalid")])
+    );
+    // 12 月 (月末は翌年の 1 月 1 日の前日) も運行が無ければ start → done
+    let (_, events, _) = recalc(ctx.app(t), "year=2025&month=12").await;
+    assert_eq!(events, empty);
+    // query が無い・数でない: axum の既定の 400 (口に届かない)
+    for query in ["", "year=2026", "year=x&month=3"] {
+        let (status, _, _) = recalc(ctx.app(t), query).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{query}");
+    }
+
+    // 2 人の運行を上げて、別テナントにも同じものを上げる
+    let kudguri = [
+        kudguri_line("U-7001", 1, "D-ONE", 2, 8, 17),
+        kudguri_line("U-REJECT", 1, "D-TWO", 3, 8, 17),
+    ];
+    let kudgivt = [
+        kudgivt_line("U-7001", 1, "D-ONE", 2, "08:15", "201", 540),
+        kudgivt_line("U-REJECT", 1, "D-TWO", 3, "08:15", "201", 540),
+    ];
+    let zip = upload_zip(&kudguri, &kudgivt);
+    ctx.upload_ok(t, "two.zip", &zip).await;
+    ctx.upload_ok(other, "other.zip", &zip).await;
+    let other_days = ctx.rows(other, DAYS_QUERY).await;
+
+    // KUDGIVT が保存先に無い (運行は在る) → kudgivt_not_found。日別は変わらない
+    let mut kudgivt_keys: Vec<String> = Vec::new();
+    for unko_no in ["U-7001", "U-REJECT"] {
+        let key = format!("{t}/unko/{unko_no}/KUDGIVT.csv");
+        kudgivt_keys.push(key.clone());
+    }
+    let saved: Vec<(Vec<u8>, String)> = kudgivt_keys
+        .iter()
+        .map(|k| ctx.store.object(k).unwrap())
+        .collect();
+    for key in &kudgivt_keys {
+        ctx.store.remove(key);
+    }
+    let days_before = ctx.rows(t, DAYS_QUERY).await;
+    let (_, events, not_found_body) = recalc(ctx.app(t), "year=2026&month=3").await;
+    let start = json!({ "event": "progress", "current": 0, "total": 2, "step": "start" });
+    assert_eq!(events, [start.clone(), error("kudgivt_not_found")]);
+    assert_eq!(ctx.rows(t, DAYS_QUERY).await, days_before);
+    let warn = (
+        LogLevel::Warn,
+        "recalculate: KUDGIVT unavailable for 2 operation(s)".to_owned(),
+    );
+    assert_eq!(ctx.log_lines(), std::slice::from_ref(&warn));
+    for (key, (bytes, content_type)) in kudgivt_keys.iter().zip(saved) {
+        ctx.store.seed(key, bytes, &content_type);
+    }
+
+    // 検査用の制約を 2 つ足す: 未登録のイベントCD 999 の分類を足せない / U-REJECT のセグメントを入れられない
+    let ctx = ctx
+        .run_as_superuser(
+            "ALTER TABLE alc_api.dtako_event_classifications ADD CONSTRAINT test_reject_class CHECK (event_cd <> '999') NOT VALID; \
+             ALTER TABLE alc_api.dtako_daily_work_segments ADD CONSTRAINT test_reject_segment CHECK (unko_no <> 'U-REJECT') NOT VALID",
+        )
+        .await;
+
+    // 分類を読む段で DB が失敗する (分割の出力の KUDGIVT に未登録のイベントCD が在る) → internal_error。日別は変わらない
+    let key = format!("{t}/unko/U-7001/KUDGIVT.csv");
+    let (original, content_type) = ctx.store.object(&key).unwrap();
+    let mut with_unknown = String::from_utf8(original.clone()).unwrap();
+    with_unknown.push_str(&format!(
+        "{}\n",
+        kudgivt_line("U-7001", 1, "D-ONE", 2, "17:15", "999", 10)
+    ));
+    ctx.store
+        .seed(&key, with_unknown.into_bytes(), &content_type);
+    let (_, events, class_body) = recalc(ctx.app(t), "year=2026&month=3").await;
+    assert_eq!(events, [start.clone(), error("internal_error")]);
+    assert_eq!(ctx.rows(t, DAYS_QUERY).await, days_before);
+    ctx.store.seed(&key, original, &content_type);
+
+    // 1 人の保存が失敗する: 乗務員CD の順に保存するので D-ONE が先に保存され、D-TWO の保存で落ちる
+    // (D-TWO のセグメントの INSERT が検査用の制約に当たる)
+    let mark = "UPDATE dtako_daily_work_hours SET total_work_minutes = 1 WHERE tenant_id = $1";
+    {
+        let mut c = ctx.pg.inner.lock().await;
+        assert_eq!(exec(&mut c, t, mark).await, 2);
+    }
+    let (_, events, failed_body) = recalc(ctx.app(t), "year=2026&month=3").await;
+    assert_eq!(events, [start, error("internal_error")]);
+    let work = "SELECT e.driver_cd, h.total_work_minutes FROM dtako_daily_work_hours h \
+                JOIN employees e ON e.id = h.driver_id WHERE h.tenant_id = $1 ORDER BY e.driver_cd";
+    // D-ONE は保存し直された (540)。D-TWO は transaction が戻り、印を付けた値のまま
+    let want_work = [
+        json!({ "driver_cd": "D-ONE", "total_work_minutes": 540 }),
+        json!({ "driver_cd": "D-TWO", "total_work_minutes": 1 }),
+    ];
+    assert_eq!(ctx.rows(t, work).await, want_work);
+    let db_error = (LogLevel::Error, "recalculate failed: db (23514)".to_owned());
+    assert_eq!(ctx.log_lines(), [warn, db_error.clone(), db_error]);
+    // 別テナントの日別は、どれにも触れられていない
+    assert_eq!(ctx.rows(other, DAYS_QUERY).await, other_days);
+
+    // tenant ヘッダーの layer を通すと、ヘッダー無しは 401
+    let guarded = tenant_router()
+        .layer(middleware::from_fn(alc_core_wasm::require_tenant_header))
+        .with_state(ctx.state());
+    let (status, _, _) = recalc(guarded, "year=2026&month=3").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    // 切れた接続: 運行を読む段で DB が失敗 → internal_error
+    let ctx_logs = ctx.logs.clone();
+    let bodies = [&invalid_body, &not_found_body, &class_body, &failed_body];
+    let bodies: Vec<&str> = bodies.iter().map(|b| b.as_str()).collect();
+    ctx.assert_no_identifiers(
+        t,
+        &bodies,
+        &["U-7001", "U-REJECT", "D-ONE", "D-TWO", &other.to_string()],
+    );
+    let Ctx {
+        db,
+        pg,
+        store,
+        sleeper,
+        logs,
+    } = ctx;
+    let pg = pg.sever().await;
+    let state = DtakoState {
+        pg,
+        store,
+        sleeper,
+        clock: Arc::new(FakeClock::default()),
+        log: logs.sink(),
+    };
+    let app = tenant_router()
+        .with_state(state)
+        .layer(Extension(TenantId(t)));
+    let (status, events, _) = recalc(app, "year=2026&month=3").await;
+    assert_eq!(
+        (status, events),
+        (StatusCode::OK, vec![error("internal_error")])
+    );
+    let last = ctx_logs.all().pop().unwrap();
+    assert_eq!(
+        last,
+        (
+            LogLevel::Error,
+            "recalculate failed: db (closed)".to_owned()
+        )
+    );
+    db.shutdown();
+}

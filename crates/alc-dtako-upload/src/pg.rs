@@ -100,6 +100,71 @@ pub async fn uploads_needing_split(
 
 // ---- アップロードの取り込み ----
 
+/// 月の再計算の対象の運行 1 行 ([`sql::LIST_OPERATIONS_FOR_RECALC`])。
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecalcOperationRow {
+    pub unko_no: String,
+    pub reading_date: NaiveDate,
+    pub operation_date: Option<NaiveDate>,
+    pub departure_at: Option<DateTime<Utc>>,
+    pub return_at: Option<DateTime<Utc>>,
+    pub driver_cd: Option<String>,
+    pub total_distance: Option<f64>,
+    pub drive_time_general: Option<i32>,
+    pub drive_time_highway: Option<i32>,
+    pub drive_time_bypass: Option<i32>,
+}
+
+impl TxOutput for RecalcOperationRow {}
+
+/// [`sql::LIST_OPERATIONS_FOR_RECALC`]。`fetch_end` は月末の翌日 (範囲は両端を含む)。
+pub async fn operations_for_recalc(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+    month_start: NaiveDate,
+    fetch_end: NaiveDate,
+) -> Result<Vec<RecalcOperationRow>, tokio_postgres::Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            let params: [(&(dyn tokio_postgres::types::ToSql + Sync), Type); 3] = [
+                (&tenant_id, Type::UUID),
+                (&month_start, Type::DATE),
+                (&fetch_end, Type::DATE),
+            ];
+            let rows = tx
+                .query_typed(sql::LIST_OPERATIONS_FOR_RECALC, &params)
+                .await?;
+            let row = |r: tokio_postgres::Row| RecalcOperationRow {
+                unko_no: r.get(0),
+                reading_date: r.get(1),
+                operation_date: r.get(2),
+                departure_at: r.get(3),
+                return_at: r.get(4),
+                driver_cd: r.get(5),
+                total_distance: r.get(6),
+                drive_time_general: r.get(7),
+                drive_time_highway: r.get(8),
+                drive_time_bypass: r.get(9),
+            };
+            Ok(rows.into_iter().map(row).collect())
+        })
+    })
+    .await
+}
+
+/// 日別の保存の段 (1 transaction): [`save_daily_hours_with`] を流す。再計算が乗務員ごとに呼ぶ。
+pub async fn save_daily_hours_in_tx(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+    daily: HashMap<DayKey, DailyHours>,
+    all_unko_nos: Arc<Vec<String>>,
+) -> Result<(), tokio_postgres::Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move { save_daily_hours_with(tx, tenant_id, &daily, &all_unko_nos).await })
+    })
+    .await
+}
+
 /// 履歴の一覧の 1 行 ([`sql::LIST_UPLOADS`])。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UploadRow {
@@ -713,22 +778,43 @@ pub async fn save_daily_hours(
     tenant_id: Uuid,
     daily: &HashMap<DayKey, DailyHours>,
 ) -> Result<(), tokio_postgres::Error> {
+    let all_unko_nos = daily_unko_nos(daily);
+    save_daily_hours_with(tx, tenant_id, daily, &all_unko_nos).await
+}
+
+/// 全日エントリの運行NO を、[`DayKey`] の順に重複なしで並べる ([`save_daily_hours`] の手順 2 で消す対象)。
+pub fn daily_unko_nos(daily: &HashMap<DayKey, DailyHours>) -> Vec<String> {
+    let mut entries: Vec<(&DayKey, &DailyHours)> = daily.iter().collect();
+    entries.sort_by(|a, b| a.0.cmp(b.0));
+    let mut all_unko_nos: Vec<String> = Vec::new();
+    for (_, hours) in entries {
+        for unko_no in &hours.unko_nos {
+            if !all_unko_nos.contains(unko_no) {
+                all_unko_nos.push(unko_no.clone());
+            }
+        }
+    }
+    all_unko_nos
+}
+
+/// [`save_daily_hours`] の、手順 2 で消す対象の運行NO を外から渡す形。日エントリを分けて (例: 乗務員ごとに) 別の
+/// transaction で保存するとき、全体の運行NO ([`daily_unko_nos`]) を渡せば、まとめて保存したときと同じ行が消える。
+pub async fn save_daily_hours_with(
+    tx: &TenantTx<'_>,
+    tenant_id: Uuid,
+    daily: &HashMap<DayKey, DailyHours>,
+    all_unko_nos: &[String],
+) -> Result<(), tokio_postgres::Error> {
     let mut entries: Vec<(&DayKey, &DailyHours)> = daily.iter().collect();
     entries.sort_by(|a, b| a.0.cmp(b.0));
 
     let mut driver_ids: HashMap<&str, Option<Uuid>> = HashMap::new();
     let mut targets: Vec<Uuid> = Vec::new();
-    let mut all_unko_nos: Vec<String> = Vec::new();
-    for ((driver_cd, _, _), hours) in &entries {
+    for ((driver_cd, _, _), _) in &entries {
         if !driver_cd.is_empty() && !driver_ids.contains_key(driver_cd.as_str()) {
             let id = get_employee_id_by_driver_cd(tx, tenant_id, driver_cd).await?;
             driver_ids.insert(driver_cd, id);
             targets.extend(id.filter(|id| !targets.contains(id)));
-        }
-        for unko_no in &hours.unko_nos {
-            if !all_unko_nos.contains(unko_no) {
-                all_unko_nos.push(unko_no.clone());
-            }
         }
     }
 

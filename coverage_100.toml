@@ -31,6 +31,10 @@ path = "crates/alc-dtako-upload/src/ingest.rs"
 [[files]]
 path = "crates/alc-dtako-upload/src/archive.rs"
 
+# 月の全員の再計算の流れ (tests/upload_flow.rs が組み込みの PostgreSQL と偽の保存先で通す)
+[[files]]
+path = "crates/alc-dtako-upload/src/recalc.rs"
+
 # 段ごとの所要 (時計は差し込み。tests/upload_flow.rs が固定の歩幅の時計で通す)
 [[files]]
 path = "crates/alc-dtako-upload/src/timing.rs"

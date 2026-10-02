@@ -1,6 +1,7 @@
 name: CI
 
 # デジタコの運行 CSV の Worker alc-dtako の検査 (ippoan/alc-vein-worker の ci.yml の形。Refs ippoan/rust-alc-api#725)。
+# 公開範囲の検査・fmt・clippy・crates/alc-dtako-upload の DB のテストと coverage の gate・wasm のビルド。
 # デプロイは deploy.yml (別 workflow)。
 on:
   pull_request:
@@ -37,13 +38,33 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.92.0
         with:
           targets: wasm32-unknown-unknown
-          components: rustfmt, clippy
+          components: rustfmt, clippy, llvm-tools-preview
       - uses: swatinem/rust-cache@v2
         with:
           shared-key: dtako-worker
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo fmt --check
       - run: cargo clippy --locked --target wasm32-unknown-unknown --release -- -D warnings
+      # テスト (組み込みの PostgreSQL) が流す SQL を ippoan/alc-migrations から取る (版は scripts/ALC_MIGRATIONS_REV)
+      - run: bash scripts/fetch-migrations.sh
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      # crates/alc-dtako-upload の tests/sql_db.rs (組み込みの PostgreSQL。docker も env も要らない) を、
+      # 計測つきで 1 回だけ走らせる (素の cargo test と分けると、dev-dependency を 2 回 compile することになる)。
+      # sql_db の本数を固定する (減ったら落ちる。テストを足したらここの数も上げる)。
+      # 行カバレッジ 100% の gate の登録簿は直下の coverage_100.toml
+      - name: sql_db (組み込みの PostgreSQL) + Coverage 100% gate (crates/alc-dtako-upload)
+        run: |
+          set -o pipefail
+          # 前の計測の残り (cache から戻った profraw) を数えない
+          cargo llvm-cov clean --workspace
+          cargo llvm-cov --locked -p alc-dtako-upload --no-report 2>&1 | tee "$RUNNER_TEMP/alc-dtako-upload-test.txt"
+          # sql_db の結果の行だけを見る (unit test の行と取り違えない)
+          awk '/Running.*tests\/sql_db\.rs \(/{f=1} f && /^test result:/{print; exit}' "$RUNNER_TEMP/alc-dtako-upload-test.txt" \
+            | grep -Eq '^test result: ok\. 7 passed; 0 failed; 0 ignored'
+          cov="$RUNNER_TEMP/alc-dtako-upload-cov.txt"
+          # -p を付けないと直下の package (worker) だけが対象になり、報告が空になる
+          cargo llvm-cov report --locked -p alc-dtako-upload --text > "$cov"
+          bash scripts/check_coverage_100.sh --use-cache "$cov"
       # worker-build の版は wrangler.toml の [build] command と揃える
       - run: cargo install -q worker-build@0.8.7 --locked
       - run: worker-build --release

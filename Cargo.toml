@@ -1,0 +1,44 @@
+# デジタコの運行 CSV のアップロード・分割の Worker。rust-alc-api を Cloudflare Workers へ段階移行する 2 本目
+# (Refs ippoan/rust-alc-api#725)。型は 1 本目の ippoan/alc-vein-worker に合わせる。
+# 直下の package が worker、route の crate は crates/alc-dtako-upload (同じ workspace・lock は直下の 1 つ)。
+#
+# いまは骨組みだけで、業務の口は 1 本も無い (後続の PR で crates/alc-dtako-upload に足す)。
+# この Worker が持つのは DB への経路 (`src/db.rs`) と workers-rs への載せ方 (`src/lib.rs`) だけ。
+[package]
+name = "alc-dtako-worker"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[workspace]
+members = ["crates/alc-dtako-upload"]
+
+# alc-core-wasm は ippoan/rust-alc-api に残る。git 依存・rev 固定で引き、**書くのはここ 1 か所だけ**
+# (worker と crates/alc-dtako-upload は `workspace = true` で継承する)。出どころが 2 つになると `TenantId` が
+# 別の型になり、コンパイルは通るのに全リクエストが 500 になる (layer が入れる型と route が取り出す型が合わない)。
+# rev を上げるときは Cargo.lock も一緒に更新する (CLAUDE.md)。
+# alc-worker-db (ippoan/alc-worker-kit) も同じ (出どころを 2 つにしない。`PgClient` が別の型になる)。
+# rev は ippoan/alc-vein-worker と揃えている。
+[workspace.dependencies]
+alc-core-wasm = { git = "https://github.com/ippoan/rust-alc-api", rev = "4f96141f6db258c36b28c880e27000b14391edba" }
+alc-worker-db = { git = "https://github.com/ippoan/alc-worker-kit", rev = "6e8b169846e068a93fa367f963a578b7422f5db8", features = ["chrono"] }
+
+# 使わない依存は入れない (口を足す PR が、要るものを足す)
+[dependencies]
+alc-core-wasm = { workspace = true }
+alc-dtako-upload = { path = "crates/alc-dtako-upload" }
+alc-worker-db = { workspace = true }
+axum = { version = "0.8", default-features = false }
+tokio-postgres = { version = "0.7", default-features = false, features = ["js"] }
+tower-service = "0.3"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+worker = { version = "0.8", features = ["http", "axum", "tokio-postgres"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1

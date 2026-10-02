@@ -13,8 +13,14 @@
 //! 7. 運行の入れ替え + 日別の保存 + 完了の印 ([`pg::apply_upload`]。1 transaction)
 //! 8. 分割 ([`split_upload`])。丸ごと失敗したら待って、全体を最大 [`PUT_RETRY_ATTEMPTS`] 回。尽きても取り込みは成功のまま
 //!
-//! 2〜7 が失敗したら、履歴に失敗の印 ([`pg::mark_upload_failed`]) を付けてから失敗を返す。保存先の await を DB の
+//! やり直し ([`rerun_upload`]) は、既に保存先に在る zip をもう一度取り込む: 履歴の zip の key を引く → zip を保存先から読む →
+//! 上の 4〜8 をそのまま通す。履歴を作らない・zip を置き直さない・key を更新しない。
+//!
+//! 2〜7 (やり直しでは、key を引けた後) が失敗したら、履歴に失敗の印 ([`pg::mark_upload_failed`]) を付けてから失敗を返す。保存先の await を DB の
 //! transaction の中に挟まない (接続の lock を取って `pg` の関数を呼び、返ったら離してから保存先へ)。
+//!
+//! 段ごとの所要は [`StageTimer`] に記録する (段の名前は固定の語: `history`・`put_zip`・`parse`・`prepare`・`old_kudgivt`・`apply`・`split`、
+//! やり直しは頭が `zip_key`・`get_zip`)。失敗したときは、終えた段までが残る。
 //!
 //! **失敗の文・ログ・履歴の `error_message` は固定の語だけ** ([`IngestError::label`])。parser や DB の生の文・入力の値・
 //! key・運行NO・テナント ID を出さない。
@@ -36,6 +42,7 @@ use crate::archive::{Archive, ArchiveError, MAX_UNCOMPRESSED_BYTES};
 use crate::pg::{self, CreateUploadError, OperationInput, PreparedRow};
 use crate::split::{split_upload, LogLevel, LogSink, SplitOutcome};
 use crate::store::{ObjectStore, Sleeper, PUT_RETRY_ATTEMPTS, PUT_RETRY_DELAYS_MS};
+use crate::timing::StageTimer;
 
 /// 取り込みの上限。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,7 +59,7 @@ impl Default for IngestLimits {
     }
 }
 
-/// [`ingest_upload`] の結果。
+/// [`ingest_upload`]・[`rerun_upload`] の結果。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IngestOutcome {
     pub upload_id: Uuid,
@@ -62,9 +69,11 @@ pub struct IngestOutcome {
     pub split: SplitOutcome,
 }
 
-/// [`ingest_upload`] の失敗。`Db`・`Storage` はこちら側の失敗、ほかは入力の誤り。
+/// [`ingest_upload`]・[`rerun_upload`] の失敗。`Db`・`Storage` はこちら側の失敗、`NotFound` は対象が無い、ほかは入力の誤り。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IngestError {
+    /// やり直しの対象が無い (履歴が無い・別のテナントの履歴・zip の key が入っていない)
+    NotFound,
     /// テナントが存在しない (履歴は作られていない)
     TenantNotFound,
     /// zip として開けない、または展開できないエントリが在る
@@ -81,7 +90,7 @@ pub enum IngestError {
     KudgivtInvalid,
     /// DB の失敗。中身は `alc_worker_db::kind` の label (SQLSTATE か、接続の失敗の種類)
     Db(String),
-    /// zip を保存先に置けない
+    /// zip を保存先に置けない (やり直しでは、保存先から読めない・無い)
     Storage,
 }
 
@@ -89,6 +98,7 @@ impl IngestError {
     /// 固定の語 (応答の本文・履歴の `error_message` に使う。識別子も生の文も含まない)。
     pub fn label(&self) -> &'static str {
         match self {
+            Self::NotFound => "not_found",
             Self::TenantNotFound => "tenant_not_found",
             Self::InvalidZip => "invalid_zip",
             Self::ZipTooLarge => "zip_too_large",
@@ -101,9 +111,9 @@ impl IngestError {
         }
     }
 
-    /// 入力の誤りか (そうでなければ、こちら側の失敗)。
-    pub fn is_input_error(&self) -> bool {
-        !matches!(self, Self::Db(_) | Self::Storage)
+    /// こちら側の失敗か (そうでなければ、入力の誤りか、対象が無い)。
+    pub fn is_internal(&self) -> bool {
+        matches!(self, Self::Db(_) | Self::Storage)
     }
 }
 
@@ -138,6 +148,7 @@ pub async fn ingest_upload(
     sleeper: &dyn Sleeper,
     log: &LogSink,
     limits: IngestLimits,
+    timer: &mut StageTimer<'_>,
     tenant_id: Uuid,
     filename: String,
     zip_bytes: Bytes,
@@ -150,11 +161,75 @@ pub async fn ingest_upload(
         CreateUploadError::TenantNotFound => IngestError::TenantNotFound,
         CreateUploadError::Db(e) => db_error(e),
     })?;
+    timer.lap("history");
 
-    let applied = store_and_apply(
-        pg, store, log, limits, tenant_id, upload_id, &filename, zip_bytes,
-    );
-    let operations_count = match applied.await {
+    let applied = async {
+        store_zip(pg, store, tenant_id, upload_id, &filename, &zip_bytes).await?;
+        timer.lap("put_zip");
+        import_zip(
+            pg, store, log, limits, timer, tenant_id, upload_id, zip_bytes,
+        )
+        .await
+    };
+    let applied = applied.await;
+    finish(
+        pg, store, sleeper, log, timer, tenant_id, upload_id, applied,
+    )
+    .await
+}
+
+/// 既に保存先に在る zip を、もう一度取り込む (失敗した履歴の復旧に使う)。
+///
+/// 履歴の zip の key を引き ([`pg::upload_zip_key`]。履歴が無い・別のテナントの履歴・key が NULL は [`IngestError::NotFound`])、
+/// zip を保存先から読んで、[`ingest_upload`] の段 4〜8 を通す。履歴の status は、始めるときには変えない
+/// (成功で completed と行数、key を引けた後の失敗で failed)。
+#[allow(clippy::too_many_arguments)]
+pub async fn rerun_upload(
+    pg: &Mutex<PgClient>,
+    store: &dyn ObjectStore,
+    sleeper: &dyn Sleeper,
+    log: &LogSink,
+    limits: IngestLimits,
+    timer: &mut StageTimer<'_>,
+    tenant_id: Uuid,
+    upload_id: Uuid,
+) -> Result<IngestOutcome, IngestError> {
+    let key = {
+        let mut client = pg.lock().await;
+        pg::upload_zip_key(&mut client, tenant_id, upload_id).await
+    };
+    let key = key.map_err(db_error)?.ok_or(IngestError::NotFound)?;
+    timer.lap("zip_key");
+
+    let applied = async {
+        let zip_bytes = store.get(&key).await.ok().flatten();
+        let zip_bytes = Bytes::from(zip_bytes.ok_or(IngestError::Storage)?);
+        timer.lap("get_zip");
+        import_zip(
+            pg, store, log, limits, timer, tenant_id, upload_id, zip_bytes,
+        )
+        .await
+    };
+    let applied = applied.await;
+    finish(
+        pg, store, sleeper, log, timer, tenant_id, upload_id, applied,
+    )
+    .await
+}
+
+/// 取り込みの結果を受けて締める: 失敗なら履歴に失敗の印を付けて返し、成功なら分割 (段 8) へ進む。
+#[allow(clippy::too_many_arguments)]
+async fn finish(
+    pg: &Mutex<PgClient>,
+    store: &dyn ObjectStore,
+    sleeper: &dyn Sleeper,
+    log: &LogSink,
+    timer: &mut StageTimer<'_>,
+    tenant_id: Uuid,
+    upload_id: Uuid,
+    applied: Result<i32, IngestError>,
+) -> Result<IngestOutcome, IngestError> {
+    let operations_count = match applied {
         Ok(count) => count,
         Err(e) => {
             // 印を付けること自体の失敗は握る (返すのは元の失敗)
@@ -166,6 +241,7 @@ pub async fn ingest_upload(
     };
 
     let split = split_with_retry(pg, store, sleeper, log, tenant_id, upload_id).await;
+    timer.lap("split");
     Ok(IngestOutcome {
         upload_id,
         operations_count,
@@ -173,19 +249,15 @@ pub async fn ingest_upload(
     })
 }
 
-/// 段 2〜7。返すのは流した行数。
-#[allow(clippy::too_many_arguments)]
-async fn store_and_apply(
+/// 段 2〜3: zip を保存先に置き、key を履歴に記録する。filename は加工せず key に入れる (backend と同じ key)。
+async fn store_zip(
     pg: &Mutex<PgClient>,
     store: &dyn ObjectStore,
-    log: &LogSink,
-    limits: IngestLimits,
     tenant_id: Uuid,
     upload_id: Uuid,
     filename: &str,
-    zip_bytes: Bytes,
-) -> Result<i32, IngestError> {
-    // 2〜3: filename は加工せず key に入れる (backend と同じ key)
+    zip_bytes: &Bytes,
+) -> Result<(), IngestError> {
     let key = format!("{tenant_id}/uploads/{upload_id}/{filename}");
     let put = store.put(&key, zip_bytes.to_vec(), "application/zip");
     put.await.map_err(|_| IngestError::Storage)?;
@@ -194,11 +266,26 @@ async fn store_and_apply(
         pg::set_upload_zip_key(&mut client, tenant_id, upload_id, key).await
     };
     recorded.map_err(db_error)?;
+    Ok(())
+}
 
+/// 段 4〜7 (アップロードとやり直しで同じ)。返すのは流した行数。
+#[allow(clippy::too_many_arguments)]
+async fn import_zip(
+    pg: &Mutex<PgClient>,
+    store: &dyn ObjectStore,
+    log: &LogSink,
+    limits: IngestLimits,
+    timer: &mut StageTimer<'_>,
+    tenant_id: Uuid,
+    upload_id: Uuid,
+    zip_bytes: Bytes,
+) -> Result<i32, IngestError> {
     // 4: 読み終えたら zip を手放す
     let (rows, kudgivt_rows) = read_rows(&zip_bytes, limits)?;
     drop(zip_bytes);
     let (rows, kudgivt_rows) = (Arc::new(rows), Arc::new(kudgivt_rows));
+    timer.lap("parse");
 
     // 5
     let prepared = {
@@ -206,6 +293,7 @@ async fn store_and_apply(
         pg::prepare_upload(&mut client, tenant_id, rows.clone(), kudgivt_rows.clone()).await
     };
     let prepared = prepared.map_err(db_error)?;
+    timer.lap("prepare");
 
     // 6
     let before = before_minutes(store, log, tenant_id, &rows, &prepared.rows).await;
@@ -225,13 +313,16 @@ async fn store_and_apply(
     let classifications = prepared.classification_map();
     let daily = compute_daily_hours(&rows, &kudgivt_rows, &classifications, &HashMap::new());
     drop(kudgivt_rows);
+    timer.lap("old_kudgivt");
 
     // 7
     let applied = {
         let mut client = pg.lock().await;
         pg::apply_upload(&mut client, tenant_id, upload_id, rows, inputs, daily).await
     };
-    applied.map_err(|e| IngestError::Db(e.kind()))
+    let count = applied.map_err(|e| IngestError::Db(e.kind()))?;
+    timer.lap("apply");
+    Ok(count)
 }
 
 /// zip を展開して KUDGURI と KUDGIVT の行を読む。全エントリを展開できることも確かめる (展開できないエントリが在れば失敗)。

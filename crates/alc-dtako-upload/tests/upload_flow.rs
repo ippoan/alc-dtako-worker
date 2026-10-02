@@ -23,8 +23,10 @@ use alc_worker_db::PgClient;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::{middleware, Extension, Router};
-use embedded::{rows_json, tenant, Embedded, Held, APP_ROLE};
-use fakes::{declare_uncompressed_size, flag_data_descriptor, FakeSleeper, FakeStore, Logs};
+use embedded::{rows_json, tenant, upload, Embedded, Held, APP_ROLE};
+use fakes::{
+    declare_uncompressed_size, flag_data_descriptor, FakeClock, FakeSleeper, FakeStore, Logs,
+};
 use futures_util::lock::Mutex;
 use serde_json::{json, Value};
 use tower::ServiceExt;
@@ -123,17 +125,37 @@ fn multipart_type() -> String {
     format!("multipart/form-data; boundary={BOUNDARY}")
 }
 
-async fn send(app: Router, content_type: &str, body: Vec<u8>) -> (StatusCode, String) {
-    let req = Request::builder()
-        .method("POST")
-        .uri("/upload")
-        .header("content-type", content_type)
-        .body(Body::from(body))
-        .unwrap();
+/// 口を叩く → (status, 応答の `Server-Timing`, 本文)。
+async fn call(app: Router, req: Request<Body>) -> (StatusCode, Option<String>, String) {
     let res = app.oneshot(req).await.unwrap();
     let status = res.status();
+    let timing = res.headers().get("server-timing").cloned();
+    let timing = timing.map(|v| v.to_str().unwrap().to_owned());
     let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await;
-    (status, String::from_utf8(bytes.unwrap().to_vec()).unwrap())
+    let body = String::from_utf8(bytes.unwrap().to_vec()).unwrap();
+    (status, timing, body)
+}
+
+fn upload_request(content_type: &str, body: Vec<u8>) -> Request<Body> {
+    let req = Request::builder().method("POST").uri("/upload");
+    let req = req.header("content-type", content_type);
+    req.body(Body::from(body)).unwrap()
+}
+
+fn rerun_request(id: &str) -> Request<Body> {
+    let req = Request::builder().method("POST");
+    let req = req.uri(format!("/internal/rerun/{id}"));
+    req.body(Body::empty()).unwrap()
+}
+
+async fn send(app: Router, content_type: &str, body: Vec<u8>) -> (StatusCode, String) {
+    let (status, _, body) = call(app, upload_request(content_type, body)).await;
+    (status, body)
+}
+
+async fn post_rerun(app: Router, id: &str) -> (StatusCode, String) {
+    let (status, _, body) = call(app, rerun_request(id)).await;
+    (status, body)
 }
 
 fn json_of(body: &str) -> Value {
@@ -171,6 +193,7 @@ impl Ctx {
             pg: self.pg.inner.clone(),
             store: self.store.clone(),
             sleeper: self.sleeper.clone(),
+            clock: Arc::new(FakeClock::default()),
             log: self.logs.sink(),
         }
     }
@@ -179,6 +202,48 @@ impl Ctx {
         tenant_router()
             .with_state(self.state())
             .layer(Extension(TenantId(tenant_id)))
+    }
+
+    /// 接続を閉じ切って superuser で `sql` を流し、口の接続を張り直す (同時に張れる接続は 1 本)。保存先・待ち・ログはそのまま。
+    async fn run_as_superuser(self, sql: &str) -> Self {
+        let Self {
+            db,
+            pg,
+            store,
+            sleeper,
+            logs,
+        } = self;
+        pg.close().await;
+        let su = db.superuser().await;
+        su.inner.batch_execute(sql).await.unwrap();
+        su.close().await;
+        let pg = db.shared(APP_ROLE).await;
+        Self {
+            db,
+            pg,
+            store,
+            sleeper,
+            logs,
+        }
+    }
+
+    /// zip を `file` field で送る → (status, `Server-Timing`)。
+    async fn upload_timing(&self, tenant_id: Uuid, zip: &[u8]) -> (StatusCode, Option<String>) {
+        let body = multipart_body("file", Some("timed.zip"), zip);
+        let req = upload_request(&multipart_type(), body);
+        let (status, timing, _) = call(self.app(tenant_id), req).await;
+        (status, timing)
+    }
+
+    /// やり直しの口を叩く → (status, `Server-Timing`)。
+    async fn rerun_timing(&self, tenant_id: Uuid, id: &str) -> (StatusCode, Option<String>) {
+        let (status, timing, _) = call(self.app(tenant_id), rerun_request(id)).await;
+        (status, timing)
+    }
+
+    /// `tenant_id` として、やり直しの口を叩く → (status, 本文)。`id` は path にそのまま入れる。
+    async fn rerun(&self, tenant_id: Uuid, id: &str) -> (StatusCode, String) {
+        post_rerun(self.app(tenant_id), id).await
     }
 
     async fn tenant(&self, name: &str) -> Uuid {
@@ -399,6 +464,31 @@ async fn upload_imports_operations_daily_hours_and_splits() {
 
     assert_eq!(ctx.sleeper.slept(), Vec::<u64>::new());
     assert_eq!(ctx.log_lines(), []);
+
+    // 本文のキーの順は固定で、`upload_id` が先頭に来る (呼び手に、本文の先頭の決まった長さだけから `upload_id` を読むものが在る)。
+    // 運行が多くて運行NO の一覧が長い応答でも変わらない
+    let unko_nos: Vec<String> = (1..=30).map(|n| format!("U-LONG-{n:04}")).collect();
+    let line = |unko_no: &String| kudguri_line(unko_no, 1, "D-ONE", 9, 8, 17);
+    let kudguri: Vec<String> = unko_nos.iter().map(line).collect();
+    let line = |unko_no: &String| kudgivt_line(unko_no, 1, "D-ONE", 9, "08:15", "201", 540);
+    let kudgivt: Vec<String> = unko_nos.iter().map(line).collect();
+    let (status, text) = ctx
+        .upload(t, "many.zip", &upload_zip(&kudguri, &kudgivt))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let many_id = json_of(&text)["upload_id"].as_str().unwrap().to_owned();
+    let listed: Vec<String> = unko_nos.iter().map(|u| format!("\"{u}\"")).collect();
+    let want_text = format!(
+        r#"{{"upload_id":"{many_id}","operations_count":30,"status":"completed","split_failed":0,"split_unko_nos":[{}],"split_unko_nos_total":30,"split_failed_unko_nos":[],"split_failed_unko_nos_total":0}}"#,
+        listed.join(",")
+    );
+    assert_eq!(text, want_text);
+    assert!(text.len() > 300 && text.starts_with(r#"{"upload_id":""#));
+
+    // 応答の `Server-Timing` に、段ごとの所要が終えた順に載る (名前と数字だけ。偽の時計は読むたびに 7 進む)
+    let stages = "history;dur=7, put_zip;dur=7, parse;dur=7, prepare;dur=7, old_kudgivt;dur=7, apply;dur=7, split;dur=7";
+    let timed = ctx.upload_timing(t, &sample_zip(60)).await;
+    assert_eq!(timed, (StatusCode::OK, Some(stages.to_owned())));
     ctx.finish().await;
 }
 
@@ -513,6 +603,10 @@ async fn malformed_requests_are_400_with_fixed_labels() {
     let too_big = multipart_body("file", Some("big.zip"), &vec![0u8; 21 * 1024 * 1024]);
     let too_big = send(ctx.app(t), &multipart_type(), too_big).await;
     assert_eq!(too_big, label("invalid_multipart"));
+    // 段を 1 つも終えていない応答に `Server-Timing` は付かない
+    let req = upload_request(&multipart_type(), multipart_body("other", None, &zip));
+    let (_, timing, _) = call(ctx.app(t), req).await;
+    assert_eq!(timing, None);
     // ここまで履歴は作られていない
     assert_eq!(ctx.history(t).await, Vec::<Value>::new());
 
@@ -770,6 +864,7 @@ async fn storage_and_db_failures_are_500() {
         pg,
         store: store.clone(),
         sleeper,
+        clock: Arc::new(FakeClock::default()),
         log: logs.sink(),
     };
     let app = tenant_router()
@@ -856,4 +951,253 @@ async fn split_is_retried_as_a_whole_and_does_not_fail_the_upload() {
 
     ctx.assert_no_identifiers(t, &[], &["U-1001", "U-4001", "D-ONE", ".zip", &upload_id]);
     ctx.finish().await;
+}
+
+const REJECT: &str =
+    "ALTER TABLE alc_api.dtako_operations ADD CONSTRAINT test_reject CHECK (unko_no <> 'U-REJECT')";
+/// 既に行が在る表に足す形 (`NOT VALID` = 在る行は検査せず、これからの INSERT だけ落とす)。
+const REJECT_NEW: &str = "ALTER TABLE alc_api.dtako_operations ADD CONSTRAINT test_reject CHECK (unko_no <> 'U-REJECT') NOT VALID";
+const ACCEPT: &str = "ALTER TABLE alc_api.dtako_operations DROP CONSTRAINT test_reject";
+
+/// 復旧: 取り込みの途中で失敗した履歴 (failed) を、やり直しの口で取り込み直す。zip は保存先のものを読み、置き直さない。
+#[tokio::test(flavor = "multi_thread")]
+async fn rerun_recovers_a_failed_upload_from_the_stored_zip() {
+    let ctx = Ctx::start().await.run_as_superuser(REJECT).await;
+    let t = ctx.tenant("Dtako Rerun Tenant").await;
+    let kudguri = [
+        kudguri_line("U-5001", 1, "D-ONE", 2, 8, 17),
+        kudguri_line("U-REJECT", 1, "D-TWO", 2, 8, 17),
+    ];
+    let kudgivt = [
+        kudgivt_line("U-5001", 1, "D-ONE", 2, "08:15", "201", 540),
+        kudgivt_line("U-REJECT", 1, "D-TWO", 2, "08:15", "201", 480),
+    ];
+    let zip = upload_zip(&kudguri, &kudgivt);
+
+    // アップロードが取り込みの本体の途中で失敗 → 履歴は failed。zip は保存先に在り、key も記録されている
+    let (status, _) = ctx.upload(t, "broken.zip", &zip).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    let failed = json!({ "filename": "broken.zip", "status": "failed", "error_message": "db", "operations_count": 0, "has_key": true });
+    assert_eq!(ctx.history(t).await, [failed]);
+    let ids = "SELECT id, r2_zip_key FROM dtako_upload_history WHERE tenant_id = $1";
+    let stored = ctx.rows(t, ids).await.remove(0);
+    let upload_id = stored["id"].as_str().unwrap().to_owned();
+    let zip_key = stored["r2_zip_key"].as_str().unwrap().to_owned();
+    assert_eq!(ctx.count(t, "dtako_operations").await, 0);
+
+    // 落ちる原因を取り除いて、やり直す → 200。応答はアップロードの口と同じ形で、`upload_id` は path の id
+    let ctx = ctx.run_as_superuser(ACCEPT).await;
+    let (status, body) = ctx.rerun(t, &upload_id).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let want = json!({
+        "upload_id": upload_id,
+        "operations_count": 2,
+        "status": "completed",
+        "split_failed": 0,
+        "split_unko_nos": ["U-5001", "U-REJECT"],
+        "split_unko_nos_total": 2,
+        "split_failed_unko_nos": [],
+        "split_failed_unko_nos_total": 0,
+    });
+    assert_eq!(json_of(&body), want);
+    // 履歴は同じ 1 行のまま completed と行数になる (新しい履歴は作らない。前の失敗の語は残る — 成功の印は語を消さない)
+    let completed = json!({ "filename": "broken.zip", "status": "completed", "error_message": "db", "operations_count": 2, "has_key": true });
+    assert_eq!(ctx.history(t).await, std::slice::from_ref(&completed));
+    assert_eq!(ctx.rows(t, ids).await, [stored]);
+    let op = |unko_no: &str, driver_cd: &str| json!({ "unko_no": unko_no, "crew_role": 1, "driver_cd": driver_cd, "has_kudgivt": true, "departure": "03-02 08:15" });
+    assert_eq!(
+        ctx.operations(t).await,
+        [op("U-5001", "D-ONE"), op("U-REJECT", "D-TWO")]
+    );
+    assert_eq!(ctx.count(t, "dtako_daily_work_hours").await, 2);
+    assert_eq!(ctx.count(t, "dtako_daily_work_segments").await, 2);
+    let want_keys = [
+        "T/unko/U-5001/KUDGIVT.csv".to_owned(),
+        "T/unko/U-5001/KUDGURI.csv".to_owned(),
+        "T/unko/U-REJECT/KUDGIVT.csv".to_owned(),
+        "T/unko/U-REJECT/KUDGURI.csv".to_owned(),
+        format!("T/uploads/{upload_id}/broken.zip"),
+    ];
+    assert_eq!(ctx.keys(t), want_keys);
+
+    // もう一度やり直す → 200。同じ中身なので変更記録は増えない。zip は置き直されていない (PUT は最初のアップロードの 1 回だけ)
+    let (status, again) = ctx.rerun(t, &upload_id).await;
+    assert_eq!(status, StatusCode::OK, "{again}");
+    assert_eq!(json_of(&again), want);
+    // 本文のキーの順は、アップロードの口と同じ (文字列として比べる)
+    let want_text = format!(
+        r#"{{"upload_id":"{upload_id}","operations_count":2,"status":"completed","split_failed":0,"split_unko_nos":["U-5001","U-REJECT"],"split_unko_nos_total":2,"split_failed_unko_nos":[],"split_failed_unko_nos_total":0}}"#
+    );
+    assert_eq!(again, want_text);
+    assert_eq!(ctx.changes(t).await, Vec::<Value>::new());
+    assert_eq!(ctx.history(t).await, [completed]);
+    // やり直しの `Server-Timing` は、頭の 2 段が違う (失敗した応答には、終えた段までが載る)
+    let stages = "zip_key;dur=7, get_zip;dur=7, parse;dur=7, prepare;dur=7, old_kudgivt;dur=7, apply;dur=7, split;dur=7";
+    let timed = ctx.rerun_timing(t, &upload_id).await;
+    assert_eq!(timed, (StatusCode::OK, Some(stages.to_owned())));
+    let ctx = ctx.run_as_superuser(REJECT_NEW).await;
+    let timed = ctx.rerun_timing(t, &upload_id).await;
+    let until_apply = "zip_key;dur=7, get_zip;dur=7, parse;dur=7, prepare;dur=7, old_kudgivt;dur=7";
+    let failed = (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Some(until_apply.to_owned()),
+    );
+    assert_eq!(timed, failed);
+    let not_found = ctx.rerun_timing(t, &Uuid::new_v4().to_string()).await;
+    assert_eq!(not_found, (StatusCode::NOT_FOUND, None));
+    assert_eq!(ctx.store.put_calls(&zip_key), 1);
+    assert_eq!(
+        ctx.store.object(&zip_key),
+        Some((zip, "application/zip".to_owned()))
+    );
+
+    // ログは、最初のアップロードの失敗と、落ちるようにし直した後のやり直しの失敗の 2 行だけ
+    let want_logs = [
+        (LogLevel::Error, "upload failed: db (23514)".to_owned()),
+        (LogLevel::Error, "rerun failed: db (23514)".to_owned()),
+    ];
+    assert_eq!(ctx.log_lines(), want_logs);
+    ctx.finish().await;
+}
+
+/// やり直せるのは、ヘッダーのテナントの、zip の key が在る履歴だけ (ほかは 404)。zip が保存先に無ければ 500、壊れていれば 400 で、
+/// どちらも履歴に失敗の印が付く。
+#[tokio::test(flavor = "multi_thread")]
+async fn rerun_of_a_missing_or_unreadable_upload_fails_without_identifiers() {
+    let ctx = Ctx::start().await;
+    let a = ctx.tenant("Dtako Rerun Tenant A").await;
+    let b = ctx.tenant("Dtako Rerun Tenant B").await;
+    let (b_up, no_key, missing_zip, broken_zip) = {
+        let mut c = ctx.pg.inner.lock().await;
+        let b_up = upload(
+            &mut c,
+            b,
+            "1-other.zip",
+            "failed",
+            Some("zips/other.zip"),
+            0.0,
+        )
+        .await;
+        let no_key = upload(&mut c, a, "2-nokey.zip", "processing", None, 0.0).await;
+        let missing = upload(
+            &mut c,
+            a,
+            "3-missing.zip",
+            "processing",
+            Some("zips/missing.zip"),
+            0.0,
+        )
+        .await;
+        let broken = upload(
+            &mut c,
+            a,
+            "4-broken.zip",
+            "processing",
+            Some("zips/broken.zip"),
+            0.0,
+        )
+        .await;
+        (b_up, no_key, missing, broken)
+    };
+    ctx.store
+        .seed("zips/other.zip", sample_zip(60), "application/zip");
+    ctx.store
+        .seed("zips/broken.zip", b"not a zip".to_vec(), "application/zip");
+    let not_found = (StatusCode::NOT_FOUND, r#"{"error":"not_found"}"#.to_owned());
+
+    // 存在しない id / 別テナントの履歴の id (保存先に zip が在っても) / zip の key が NULL の履歴
+    let random = Uuid::new_v4();
+    let unknown = ctx.rerun(a, &random.to_string()).await;
+    assert_eq!(unknown, not_found);
+    let other_tenant = ctx.rerun(a, &b_up.to_string()).await;
+    assert_eq!(other_tenant, not_found);
+    let null_key = ctx.rerun(a, &no_key.to_string()).await;
+    assert_eq!(null_key, not_found);
+    let untouched = |filename: &str, status: &str, has_key: bool| json!({ "filename": filename, "status": status, "error_message": null, "operations_count": 0, "has_key": has_key });
+    assert_eq!(
+        ctx.history(b).await,
+        [untouched("1-other.zip", "failed", true)]
+    );
+    assert_eq!(ctx.count(a, "dtako_operations").await, 0);
+    assert_eq!(ctx.count(b, "dtako_operations").await, 0);
+    assert_eq!(ctx.log_lines(), []);
+
+    // zip が保存先に無い → 500。履歴は failed (段の名前)
+    let internal = (StatusCode::INTERNAL_SERVER_ERROR, INTERNAL_ERROR.to_owned());
+    let no_zip = ctx.rerun(a, &missing_zip.to_string()).await;
+    assert_eq!(no_zip, internal);
+    // zip を読めない (GET の失敗) も同じ
+    ctx.store.fail_gets_containing("zips/broken.zip", 1);
+    let get_failed = ctx.rerun(a, &broken_zip.to_string()).await;
+    assert_eq!(get_failed, internal);
+    // 壊れた zip が置いてある → 400 と、アップロードの口と同じ語。履歴は failed (同じ語)
+    let invalid = ctx.rerun(a, &broken_zip.to_string()).await;
+    assert_eq!(
+        invalid,
+        (
+            StatusCode::BAD_REQUEST,
+            r#"{"error":"invalid_zip"}"#.to_owned()
+        )
+    );
+    let failed = |filename: &str, label: &str| json!({ "filename": filename, "status": "failed", "error_message": label, "operations_count": 0, "has_key": true });
+    let want_history = [
+        untouched("2-nokey.zip", "processing", false),
+        failed("3-missing.zip", "storage"),
+        failed("4-broken.zip", "invalid_zip"),
+    ];
+    assert_eq!(ctx.history(a).await, want_history);
+    let storage = (LogLevel::Error, "rerun failed: storage".to_owned());
+    assert_eq!(ctx.log_lines(), [storage.clone(), storage]);
+    assert_eq!(ctx.store.total_put_calls(), 0);
+
+    // UUID でない id は 400 (口に届かない)。tenant ヘッダーの layer を通すと、ヘッダー無しは 401
+    let (status, _) = ctx.rerun(a, "not-a-uuid").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let guarded = tenant_router()
+        .layer(middleware::from_fn(alc_core_wasm::require_tenant_header))
+        .with_state(ctx.state());
+    let (status, _) = post_rerun(guarded, &missing_zip.to_string()).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let bodies = [
+        &unknown.1,
+        &other_tenant.1,
+        &null_key.1,
+        &no_zip.1,
+        &get_failed.1,
+        &invalid.1,
+    ];
+    let bodies: Vec<&str> = bodies.iter().map(|b| b.as_str()).collect();
+    let ids = [random, b_up, no_key, missing_zip, broken_zip].map(|id| id.to_string());
+    let mut needles: Vec<&str> = ids.iter().map(String::as_str).collect();
+    needles.extend(["zips/", ".zip"]);
+    ctx.assert_no_identifiers(a, &bodies, &needles);
+
+    // 切れた接続: key を引く段で DB が失敗 → 500 (保存先には触れない)
+    let Ctx {
+        db,
+        pg,
+        store,
+        sleeper,
+        logs,
+    } = ctx;
+    let pg = pg.sever().await;
+    let state = DtakoState {
+        pg,
+        store,
+        sleeper,
+        clock: Arc::new(FakeClock::default()),
+        log: logs.sink(),
+    };
+    let app = tenant_router()
+        .with_state(state)
+        .layer(Extension(TenantId(a)));
+    let closed = post_rerun(app, &missing_zip.to_string()).await;
+    assert_eq!(closed, internal);
+    let last = logs.all().pop().unwrap();
+    assert_eq!(
+        last,
+        (LogLevel::Error, "rerun failed: db (closed)".to_owned())
+    );
+    db.shutdown();
 }

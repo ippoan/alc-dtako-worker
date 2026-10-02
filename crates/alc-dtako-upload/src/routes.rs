@@ -1,6 +1,7 @@
 //! 口 (Refs ippoan/rust-alc-api#725)。
 //!
 //! - `POST /upload` → デジタコの zip (multipart の `file` field) を取り込む ([`crate::ingest::ingest_upload`])
+//! - `POST /internal/rerun/{upload_id}` → 既に保存先に在る zip を、もう一度取り込む ([`crate::ingest::rerun_upload`])
 //! - `POST /split-csv/{upload_id}` → アップロード 1 件を分割する ([`crate::split::split_upload`])
 //! - `POST /split-csv-all` → 未分割の運行が在るテナントの、分割の元にできるアップロードを新しい順に
 //!   最大 [`SPLIT_CSV_ALL_LIMIT`] 件、1 件ずつ分割し直す。応答は `text/event-stream` (1 件ごとに `progress`、終わりに `done`)
@@ -17,19 +18,21 @@ use axum::body::{Body, Bytes};
 use axum::extract::multipart::MultipartRejection;
 use axum::extract::{DefaultBodyLimit, Multipart, Path, State};
 use axum::http::header::{HeaderName, CACHE_CONTROL, CONTENT_TYPE};
-use axum::http::StatusCode;
+use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Extension, Json, Router};
 use futures_util::lock::Mutex;
 use futures_util::stream;
+use serde::Serialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use crate::ingest::{ingest_upload, IngestError, IngestLimits};
+use crate::ingest::{ingest_upload, rerun_upload, IngestError, IngestLimits, IngestOutcome};
 use crate::pg;
 use crate::split::{split_upload, LogLevel, LogSink, SplitError};
 use crate::store::{ObjectStore, Sleeper};
+use crate::timing::{Clock, StageTimer};
 
 /// 応答に載せる運行NO の一覧の上限 (超えたぶんは切り、総数は `*_total` に載せる)。backend と同じ値。
 pub const SPLIT_UNKO_NOS_DISPLAY_LIMIT: usize = 500;
@@ -44,6 +47,8 @@ pub struct DtakoState {
     pub pg: Arc<Mutex<PgClient>>,
     pub store: Arc<dyn ObjectStore>,
     pub sleeper: Arc<dyn Sleeper>,
+    /// 段ごとの所要を測る時計 (取り込みの口が `Server-Timing` に載せる)
+    pub clock: Arc<dyn Clock>,
     pub log: LogSink,
 }
 
@@ -63,11 +68,17 @@ pub fn tenant_router_with(limits: IngestLimits) -> Router<DtakoState> {
             upload(limits, state, tenant, multipart)
         },
     );
+    let rerun = post(
+        move |state: State<DtakoState>, tenant: Extension<TenantId>, upload_id: Path<Uuid>| {
+            rerun(limits, state, tenant, upload_id)
+        },
+    );
     Router::new()
         .route(
             "/upload",
             upload.layer(DefaultBodyLimit::max(UPLOAD_BODY_LIMIT)),
         )
+        .route("/internal/rerun/{upload_id}", rerun)
         .route("/split-csv/{upload_id}", post(split_csv))
         .route("/split-csv-all", post(split_csv_all))
 }
@@ -88,14 +99,53 @@ fn bad_request(label: &'static str) -> ApiError {
     (StatusCode::BAD_REQUEST, Json(json!({ "error": label })))
 }
 
-/// 入力の誤りは 400 と固定の語。こちら側の失敗は 500 (原因は `log` に、段の名前と kind だけを出す)。
-fn upload_error(log: &LogSink, e: IngestError) -> ApiError {
-    if e.is_input_error() {
+/// 対象が無いは 404、入力の誤りは 400 と固定の語。こちら側の失敗は 500 (原因は `log` に、`what` と段の名前と kind だけを出す)。
+fn ingest_error(log: &LogSink, what: &str, e: IngestError) -> ApiError {
+    if e == IngestError::NotFound {
+        return (StatusCode::NOT_FOUND, Json(json!({ "error": e.label() })));
+    }
+    if !e.is_internal() {
         return bad_request(e.label());
     }
-    log(LogLevel::Error, &format!("upload failed: {e}"));
+    log(LogLevel::Error, &format!("{what} failed: {e}"));
     let body = json!({ "error": "internal_error" });
     (StatusCode::INTERNAL_SERVER_ERROR, Json(body))
+}
+
+/// 取り込みの応答 (backend の `POST /api/upload` と同じ 8 フィールド。アップロードとやり直しで同じ形)。
+///
+/// **field の順 = 本文のキーの順** (backend と同じ順)。呼び手に、本文の先頭の決まった長さだけを取っておき、そこから
+/// `upload_id` を読むものが在るので、`upload_id` を先頭に、長くなりうる運行NO の一覧を後ろに置く (順を変えない)。
+#[derive(Serialize)]
+struct UploadResponse {
+    upload_id: Uuid,
+    operations_count: i32,
+    status: &'static str,
+    split_failed: usize,
+    split_unko_nos: Vec<String>,
+    split_unko_nos_total: usize,
+    split_failed_unko_nos: Vec<String>,
+    split_failed_unko_nos_total: usize,
+}
+
+fn ingest_response(outcome: IngestOutcome) -> Json<UploadResponse> {
+    let (split_unko_nos, split_unko_nos_total) = alc_csv_parser::cap_sorted(
+        outcome.split.succeeded_unko_nos,
+        SPLIT_UNKO_NOS_DISPLAY_LIMIT,
+    );
+    let (split_failed_unko_nos, split_failed_unko_nos_total) =
+        alc_csv_parser::cap_sorted(outcome.split.failed_unko_nos, SPLIT_UNKO_NOS_DISPLAY_LIMIT);
+
+    Json(UploadResponse {
+        upload_id: outcome.upload_id,
+        operations_count: outcome.operations_count,
+        status: "completed",
+        split_failed: outcome.split.put_failed,
+        split_unko_nos,
+        split_unko_nos_total,
+        split_failed_unko_nos,
+        split_failed_unko_nos_total,
+    })
 }
 
 /// multipart から `file` field を読む → (filename, 中身)。filename が無ければ `upload.zip` (backend と同じ)。
@@ -114,45 +164,77 @@ async fn read_file(mut multipart: Multipart) -> Result<(String, Bytes), &'static
     }
 }
 
-/// 応答は backend の `POST /api/upload` と同じ 8 フィールド。
+/// 取り込みの結果を応答にし、終えた段の所要を `Server-Timing` に載せる (成功でも失敗でも。載せるのは段の名前と数字だけ)。
+fn timed_response(
+    log: &LogSink,
+    what: &str,
+    timer: &StageTimer<'_>,
+    outcome: Result<IngestOutcome, IngestError>,
+) -> Response {
+    let mut response = match outcome {
+        Ok(outcome) => ingest_response(outcome).into_response(),
+        Err(e) => ingest_error(log, what, e).into_response(),
+    };
+    let timing = timer.server_timing();
+    if let Some(value) = timing.and_then(|v| HeaderValue::from_str(&v).ok()) {
+        let name = HeaderName::from_static("server-timing");
+        response.headers_mut().insert(name, value);
+    }
+    response
+}
+
+/// 応答は [`ingest_response`]。
 async fn upload(
     limits: IngestLimits,
     State(state): State<DtakoState>,
     Extension(TenantId(tenant_id)): Extension<TenantId>,
     multipart: Result<Multipart, MultipartRejection>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Response, ApiError> {
     let multipart = multipart.map_err(|_| bad_request("invalid_multipart"))?;
     let (filename, zip_bytes) = read_file(multipart).await.map_err(bad_request)?;
     let (store, sleeper) = (state.store.as_ref(), state.sleeper.as_ref());
+    let mut timer = StageTimer::new(state.clock.as_ref());
     let ingest = ingest_upload(
-        &state.pg, store, sleeper, &state.log, limits, tenant_id, filename, zip_bytes,
+        &state.pg, store, sleeper, &state.log, limits, &mut timer, tenant_id, filename, zip_bytes,
     );
-    let outcome = ingest.await.map_err(|e| upload_error(&state.log, e))?;
-    let (split_unko_nos, split_unko_nos_total) = alc_csv_parser::cap_sorted(
-        outcome.split.succeeded_unko_nos,
-        SPLIT_UNKO_NOS_DISPLAY_LIMIT,
-    );
-    let (split_failed_unko_nos, split_failed_unko_nos_total) =
-        alc_csv_parser::cap_sorted(outcome.split.failed_unko_nos, SPLIT_UNKO_NOS_DISPLAY_LIMIT);
-
-    Ok(Json(json!({
-        "upload_id": outcome.upload_id,
-        "operations_count": outcome.operations_count,
-        "status": "completed",
-        "split_failed": outcome.split.put_failed,
-        "split_unko_nos": split_unko_nos,
-        "split_unko_nos_total": split_unko_nos_total,
-        "split_failed_unko_nos": split_failed_unko_nos,
-        "split_failed_unko_nos_total": split_failed_unko_nos_total,
-    })))
+    let outcome = ingest.await;
+    Ok(timed_response(&state.log, "upload", &timer, outcome))
 }
 
-/// 応答は backend の `POST /api/split-csv/{upload_id}` と同じ 7 フィールド。
+/// 応答は [`ingest_response`] (`upload_id` は path の id)。やり直せるのは、ヘッダーのテナントの履歴だけ (ほかは 404)。
+async fn rerun(
+    limits: IngestLimits,
+    State(state): State<DtakoState>,
+    Extension(TenantId(tenant_id)): Extension<TenantId>,
+    Path(upload_id): Path<Uuid>,
+) -> Response {
+    let (store, sleeper) = (state.store.as_ref(), state.sleeper.as_ref());
+    let mut timer = StageTimer::new(state.clock.as_ref());
+    let rerun = rerun_upload(
+        &state.pg, store, sleeper, &state.log, limits, &mut timer, tenant_id, upload_id,
+    );
+    let outcome = rerun.await;
+    timed_response(&state.log, "rerun", &timer, outcome)
+}
+
+/// 分割 1 件の応答 (backend の `POST /api/split-csv/{upload_id}` と同じ 7 フィールド)。**field の順 = 本文のキーの順**。
+#[derive(Serialize)]
+struct SplitResponse {
+    status: &'static str,
+    upload_id: Uuid,
+    split_failed: usize,
+    split_unko_nos: Vec<String>,
+    split_unko_nos_total: usize,
+    split_failed_unko_nos: Vec<String>,
+    split_failed_unko_nos_total: usize,
+}
+
+/// 応答は [`SplitResponse`]。
 async fn split_csv(
     State(state): State<DtakoState>,
     Extension(TenantId(tenant_id)): Extension<TenantId>,
     Path(upload_id): Path<Uuid>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<SplitResponse>, ApiError> {
     let (store, sleeper) = (state.store.as_ref(), state.sleeper.as_ref());
     let outcome = split_upload(&state.pg, store, sleeper, &state.log, tenant_id, upload_id)
         .await
@@ -162,15 +244,15 @@ async fn split_csv(
     let (split_failed_unko_nos, split_failed_unko_nos_total) =
         alc_csv_parser::cap_sorted(outcome.failed_unko_nos, SPLIT_UNKO_NOS_DISPLAY_LIMIT);
 
-    Ok(Json(json!({
-        "status": "ok",
-        "upload_id": upload_id,
-        "split_failed": outcome.put_failed,
-        "split_unko_nos": split_unko_nos,
-        "split_unko_nos_total": split_unko_nos_total,
-        "split_failed_unko_nos": split_failed_unko_nos,
-        "split_failed_unko_nos_total": split_failed_unko_nos_total,
-    })))
+    Ok(Json(SplitResponse {
+        status: "ok",
+        upload_id,
+        split_failed: outcome.put_failed,
+        split_unko_nos,
+        split_unko_nos_total,
+        split_failed_unko_nos,
+        split_failed_unko_nos_total,
+    }))
 }
 
 /// 一括分割の進み具合 (stream の状態)。

@@ -4,6 +4,7 @@
 //! - [`ingest`]: アップロードの取り込みの流れ。zip を保存先に置き、運行と日別を DB に入れ、分割する (axum に依るのは `Bytes` の型だけ)
 //! - [`split`]: 分割の流れ (axum に依らない) と、ログの差し込み口
 //! - [`repo`] / [`pg`]: SQL の定数と、それを流す tokio-postgres 実装 (接続は持たない)
+//! - [`timing`]: 段ごとの所要を測って `Server-Timing` に載せる形にする (時計は差し込む)
 //! - [`store`]: 保存先 (R2) の抽象と PUT のやり直し (R2 を包む実装は直下の worker)
 //!
 //! tenant ヘッダーの layer (`alc_core_wasm::require_tenant_header`) は載せる側 (直下の worker) が掛ける。
@@ -15,3 +16,4 @@ pub mod repo;
 pub mod routes;
 pub mod split;
 pub mod store;
+pub mod timing;

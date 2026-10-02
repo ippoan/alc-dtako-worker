@@ -4,11 +4,12 @@
 //! 同時に走っている PUT の最大を記録する。偽の待ちは待たずに、渡された値を記録する。
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use alc_dtako_upload::split::{LogLevel, LogSink};
 use alc_dtako_upload::store::{ObjectStore, Sleeper, StoreError};
+use alc_dtako_upload::timing::Clock;
 use futures_util::future::BoxFuture;
 
 #[derive(Default)]
@@ -170,6 +171,16 @@ impl FakeSleeper {
 impl Sleeper for FakeSleeper {
     fn sleep_ms(&self, ms: u64) -> BoxFuture<'_, ()> {
         Box::pin(async move { self.slept.lock().unwrap().push(ms) })
+    }
+}
+
+/// 読むたびに 7 ミリ秒進む時計 (段の所要が、どの段も 7 になる)。
+#[derive(Default)]
+pub struct FakeClock(AtomicU64);
+
+impl Clock for FakeClock {
+    fn now_ms(&self) -> u64 {
+        self.0.fetch_add(7, Ordering::SeqCst)
     }
 }
 

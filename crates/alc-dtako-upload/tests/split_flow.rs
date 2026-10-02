@@ -706,6 +706,50 @@ fn split_error_display_is_stage_and_kind_only() {
     assert!(source.source().is_none());
 }
 
+/// 分割の出力の固定の期待値: Shift_JIS・CRLF の KUDGIVT を通し、置かれる key と中身 (UTF-8・LF) を
+/// **手で書いたバイト列**と比べる (`split_csv_entry` を呼んで期待値を作らない)。共有の関数の側
+/// (rust-alc-api の rev) が動いても、出力が 1 バイトも変わらないことをここで固定する。
+#[tokio::test(flavor = "multi_thread")]
+async fn split_output_matches_hand_written_bytes() {
+    let ctx = Ctx::start().await;
+    // 次の CSV を Shift_JIS にしたバイト列 (行末は CRLF)。運行NO・値は作り物:
+    //   運行NO,イベント名 / 8101,運転 / 8102,休憩 / 8101,休息
+    let sjis: Vec<u8> = [
+        &b"\x89\x5e\x8d\x73NO,\x83\x43\x83\x78\x83\x93\x83\x67\x96\xbc\r\n"[..],
+        &b"8101,\x89\x5e\x93\x5d\r\n"[..],
+        &b"8102,\x8b\x78\x8c\x65\r\n"[..],
+        &b"8101,\x8b\x78\x91\xa7\r\n"[..],
+    ]
+    .concat();
+    assert!(std::str::from_utf8(&sjis).is_err());
+    let zip = zip_of(&[("KUDGIVT.csv", &sjis, Deflated)]);
+    let (t, up) = ctx.tenant_with_zip("Dtako Fixed Bytes Tenant", zip).await;
+
+    let (status, body) = ctx.post_split(t, up).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let csv = |text: &str| (text.as_bytes().to_vec(), "text/csv".to_owned());
+    let expected = BTreeMap::from([
+        (
+            format!("{t}/unko/8101/KUDGIVT.csv"),
+            csv("運行NO,イベント名\n8101,運転\n8101,休息\n"),
+        ),
+        (
+            format!("{t}/unko/8102/KUDGIVT.csv"),
+            csv("運行NO,イベント名\n8102,休憩\n"),
+        ),
+    ]);
+    assert_eq!(ctx.written(), expected);
+    // UTF-8 のバイト列としても 1 つ直に書く ("運行NO" = e9 81 8b e8 a1 8c 4e 4f)
+    let first = &ctx.written()[&format!("{t}/unko/8102/KUDGIVT.csv")].0;
+    assert_eq!(&first[..9], b"\xe9\x81\x8b\xe8\xa1\x8cNO,");
+    assert_eq!(
+        &first[first.len() - 13..],
+        b"\n8102,\xe4\xbc\x91\xe6\x86\xa9\n"
+    );
+    ctx.finish().await;
+}
+
 // ---- 一括分割の口 POST /split-csv-all ----
 
 fn progress(current: usize, total: usize, filename: &str) -> Value {

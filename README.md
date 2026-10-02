@@ -215,9 +215,11 @@ cargo test -p alc-dtako-upload --test sql_db
 cargo llvm-cov --locked -p alc-dtako-upload --text > cov.txt && bash scripts/check_coverage_100.sh --use-cache cov.txt
 ```
 
-`tests/split_flow.rs` (19 本。口から、組み込みの PostgreSQL と偽の保存先まで) は 2 つの口を確かめる。一括分割 (6 本): 候補 0 件は `done` だけ /
+`tests/split_flow.rs` (20 本。口から、組み込みの PostgreSQL と偽の保存先まで) は 2 つの口を確かめる。一括分割 (6 本): 候補 0 件は `done` だけ /
 新しい順に 1 件ずつ `progress` → `done` / 1 件の失敗を数えて続ける / 上限 50 件と `skipped` / 候補の取得の失敗は固定の `error` / tenant ヘッダー無しは 401。
-本文は、呼び手と同じ読み方 (空行で割り、`data:` の行を JSON に) で読む。分割 1 件 (13 本): 置かれた key と中身が、同じ zip に
+本文は、呼び手と同じ読み方 (空行で割り、`data:` の行を JSON に) で読む。**分割の出力の固定の期待値 (1 本)**: Shift_JIS・CRLF の KUDGIVT を通し、
+置かれる key と中身を、テストに手で書いたバイト列と比べる (共有の関数を呼んで期待値を作らない。rust-alc-api の rev を上げるときは、上げる前後ともこれが通ることを確かめる)。
+分割 1 件 (13 本): 置かれた key と中身が、同じ zip に
 `split_csv_entry` を当てた結果と集合として一致 / 印 / 応答の 7 フィールド / 別テナントのアップロード・key が NULL・存在しない id は 404 で
 何も書かない / zip が無い・壊れている (途中のエントリ) は 500 で何も書かない / PUT が 2 回失敗して 3 回目に成功 / 3 回とも失敗した運行には印を付けない /
 印が当たらない運行NO はログに件数 / DB の失敗は 500 でログに段と kind / 一覧の 500 件上限 / 本文とログに key・運行NO・テナント ID が出ない。
@@ -226,7 +228,7 @@ cargo llvm-cov --locked -p alc-dtako-upload --text > cov.txt && bash scripts/che
 1 回失敗は 2 回目で成功し、成功済みは再送しない / 2 回失敗は 3 回目で成功 (待ちは 300・800) / 3 回とも失敗は `failed` (3 回目の後は待たない) /
 同時に走る PUT は 6 本まで / 空の入力は何も呼ばない / `get` の 3 通り / `StoreError` の文に key が出ない。
 
-CI は target ごとに本数を固定で見る (`sql_db` は `7 passed`、`store` は `9 passed`、`split_flow` は `19 passed`、どれも `0 failed; 0 ignored`)。減らすと落ちる。
+CI は target ごとに本数を固定で見る (`sql_db` は `7 passed`、`store` は `9 passed`、`split_flow` は `20 passed`、どれも `0 failed; 0 ignored`)。減らすと落ちる。
 足したら `ci.yml` の数も上げる。`sql_db` が確かめること (7 本):
 
 - ZIP の key: 自テナントの id で引ける / 別テナントの id・key が NULL の行・存在しない id は `None`

@@ -4,16 +4,16 @@
 rust-alc-api を Cloudflare Workers へ段階移行する 2 本目 (Refs ippoan/rust-alc-api#725) で、型は 1 本目の
 ippoan/alc-vein-worker に合わせている。
 
-**業務の口はまだ無い。** どの path も、tenant ヘッダー無しは 401・有りは 404 を返す
-(その前に DB へ繋ぐので、繋げなければ 503 / 500)。口は後続の PR で `crates/alc-dtako-upload` に足す。
-いま在るのは骨組みと、口が使う DB の層 (SQL の定数とそれを流す実装、その検査)・保存先の層 (R2 の抽象と PUT のやり直し)。
+口は **`POST /split-csv/{upload_id}`** (アップロード 1 件の分割。`/api` 付きでも受ける) の 1 本。それ以外の path は、
+tenant ヘッダー無しが 401・有りが 404 (どのリクエストも、その前に DB へ繋ぐので、繋げなければ 503 / 500)。
+アップロード本体の口は後続の PR で足す。本番ではまだ誰もこの口を呼ばない (auth-worker の振り分け表に足すのは、アップロード本体が揃った後)。
 
 ## 配置
 
 | 場所 | 中身 |
 |---|---|
-| 直下 (`Cargo.toml`・`wrangler.toml`・`src/`) | Worker 本体 (package `alc-dtako-worker`、wasm32-unknown-unknown)。workspace の root で、`Cargo.lock` はここの 1 つだけ。`src/lib.rs` (workers-rs への載せ方)・`src/db.rs` (DB への経路)・`src/tcp.rs` (VPC の binding の extern) |
-| `crates/alc-dtako-upload/` | route の crate (package `alc-dtako-upload`)。口の無い `tenant_router()`・SQL の定数 (`src/repo.rs` の `sql`)・それを流す tokio-postgres 実装 (`src/pg.rs`)・保存先の抽象と PUT のやり直し (`src/store.rs`)。接続も R2 の実装も持たない (張るのは Worker とテスト。テストの DB は process の中で起こす組み込みの PostgreSQL — 下の「DB の検査」) |
+| 直下 (`Cargo.toml`・`wrangler.toml`・`src/`) | Worker 本体 (package `alc-dtako-worker`、wasm32-unknown-unknown)。workspace の root で、`Cargo.lock` はここの 1 つだけ。`src/lib.rs` (workers-rs への載せ方)・`src/db.rs` (DB への経路)・`src/r2.rs` (R2 の binding と待ちを、保存先の層に載せる実装)・`src/tcp.rs` (VPC の binding の extern) |
+| `crates/alc-dtako-upload/` | route の crate (package `alc-dtako-upload`)。口 (`src/routes.rs`)・分割の流れ (`src/split.rs`)・SQL の定数 (`src/repo.rs` の `sql`)・それを流す tokio-postgres 実装 (`src/pg.rs`)・保存先の抽象と PUT のやり直し (`src/store.rs`)。接続も R2 の実装も持たない (張るのは Worker とテスト。テストの DB は process の中で起こす組み込みの PostgreSQL — 下の「DB の検査」) |
 | `scripts/` | 公開範囲の検査 (`check-exposure.sh` と陰性対照 `check-exposure-test.sh`)、`fetch-migrations.sh` (版は `ALC_MIGRATIONS_REV`)、coverage の gate (`check_coverage_100.sh`、登録簿は直下の `coverage_100.toml`) |
 | `.github/workflows/` | `ci.yml` (検査) / `deploy.yml` (デプロイ) / `tag-release.yml` (本番用のタグ) |
 
@@ -27,6 +27,9 @@ ippoan/alc-vein-worker に合わせている。
   ```bash
   cargo tree -i alc-core-wasm --target wasm32-unknown-unknown   # 出どころが 1 つだけ
   ```
+- **`alc-csv-parser`** (分割の純粋な部分 `split_csv_entry`・`cap_sorted`。backend と同じ関数を呼ぶ) も ippoan/rust-alc-api の crate。
+  `alc-core-wasm` と**同じ rev** で、同じく `[workspace.dependencies]` の 1 か所に書く (`default-features = false` = zip の展開を引かない。
+  zip の既定 features は C の依存を連れてきて wasm32 に載らないので、展開は route の crate が `zip` を deflate だけで直接引く)。
 - **`alc-worker-db`** (テナントの transaction の部品 `PgClient`・`TenantTx`・`TxOutput`) は ippoan/alc-worker-kit (public) に在る。
   同じく直下の `[workspace.dependencies]` に **git 依存・rev 固定で 1 か所だけ**書く (feature `chrono`。
   出どころが 2 つになると `PgClient` が別の型になる)。
@@ -84,15 +87,49 @@ SQL は `src/repo.rs` の `sql` の 1 か所、流すのは `src/pg.rs` の 1 �
 | `mark_has_kudgivt(pg, tenant_id, unko_nos)` | `MARK_HAS_KUDGIVT` | 渡した運行NO の運行に分割済みの印を付け、付けた行の運行NO を返す (`RETURNING` のまま。同じ運行NO が乗務員ごとに複数行あればその数だけ返る — 呼び手が集合にする)。空の入力は transaction を開かない。backend は 100 件ずつの `IN (…)` だったが、`= ANY($2)` の 1 文にしている (結果は同じ) |
 | `uploads_needing_split(pg, tenant_id)` | `LIST_UPLOADS_NEEDING_SPLIT` | 分割がまだの運行がテナントに 1 件でも在るとき、completed で key の在るアップロードの `(id, filename)` を新しい順に |
 
-口はまだこれらを呼んでいない (Worker の `src/lib.rs` は繋いだ `PgClient` を使わずに落とす)。
+分割の口が使うのは `upload_zip_key` と `mark_has_kudgivt` (`uploads_needing_split` は、後続の口が使う)。
+
+## 分割の口 `POST /split-csv/{upload_id}`
+
+アップロード済みの zip を R2 から読み、CSV を運行NO ごとに分けて R2 に置き、KUDGIVT を置けた運行に印 (`has_kudgivt`) を付ける。
+backend (ippoan/rust-alc-api) の `POST /api/split-csv/{upload_id}` と同じ仕事で、**置く key (`{テナント}/unko/{運行NO}/{CSV名}`) と
+中身のバイト列は backend と同じ** (読む側が object の ETag を指紋に使う)。1 エントリを分ける本体は、backend と共有の
+`alc_csv_parser::split_csv_entry` を呼ぶ (写しを持たない。`alc-csv-parser` は ippoan/rust-alc-api の crate)。
+
+- 流れ (`src/split.rs` の `split_upload`。axum に依らない): zip の key を引く → zip を読む → **全エントリが展開できることを先に確かめる**
+  (ここまでは何も書かない) → エントリを 1 つずつ「展開 → 分ける → 置く (失敗したものだけやり直す)」→ KUDGIVT を置けた運行に印。
+  メモリに載るのは zip 全体と、処理中の 1 エントリだけ。R2 の await は DB の transaction の中に挟まない。
+- この口は、テナントを設定した接続で、テナントでも絞って引く (`pg::upload_zip_key`・`pg::mark_has_kudgivt`)。
+- 応答 200 は backend と同じ 7 フィールド: `status` (`"ok"`)・`upload_id`・`split_failed` (置けなかった CSV の数。KUDGIVT 以外も数える)・
+  `split_unko_nos` / `split_unko_nos_total` (KUDGIVT を置けた運行NO。一覧はソートして 500 件で切り、総数は `_total`)・
+  `split_failed_unko_nos` / `split_failed_unko_nos_total` (KUDGIVT を置けなかった運行NO。印は付けない)。
+- エラー: アップロードの行が無い・zip の key が入っていない → **404** `{"error":"not_found"}` / それ以外 (DB・保存先・zip) → **500**
+  `{"error":"internal_error"}`。本文に原因は出さない。`upload_id` が UUID でなければ axum の既定の 400。
+- ログは State に持たせた差し込み口 (`split::LogSink`) から出す (worker は `console_warn!` / `console_error!`、テストは溜める偽物)。
+  出すのは「固定の語 + 段の名前 + kind + 件数」まで。**key・運行NO・upload_id・テナント ID・エラーの生の文を出さない。**
+
+### 旧 (backend) との違い
+
+| | この worker | backend |
+|---|---|---|
+| 見つからない | **404** | 500 |
+| エラーの本文 | JSON の固定の文 (`{"error":"…"}`) | 平文 |
+| PUT の同時数 | **6** (Workers の同時接続の上限に合わせた) | 20 |
+| PUT のやり直し | **エントリ (zip の中の 1 ファイル) ごと**に最大 3 回・待ち 300ms / 800ms。待ちの合計は最大でエントリ数ぶん | 全 item をまとめて回単位で最大 3 回・同じ待ち |
+| zip の圧縮方式 | **deflate と無圧縮だけ** (ほかの方式のエントリが在ると 500) | zip crate の既定 (bzip2・zstd・deflate64・lzma 等も) |
+| 書き始める前 | 全エントリの展開を先に確かめる (壊れたエントリが在れば何も書かない)。エントリの展開は 2 回 | 全エントリを展開してメモリに持ってから書く (同じく、壊れていれば何も書かない) |
+| やり直しのログ | 最後に残った失敗の件数だけ | やり直すたびに件数 |
+
+**`src/r2.rs` と `src/lib.rs` (wasm 専用) は CI のテストの外。** マージの後に staging で実物 (R2 と DB) を通して確かめる。
 
 ## 保存先の層 (`crates/alc-dtako-upload/src/store.rs`)
 
 口のコードから R2 を切り離すための小さな層。R2 の binding (`worker::Bucket`) は wasm32 でしか動かないので、口の流れを native の
-テストで通すときは偽の保存先を差す。**R2 を包む実装はまだ無い** (口を足す PR で、直下の worker に入る)。
+テストで通すときは偽の保存先を差す。**R2 を包む実装は直下の worker の `src/r2.rs`** (`worker::Bucket` と `worker::Delay` を `worker::send` の
+`SendWrapper`・`SendFuture` で包む。wasm 専用で、CI のテストと coverage の gate の外)。
 
 - `trait ObjectStore`: `get(key)` → `Option<Vec<u8>>` (object が無ければ `None`) / `put(key, bytes, content_type)`。
-  `trait Sleeper`: `sleep_ms(ms)` (worker では `worker::Delay`)。どちらも `Send` を要求しない (Workers の R2 の future は `Send` でない)。
+  `trait Sleeper`: `sleep_ms(ms)` (worker では `worker::Delay`)。どちらも `Send + Sync` で、返す future も `Send` (axum の state と handler が要求する。Workers の R2 の値と future は `Send` でないので、実装する側が包む)。
 - `StoreError` が持つのは段の名前 (コードに書いた固定の語) だけ。key・bucket 名・ランタイムの生のエラー文を載せない。
 - `put_all_with_retry(store, sleeper, items)`: **失敗した PUT だけ**を最大 3 回 (`PUT_RETRY_ATTEMPTS`) までやり直す (成功済みは再送しない)。
   回の中は同時 6 本 (`PUT_CONCURRENCY`。backend は 20。Workers の同時接続の上限に合わせた)。回の後に失敗が残り、次の回が在るときだけ
@@ -107,7 +144,7 @@ SQL は `src/repo.rs` の `sql` の 1 か所、流すのは `src/pg.rs` の 1 �
 | staging | `DTAKO_R2` | `ohishi-dtako-staging` |
 
 **staging の R2 は staging 用の bucket。** `env.*` から本番の bucket を指さない (本番の object を上書きする。
-`scripts/check-exposure.sh` が検査する)。骨組みの時点では binding を置いただけで、コードからは使っていない。
+`scripts/check-exposure.sh` が検査する)。読み書きは `src/r2.rs` (分割の口が zip を読み、分けた CSV を置く)。
 
 ## 到達面
 
@@ -152,11 +189,16 @@ cargo test -p alc-dtako-upload --test sql_db
 cargo llvm-cov --locked -p alc-dtako-upload --text > cov.txt && bash scripts/check_coverage_100.sh --use-cache cov.txt
 ```
 
+`tests/split_flow.rs` (13 本。口から、組み込みの PostgreSQL と偽の保存先まで) は分割の口を確かめる: 置かれた key と中身が、同じ zip に
+`split_csv_entry` を当てた結果と集合として一致 / 印 / 応答の 7 フィールド / 別テナントのアップロード・key が NULL・存在しない id は 404 で
+何も書かない / zip が無い・壊れている (途中のエントリ) は 500 で何も書かない / PUT が 2 回失敗して 3 回目に成功 / 3 回とも失敗した運行には印を付けない /
+印が当たらない運行NO はログに件数 / DB の失敗は 500 でログに段と kind / 一覧の 500 件上限 / 本文とログに key・運行NO・テナント ID が出ない。
+
 `tests/store.rs` (9 本。偽の保存先と偽の待ち。DB も R2 も要らない) は保存先の層を確かめる: 1 回で全部成功なら待たない /
 1 回失敗は 2 回目で成功し、成功済みは再送しない / 2 回失敗は 3 回目で成功 (待ちは 300・800) / 3 回とも失敗は `failed` (3 回目の後は待たない) /
 同時に走る PUT は 6 本まで / 空の入力は何も呼ばない / `get` の 3 通り / `StoreError` の文に key が出ない。
 
-CI は target ごとに本数を固定で見る (`sql_db` は `7 passed`、`store` は `9 passed`、どちらも `0 failed; 0 ignored`)。減らすと落ちる。
+CI は target ごとに本数を固定で見る (`sql_db` は `7 passed`、`store` は `9 passed`、`split_flow` は `13 passed`、どれも `0 failed; 0 ignored`)。減らすと落ちる。
 足したら `ci.yml` の数も上げる。`sql_db` が確かめること (7 本):
 
 - ZIP の key: 自テナントの id で引ける / 別テナントの id・key が NULL の行・存在しない id は `None`
@@ -166,7 +208,7 @@ CI は target ごとに本数を固定で見る (`sql_db` は `7 passed`、`stor
 - テナントを設定しない素の接続では `dtako_upload_history`・`dtako_operations` の行が読めない (エラーか 0 行)
 - DB のエラーがそのまま `Err` で返り、失敗した transaction が残らない / 権限の無いロールは 42501 / 切れた接続は `Err`
 
-`crates/alc-dtako-upload/src/pg.rs` と `src/store.rs` は行カバレッジ 100% を保つ (登録簿は直下の `coverage_100.toml`。`repo.rs` は定数だけで実行行が無いので登録しない)。
+`crates/alc-dtako-upload/src/` の `pg.rs`・`store.rs`・`split.rs`・`routes.rs` は行カバレッジ 100% を保つ (登録簿は直下の `coverage_100.toml`。`repo.rs` は定数だけで実行行が無いので登録しない)。
 
 作りと、本物の DB との違い:
 

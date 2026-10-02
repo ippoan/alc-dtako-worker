@@ -4,19 +4,26 @@ version = "0.1.0"
 edition = "2021"
 
 # デジタコの運行 CSV のアップロード・分割の route の crate (Refs ippoan/rust-alc-api#725)。
-# 口の無い Router と、DB の層 (SQL の定数 `repo::sql`・それを流す `pg`)、保存先の層 (`store`)。口は後続の PR で足す。
+# 口 (`routes`)・分割の流れ (`split`)・DB の層 (SQL の定数 `repo::sql`・それを流す `pg`)・保存先の層 (`store`)。
 [dependencies]
 # 出どころは直下の Cargo.toml の [workspace.dependencies] の 1 か所 (ここに git / path を書かない)
 alc-core-wasm = { workspace = true }
 # テナントの transaction の部品 (`PgClient`・`TenantTx`・`TxOutput`)。`pg` が使う
 alc-worker-db = { workspace = true }
-axum = { version = "0.8", default-features = false }
-# `store` の `buffer_unordered` (同時に走らせる PUT の数の上限) と `LocalBoxFuture`
+# 分割の純粋な部分 (backend と共有)
+alc-csv-parser = { workspace = true }
+axum = { version = "0.8", default-features = false, features = ["json"] }
+# `store` の `buffer_unordered` (同時に走らせる PUT の数の上限)・`BoxFuture`、state の async の Mutex
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 # `pg` が流す型付きの文の型 (`Type`)。接続は張らない (runtime の feature を付けない。
 # wasm 用の feature `js` は直下の worker と alc-worker-db が付ける)
 tokio-postgres = { version = "0.7", default-features = false, features = ["with-uuid-1"] }
-uuid = "1"
+# 口の `Path<Uuid>` に `serde` が要る
+uuid = { version = "1", features = ["serde"] }
+# アップロードされた zip の展開。deflate (と無圧縮) だけ — 既定 features は C の依存 (bzip2 等) を連れてきて wasm32 に載らない
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 # native でも wasm32-unknown-unknown でもビルドできる (接続は持たない。張るのは直下の worker と tests/sql_db.rs)。
 [dev-dependencies]
@@ -28,5 +35,7 @@ pglite-oxide = "=0.5.0"
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
 # tests/sql_db.rs 用の native の接続 (runtime 付き)。dev-dependency なので wasm のビルドには入らない
 tokio-postgres = { version = "0.7", features = ["with-uuid-1"] }
+# tests/split_flow.rs: 口を `oneshot` で叩く
+tower = { version = "0.5", features = ["util"] }
 # テストごとの乱数のテナント ID
 uuid = { version = "1", features = ["v4"] }

@@ -18,6 +18,8 @@
 //! - 直結で流す (PgBouncer を挟まない)
 //! - テナント ID はテストごとの乱数
 
+// 共用の土台のうち、このファイルが使わないものが在る
+#[allow(dead_code)]
 mod embedded;
 
 use alc_dtako_upload::pg;

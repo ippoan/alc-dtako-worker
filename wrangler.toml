@@ -29,6 +29,11 @@ binding = "CF_VERSION_METADATA"
 [placement]
 region = "aws:ap-northeast-1"
 
+# 本番でもログを残す (env に継承されないので、staging は下で別に書く)。口が出すログは、段の名前・kind・件数まで
+# (識別子も、エラーの生の文も出さない)。500 の本文は固定の語なので、原因はここでしか追えない
+[observability]
+enabled = true
+
 # 本番の DB: Cloudflare Hyperdrive の binding DTAKO_HYPERDRIVE (src/db.rs。Refs ippoan/rust-alc-api#723)。
 # 設定は実行用ロールのもの 1 つを複数の worker で共有する (worker ごとに作らない。id は ippoan/alc-vein-worker と同じ)。
 # 接続先・資格情報・TLS (証明書の検証) は設定の側に在り、ここに書くのは設定の ID だけ。

@@ -4,7 +4,7 @@
 rust-alc-api を Cloudflare Workers へ段階移行する 2 本目 (Refs ippoan/rust-alc-api#725) で、型は 1 本目の
 ippoan/alc-vein-worker に合わせている。
 
-口は **`POST /split-csv/{upload_id}`** (アップロード 1 件の分割。`/api` 付きでも受ける) の 1 本。それ以外の path は、
+口は **`POST /split-csv/{upload_id}`** (アップロード 1 件の分割) と **`POST /split-csv-all`** (一括分割) の 2 本 (どちらも `/api` 付きでも受ける)。それ以外の path は、
 tenant ヘッダー無しが 401・有りが 404 (どのリクエストも、その前に DB へ繋ぐので、繋げなければ 503 / 500)。
 アップロード本体の口は後続の PR で足す。本番ではまだ誰もこの口を呼ばない (auth-worker の振り分け表に足すのは、アップロード本体が揃った後)。
 
@@ -87,7 +87,7 @@ SQL は `src/repo.rs` の `sql` の 1 か所、流すのは `src/pg.rs` の 1 �
 | `mark_has_kudgivt(pg, tenant_id, unko_nos)` | `MARK_HAS_KUDGIVT` | 渡した運行NO の運行に分割済みの印を付け、付けた行の運行NO を返す (`RETURNING` のまま。同じ運行NO が乗務員ごとに複数行あればその数だけ返る — 呼び手が集合にする)。空の入力は transaction を開かない。backend は 100 件ずつの `IN (…)` だったが、`= ANY($2)` の 1 文にしている (結果は同じ) |
 | `uploads_needing_split(pg, tenant_id)` | `LIST_UPLOADS_NEEDING_SPLIT` | 分割がまだの運行がテナントに 1 件でも在るとき、completed で key の在るアップロードの `(id, filename)` を新しい順に |
 
-分割の口が使うのは `upload_zip_key` と `mark_has_kudgivt` (`uploads_needing_split` は、後続の口が使う)。
+分割 1 件の口が使うのは `upload_zip_key` と `mark_has_kudgivt`、一括分割の口は候補を `uploads_needing_split` で引く。
 
 ## 分割の口 `POST /split-csv/{upload_id}`
 
@@ -121,6 +121,32 @@ backend (ippoan/rust-alc-api) の `POST /api/split-csv/{upload_id}` と同じ仕
 | やり直しのログ | 最後に残った失敗の件数だけ | やり直すたびに件数 |
 
 **`src/r2.rs` と `src/lib.rs` (wasm 専用) は CI のテストの外。** マージの後に staging で実物 (R2 と DB) を通して確かめる。
+
+## 一括分割の口 `POST /split-csv-all`
+
+テナントに「分割がまだの運行」が 1 件でも在るとき、分割の元にできる (completed で zip の key が在る) アップロードを**新しい順に最大 50 件**、
+分割し直す。backend の `POST /api/split-csv-all` と同じ仕事で、1 件ぶんの本体は上の分割 1 件と同じ `split::split_upload`。
+
+- 応答は 200・`Content-Type: text/event-stream` (`Cache-Control: no-cache`・`X-Accel-Buffering: no`)。本文は `data: <JSON>` と空行の繰り返しで、
+  **1 件処理するごとに 1 個**流す (まとめて出さない):
+  - `{"event":"progress","current":n,"total":m,"filename":"…"}` — `total` は今回処理する数 (候補の数と 50 の小さい方)
+  - `{"event":"done","candidates":…,"total":…,"success":…,"failed":…,"skipped":…}` — `candidates` は候補の総数、`total = success + failed`、
+    `skipped = candidates − total` (上限で今回処理しなかった残り。もう一度呼ぶと続きではなく、その時点の候補を新しい順に引き直す)。
+    置けなかった CSV が在っても、その履歴は `success` に数える (backend と同じ)
+  - `{"event":"error","message":"internal_error"}` — 候補の取得 (DB) に失敗したとき。これ 1 個で終わり、`done` は出ない
+- 候補が 0 件なら `done` (全部 0) が 1 個だけ。
+- 履歴 1 件の分割が失敗しても止めずに次へ進み、`failed` に数える。ログに出すのは段の名前と kind だけ (upload の id・filename・エラーの生の文を出さない)。
+  `filename` が出るのは本文の `progress` だけ。
+
+### 旧 (backend) との違い
+
+| | この worker | backend |
+|---|---|---|
+| 処理の進め方 | **1 件ずつ**順に | 5 件ずつ並列 |
+| 途中の event | 1 件ごとに `progress` | 無い (終わりの `done` だけ) |
+| `error` の `message` | 固定の語 (`internal_error`) | エラーの文 |
+| 途中で切れたとき | 呼び手が切れる・Worker の上限 (CPU 時間・subrequest) に当たると、**`done` も `error` も無く stream が閉じる**。それまでに終えた履歴は分割済み。もう一度呼ぶと同じ候補を先頭からやり直す (分割は冪等) | — |
+| DB へ繋げないとき | event ではなく **500 / 503 の JSON** (routing の前に繋ぐため) | — |
 
 ## 保存先の層 (`crates/alc-dtako-upload/src/store.rs`)
 
@@ -189,7 +215,9 @@ cargo test -p alc-dtako-upload --test sql_db
 cargo llvm-cov --locked -p alc-dtako-upload --text > cov.txt && bash scripts/check_coverage_100.sh --use-cache cov.txt
 ```
 
-`tests/split_flow.rs` (13 本。口から、組み込みの PostgreSQL と偽の保存先まで) は分割の口を確かめる: 置かれた key と中身が、同じ zip に
+`tests/split_flow.rs` (19 本。口から、組み込みの PostgreSQL と偽の保存先まで) は 2 つの口を確かめる。一括分割 (6 本): 候補 0 件は `done` だけ /
+新しい順に 1 件ずつ `progress` → `done` / 1 件の失敗を数えて続ける / 上限 50 件と `skipped` / 候補の取得の失敗は固定の `error` / tenant ヘッダー無しは 401。
+本文は、呼び手と同じ読み方 (空行で割り、`data:` の行を JSON に) で読む。分割 1 件 (13 本): 置かれた key と中身が、同じ zip に
 `split_csv_entry` を当てた結果と集合として一致 / 印 / 応答の 7 フィールド / 別テナントのアップロード・key が NULL・存在しない id は 404 で
 何も書かない / zip が無い・壊れている (途中のエントリ) は 500 で何も書かない / PUT が 2 回失敗して 3 回目に成功 / 3 回とも失敗した運行には印を付けない /
 印が当たらない運行NO はログに件数 / DB の失敗は 500 でログに段と kind / 一覧の 500 件上限 / 本文とログに key・運行NO・テナント ID が出ない。
@@ -198,7 +226,7 @@ cargo llvm-cov --locked -p alc-dtako-upload --text > cov.txt && bash scripts/che
 1 回失敗は 2 回目で成功し、成功済みは再送しない / 2 回失敗は 3 回目で成功 (待ちは 300・800) / 3 回とも失敗は `failed` (3 回目の後は待たない) /
 同時に走る PUT は 6 本まで / 空の入力は何も呼ばない / `get` の 3 通り / `StoreError` の文に key が出ない。
 
-CI は target ごとに本数を固定で見る (`sql_db` は `7 passed`、`store` は `9 passed`、`split_flow` は `13 passed`、どれも `0 failed; 0 ignored`)。減らすと落ちる。
+CI は target ごとに本数を固定で見る (`sql_db` は `7 passed`、`store` は `9 passed`、`split_flow` は `19 passed`、どれも `0 failed; 0 ignored`)。減らすと落ちる。
 足したら `ci.yml` の数も上げる。`sql_db` が確かめること (7 本):
 
 - ZIP の key: 自テナントの id で引ける / 別テナントの id・key が NULL の行・存在しない id は `None`

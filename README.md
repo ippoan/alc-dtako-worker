@@ -146,7 +146,8 @@ zip の取り込みのうち DB に書く部分。**SQL は backend (ippoan/rust
      KUDGURI が 0 行なら、KUDGIVT が無くても運行 0 件として進む
   5. 営業所・車輌・乗務員を解決し、運行が既に在るかを見て、分類を読む (上の `prepare_upload`)
   6. 既に在る運行だけ、前回の分割が置いた旧 KUDGIVT (`{テナント}/unko/{運行NO}/KUDGIVT.csv`) を保存先から読んで前回の分数を出す
-     (運行NO ごとに 1 回。読めない・無い・parse できないときは「取れなかった」として続け、変更記録の before に印が残る)。
+     (運行NO ごとに 1 回、まとめて同時 6 本までで読む。やり直しはしない。読めない・無い・parse できないときは「取れなかった」として続け、
+     変更記録の before に印が残る)。
      今回の分数と日別は、backend と共有の関数 (`alc_csv_parser::operation_changes`・`alc_compare::upload_daily::compute_daily_hours`) で出す
   7. 運行の入れ替え + 日別の保存 + 完了の印 (上の `apply_upload`。1 transaction)。`operations_count` は KUDGURI の行数
   8. 分割 (下の分割の口と同じ `split_upload`。zip は保存先から読み直す)。丸ごと失敗したら待って、全体を最大 3 回 (待ち 300ms・800ms)。
@@ -272,6 +273,9 @@ backend (ippoan/rust-alc-api) の `POST /api/split-csv/{upload_id}` と同じ仕
 - `put_all_with_retry(store, sleeper, items)`: **失敗した PUT だけ**を最大 3 回 (`PUT_RETRY_ATTEMPTS`) までやり直す (成功済みは再送しない)。
   回の中は同時 6 本 (`PUT_CONCURRENCY`。backend は 20。Workers の同時接続の上限に合わせた)。回の後に失敗が残り、次の回が在るときだけ
   300ms・800ms (`PUT_RETRY_DELAYS_MS`) を待つ。回数と待ちは backend と同じ。返すのは item の `tag` だけ (`succeeded` / `failed`、順不同)。
+- `get_all(store, items)`: key と呼び手の tag の組をまとめて読む。同時 6 本 (`GET_CONCURRENCY` = PUT と同じ値) で、**やり直しはしない**。
+  返すのは `(tag, 中身)` (順不同。結果は tag で結び付ける)。無い・読めないはどちらも `None`。取り込みが、前回の KUDGIVT を運行NO ごとに読むのに使う
+  (運行の数に比例して伸びていた段を、同時に読む形にした)。
 - 待ちに `tokio::time` を使わない (wasm32 で動かない)。`tokio` は route の crate の dev-dependency だけ。
 
 ## R2
@@ -327,12 +331,13 @@ cargo test -p alc-dtako-upload --test sql_db
 cargo llvm-cov --locked -p alc-dtako-upload --text > cov.txt && bash scripts/check_coverage_100.sh --use-cache cov.txt
 ```
 
-`tests/upload_flow.rs` (8 本。口から、組み込みの PostgreSQL と偽の保存先まで) はアップロードの口 (6 本) とやり直しの口 (2 本) を確かめる。zip はテストの中で作る
+`tests/upload_flow.rs` (9 本。口から、組み込みの PostgreSQL と偽の保存先まで) はアップロードの口 (7 本) とやり直しの口 (2 本) を確かめる。zip はテストの中で作る
 (`upload_zip`。KUDGURI・KUDGIVT は Shift_JIS・CRLF): 端から端 (応答の 8 field・履歴・運行・日別・セグメント・保存先の zip と分割の出力・分割済みの印) /
 上げ直し (同じ zip は記録なし・値が変われば before と after の分数・旧 KUDGIVT が無い / 読めないときの印) / リクエストの形の誤り (400 の語・
 tenant ヘッダー無しは 401・body は 2MB を超えても通り 20MB を超えると読めない) / zip の中身の誤り (語ごとに履歴の `error_message`・展開後の上限・
 KUDGURI が 0 行は 0 件で completed) / 保存先と DB の失敗 (500・履歴の段の名前・取り込みの本体の途中の失敗で運行も日別も入らない・切れた接続) /
-分割のやり直し (2 回失敗 → 3 回目で通る・3 回とも失敗 → `split_failed = 1` で 200・後から分割の口で復旧)。やり直しの口: 復旧 (途中で失敗した履歴を
+分割のやり直し (2 回失敗 → 3 回目で通る・3 回とも失敗 → `split_failed = 1` で 200・後から分割の口で復旧) /
+前回の KUDGIVT の読み込み (8 運行の上げ直しで、同時の読み込みが上限の 6 本まで・結果が運行NO どおりに結び付く・1 本の読み込みの失敗はその運行だけ)。やり直しの口: 復旧 (途中で失敗した履歴を
 取り込み直す → completed と行数・運行と日別と分割の出力・もう一度やり直しても変更記録が増えない・zip は置き直さない) / 引けない・読めない
 (存在しない id・別テナントの履歴・key が NULL は 404 / zip が無い・読めないは 500 / 壊れた zip は 400 / UUID でない id・tenant ヘッダー無し・切れた接続)。
 本文とログに識別子が出ないことも見る。
@@ -346,11 +351,12 @@ KUDGURI が 0 行は 0 件で completed) / 保存先と DB の失敗 (500・履�
 何も書かない / zip が無い・壊れている (途中のエントリ) は 500 で何も書かない / PUT が 2 回失敗して 3 回目に成功 / 3 回とも失敗した運行には印を付けない /
 印が当たらない運行NO はログに件数 / DB の失敗は 500 でログに段と kind / 一覧の 500 件上限 / 本文とログに key・運行NO・テナント ID が出ない。
 
-`tests/store.rs` (9 本。偽の保存先と偽の待ち。DB も R2 も要らない) は保存先の層を確かめる: 1 回で全部成功なら待たない /
+`tests/store.rs` (10 本。偽の保存先と偽の待ち。DB も R2 も要らない) は保存先の層を確かめる: 1 回で全部成功なら待たない /
 1 回失敗は 2 回目で成功し、成功済みは再送しない / 2 回失敗は 3 回目で成功 (待ちは 300・800) / 3 回とも失敗は `failed` (3 回目の後は待たない) /
-同時に走る PUT は 6 本まで / 空の入力は何も呼ばない / `get` の 3 通り / `StoreError` の文に key が出ない。
+同時に走る PUT は 6 本まで / 空の入力は何も呼ばない / `get` の 3 通り / `StoreError` の文に key が出ない /
+まとめて読む `get_all` (同時 6 本まで・結果は tag に結び付く・無い / 読めないは `None`・やり直さない・空の入力は何も呼ばない)。
 
-CI は target ごとに本数を固定で見る (`sql_db` は `15 passed`、`store` は `9 passed`、`split_flow` は `20 passed`、`upload_flow` は `8 passed`、どれも `0 failed; 0 ignored`)。減らすと落ちる。
+CI は target ごとに本数を固定で見る (`sql_db` は `15 passed`、`store` は `10 passed`、`split_flow` は `20 passed`、`upload_flow` は `9 passed`、どれも `0 failed; 0 ignored`)。減らすと落ちる。
 足したら `ci.yml` の数も上げる (テスト 1 本ごとに DB を起動して全 migration を流すので、本数を増やさず 1 本に筋書きを束ねる)。
 `sql_db` が確かめること (15 本)。取り込みの DB の層 (8 本):
 

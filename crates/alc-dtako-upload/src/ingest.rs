@@ -8,7 +8,8 @@
 //! 3. key を履歴に記録する (単独の transaction。後の段が落ちても残る)
 //! 4. zip を展開して KUDGURI と KUDGIVT を読む (KUDGURI が 0 行なら、KUDGIVT が無くても運行 0 件として進む)
 //! 5. 準備 ([`pg::prepare_upload`])
-//! 6. 「既に在る」運行だけ、分割済みの旧 KUDGIVT を保存先から読んで前回の分数を出す (取れなければ `None`。取り込みは続ける)。
+//! 6. 「既に在る」運行だけ、分割済みの旧 KUDGIVT を保存先から読んで前回の分数を出す (運行NO ごとに 1 回、まとめて同時に読む。
+//!    取れなければ `None`。取り込みは続ける)。
 //!    今回の分数と日別は、共有の関数 (`alc_csv_parser::operation_changes`・`alc_compare::upload_daily`) で出す
 //! 7. 運行の入れ替え + 日別の保存 + 完了の印 ([`pg::apply_upload`]。1 transaction)
 //! 8. 分割 ([`split_upload`])。丸ごと失敗したら待って、全体を最大 [`PUT_RETRY_ATTEMPTS`] 回。尽きても取り込みは成功のまま
@@ -41,7 +42,7 @@ use uuid::Uuid;
 use crate::archive::{Archive, ArchiveError, MAX_UNCOMPRESSED_BYTES};
 use crate::pg::{self, CreateUploadError, OperationInput, PreparedRow};
 use crate::split::{split_upload, LogLevel, LogSink, SplitOutcome};
-use crate::store::{ObjectStore, Sleeper, PUT_RETRY_ATTEMPTS, PUT_RETRY_DELAYS_MS};
+use crate::store::{get_all, ObjectStore, Sleeper, PUT_RETRY_ATTEMPTS, PUT_RETRY_DELAYS_MS};
 use crate::timing::StageTimer;
 
 /// 取り込みの上限。
@@ -353,7 +354,8 @@ fn read_rows(
 }
 
 /// 行ごとの前回の分数 (`rows` と同じ順・同じ数)。「既に在る」行だけ、分割済みの旧 KUDGIVT
-/// (`{テナント}/unko/{運行NO}/KUDGIVT.csv`) を運行NO ごとに 1 回読む。読めない・無い・parse できないは `None`。
+/// (`{テナント}/unko/{運行NO}/KUDGIVT.csv`) を運行NO ごとに 1 回読む (まとめて、同時 [`crate::store::GET_CONCURRENCY`] 本まで。
+/// やり直しはしない)。読めない・無い・parse できないは `None`。
 async fn before_minutes(
     store: &dyn ObjectStore,
     log: &LogSink,
@@ -361,18 +363,23 @@ async fn before_minutes(
     rows: &[KudguriRow],
     prepared: &[PreparedRow],
 ) -> Vec<Option<OperationMinutes>> {
-    let mut old: HashMap<&str, Option<Vec<u8>>> = HashMap::new();
+    // 既に在る運行NO を、出てきた順に重複なしで集める
+    let mut wanted: Vec<(String, &str)> = Vec::new();
+    for (row, p) in rows.iter().zip(prepared) {
+        let unko_no = row.unko_no.as_str();
+        if p.exists && !wanted.iter().any(|(_, seen)| *seen == unko_no) {
+            wanted.push((format!("{tenant_id}/unko/{unko_no}/KUDGIVT.csv"), unko_no));
+        }
+    }
+    // 結果は運行NO に結び付ける (返ってくる順に依らない)
+    let old: HashMap<&str, Option<Vec<u8>>> = get_all(store, wanted).await.into_iter().collect();
+
     let mut before = Vec::with_capacity(rows.len());
     let mut unavailable = 0usize;
     for (row, p) in rows.iter().zip(prepared) {
         if !p.exists {
             before.push(None);
             continue;
-        }
-        if !old.contains_key(row.unko_no.as_str()) {
-            let key = format!("{tenant_id}/unko/{}/KUDGIVT.csv", row.unko_no);
-            let bytes = store.get(&key).await.ok().flatten();
-            old.insert(&row.unko_no, bytes);
         }
         let bytes = old[row.unko_no.as_str()].as_deref();
         let events = bytes.and_then(|b| parse_kudgivt_for_crew(b, row.crew_role).ok());

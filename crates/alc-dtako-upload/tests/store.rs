@@ -1,4 +1,4 @@
-//! `store` (保存先の層と PUT のやり直し) を、偽の保存先で確かめる (native。DB も R2 も要らない)。
+//! `store` (保存先の層・PUT のやり直し・まとめて読む) を、偽の保存先で確かめる (native。DB も R2 も要らない)。
 //! 偽物は `fakes/mod.rs` (`tests/split_flow.rs` と共用)。
 
 // 共用の偽物のうち、このファイルが使わないもの (ログの差し込み口など) が在る
@@ -6,8 +6,8 @@
 mod fakes;
 
 use alc_dtako_upload::store::{
-    put_all_with_retry, ObjectStore, PutItem, PutOutcome, StoreError, PUT_CONCURRENCY,
-    PUT_RETRY_ATTEMPTS, PUT_RETRY_DELAYS_MS,
+    get_all, put_all_with_retry, ObjectStore, PutItem, PutOutcome, StoreError, GET_CONCURRENCY,
+    PUT_CONCURRENCY, PUT_RETRY_ATTEMPTS, PUT_RETRY_DELAYS_MS,
 };
 use fakes::{FakeSleeper, FakeStore};
 
@@ -165,4 +165,34 @@ async fn store_error_display_has_only_the_stage() {
     assert_eq!(format!("{err:?}"), "StoreError { stage: \"put\" }");
     let source: &dyn std::error::Error = &err;
     assert!(source.source().is_none());
+}
+
+/// まとめて読む: 同時は 6 本まで。結果は tag に結び付き、無い・読めないはどちらも `None` (やり直さない)。空の入力は何も呼ばない。
+#[tokio::test(flavor = "multi_thread")]
+async fn get_all_reads_at_most_six_at_once_and_binds_results_to_tags() {
+    let store = FakeStore::default();
+    assert_eq!(get_all(&store, Vec::<(String, usize)>::new()).await, vec![]);
+    assert_eq!(store.max_get_running(), 0);
+
+    // 20 本のうち、偶数番だけ置いてある。3 番は置いてあるが 1 回だけ読めない
+    for n in (0..20).step_by(2) {
+        store.seed(
+            &format!("k/{n}"),
+            format!("body {n}").into_bytes(),
+            "text/csv",
+        );
+    }
+    store.seed("k/3", b"body 3".to_vec(), "text/csv");
+    store.fail_gets_containing("k/3", 1);
+    let wanted: Vec<(String, usize)> = (0..20).map(|n| (format!("k/{n}"), n)).collect();
+    let mut got = get_all(&store, wanted).await;
+    got.sort();
+    let want: Vec<(usize, Option<Vec<u8>>)> = (0..20)
+        .map(|n| (n, (n % 2 == 0).then(|| format!("body {n}").into_bytes())))
+        .collect();
+    assert_eq!(got, want);
+    assert_eq!(store.max_get_running(), GET_CONCURRENCY);
+    assert_eq!((GET_CONCURRENCY, PUT_CONCURRENCY), (6, 6));
+    // やり直していない (失敗の指定は 1 回ぶんで、次に読めば読める)
+    assert_eq!(store.get("k/3").await, Ok(Some(b"body 3".to_vec())));
 }

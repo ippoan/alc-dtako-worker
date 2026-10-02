@@ -19,6 +19,7 @@ use alc_core_wasm::TenantId;
 use alc_dtako_upload::ingest::IngestLimits;
 use alc_dtako_upload::routes::{tenant_router, tenant_router_with, DtakoState};
 use alc_dtako_upload::split::LogLevel;
+use alc_dtako_upload::store::GET_CONCURRENCY;
 use alc_worker_db::PgClient;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -571,6 +572,56 @@ async fn reupload_reads_previous_minutes_from_the_split_kudgivt() {
         .collect();
     assert_eq!(statuses, ["completed"; 6]);
     ctx.assert_no_identifiers(t, &[], &["U-1001", "U-1002", "D-ONE", ".zip"]);
+    ctx.finish().await;
+}
+
+/// 前回の KUDGIVT は、運行NO ごとに 1 回、まとめて同時に読む (同時は上限まで)。結果は運行NO に結び付き、
+/// 1 本の読み込みの失敗は、その運行だけ「前回の分数なし」になる。
+#[tokio::test(flavor = "multi_thread")]
+async fn previous_kudgivt_is_read_concurrently_and_bound_to_its_operation() {
+    let ctx = Ctx::start().await;
+    let t = ctx.tenant("Dtako Concurrent Read Tenant").await;
+    // 8 運行。運行ごとに運転の分数が違う (base + 運行の番号) ので、結果の結び付けを取り違えると値が合わない
+    let zip_of_minutes = |base: i32| {
+        let unko_no = |n: i32| format!("U-90{n:02}");
+        let kudguri: Vec<String> = (1..=8)
+            .map(|n| kudguri_line(&unko_no(n), 1, "D-ONE", 2, 8, 17))
+            .collect();
+        let line = |n: i32| kudgivt_line(&unko_no(n), 1, "D-ONE", 2, "08:15", "201", base + n);
+        let kudgivt: Vec<String> = (1..=8).map(line).collect();
+        upload_zip(&kudguri, &kudgivt)
+    };
+
+    // 初回: 既に在る運行が無いので、前回の KUDGIVT は読まない (GET は分割の zip の読み直しの 1 本だけ)
+    ctx.upload_ok(t, "first.zip", &zip_of_minutes(100)).await;
+    assert_eq!(ctx.store.max_get_running(), 1);
+
+    // 同じ zip の上げ直し: 8 運行ぶんを同時に読む (上限まで)。全部読めて値が同じなので、変更記録は付かない
+    let body = ctx.upload_ok(t, "same.zip", &zip_of_minutes(100)).await;
+    assert_eq!(body["operations_count"], 8);
+    assert_eq!(ctx.store.max_get_running(), GET_CONCURRENCY);
+    assert_eq!(ctx.changes(t).await, Vec::<Value>::new());
+    assert_eq!(ctx.log_lines(), []);
+
+    // 全運行の運転の分数を変えた上げ直しで、1 本 (U-9005) の読み込みだけ失敗させる:
+    // ほかの 7 運行は、その運行の前回の分数 (100 + 番号) と今回の分数 (200 + 番号) で記録が付く。
+    // U-9005 は前回の分数が取れないので、分数だけの違いでは記録しない
+    ctx.store.fail_gets_containing("/unko/U-9005/", 1);
+    ctx.upload_ok(t, "changed.zip", &zip_of_minutes(200)).await;
+    let snapshot = |drive_minutes: i32| {
+        json!({
+            "driver_cd": "D-ONE", "departure_at": "2026-03-02T08:15:00Z", "return_at": "2026-03-02T17:15:00Z",
+            "drive_minutes": drive_minutes, "cargo_minutes": 0, "break_minutes": 0, "rest_minutes": 0,
+        })
+    };
+    let change = |n: i32| json!({ "unko_no": format!("U-90{n:02}"), "crew_role": 1, "before": snapshot(100 + n), "after": snapshot(200 + n) });
+    let want_changes: Vec<Value> = [1, 2, 3, 4, 6, 7, 8].into_iter().map(change).collect();
+    assert_eq!(ctx.changes(t).await, want_changes);
+    let warn = "upload: previous KUDGIVT unavailable for 1 row(s)".to_owned();
+    assert_eq!(ctx.log_lines(), [(LogLevel::Warn, warn)]);
+    assert_eq!(ctx.store.max_get_running(), GET_CONCURRENCY);
+
+    ctx.assert_no_identifiers(t, &[], &["U-90", "D-ONE", ".zip"]);
     ctx.finish().await;
 }
 

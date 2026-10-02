@@ -1,4 +1,4 @@
-//! 保存先 (R2) への読み書きの層と、失敗した PUT だけをやり直す [`put_all_with_retry`]
+//! 保存先 (R2) への読み書きの層と、失敗した PUT だけをやり直す [`put_all_with_retry`]・まとめて読む [`get_all`]
 //! (Refs ippoan/rust-alc-api#725)。
 //!
 //! 口のコードから保存先を切り離すための抽象。R2 の binding (`worker::Bucket`) は wasm32 でしか動かないので、
@@ -19,6 +19,8 @@ pub const PUT_RETRY_ATTEMPTS: usize = 3;
 pub const PUT_RETRY_DELAYS_MS: [u64; 2] = [300, 800];
 /// 1 つの回の中で同時に走らせる PUT の数 (Workers の同時接続の上限に合わせる)。
 pub const PUT_CONCURRENCY: usize = 6;
+/// まとめて読むときに同時に走らせる GET の数 (PUT と同じ)。
+pub const GET_CONCURRENCY: usize = PUT_CONCURRENCY;
 
 /// 保存先のエラー。**識別子を持たない** — 持つのは段の名前 (コードに書いた固定の語) だけで、
 /// key・bucket 名・ランタイムが返した生の文は載せない (詳細を残したいときは、作る側が自分のログに出す)。
@@ -80,6 +82,25 @@ pub struct PutOutcome<T> {
     pub succeeded: Vec<T>,
     /// 回を使い切っても書けなかったもの
     pub failed: Vec<T>,
+}
+
+/// `items` (key と、呼び手の tag) を全部 GET する。同時 [`GET_CONCURRENCY`] 本で、**やり直しはしない**。
+///
+/// 返すのは `(tag, 中身)` で、順は入力の順とは限らない (結果は tag で結び付ける)。
+/// 読めなかった (失敗) と無いは、どちらも `None`。`items` が空なら `store` に触らない。
+pub async fn get_all<S, T>(store: &S, items: Vec<(String, T)>) -> Vec<(T, Option<Vec<u8>>)>
+where
+    S: ObjectStore + ?Sized,
+    T: Send,
+{
+    stream::iter(items)
+        .map(|(key, tag)| async move {
+            let bytes = store.get(&key).await.ok().flatten();
+            (tag, bytes)
+        })
+        .buffer_unordered(GET_CONCURRENCY)
+        .collect()
+        .await
 }
 
 /// `items` を全部 PUT する。失敗したものだけを、最大 [`PUT_RETRY_ATTEMPTS`] 回までやり直す

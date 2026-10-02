@@ -22,6 +22,9 @@ pub struct FakeStore {
     objects: Mutex<BTreeMap<String, (Vec<u8>, String)>>,
     running: AtomicUsize,
     max_running: AtomicUsize,
+    /// 同時に走っている GET の数と、その最大
+    get_running: AtomicUsize,
+    max_get_running: AtomicUsize,
     /// GET を失敗させる
     get_broken: AtomicBool,
     /// (key の一部, あと何回 GET を失敗させるか)。key が実行時に決まるもの (履歴の id を含む key) 用
@@ -106,6 +109,11 @@ impl FakeStore {
         self.running.load(Ordering::SeqCst)
     }
 
+    /// 同時に走った GET の最大。
+    pub fn max_get_running(&self) -> usize {
+        self.max_get_running.load(Ordering::SeqCst)
+    }
+
     pub fn max_running(&self) -> usize {
         self.max_running.load(Ordering::SeqCst)
     }
@@ -114,6 +122,11 @@ impl FakeStore {
 impl ObjectStore for FakeStore {
     fn get<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<Option<Vec<u8>>, StoreError>> {
         Box::pin(async move {
+            let running = self.get_running.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_get_running.fetch_max(running, Ordering::SeqCst);
+            // ここで他の GET に順番を譲る (同時に走っている状態を作る)
+            tokio::task::yield_now().await;
+            self.get_running.fetch_sub(1, Ordering::SeqCst);
             let broken = self.get_broken.load(Ordering::SeqCst);
             if broken || take_failure(&self.get_fail_patterns, key) {
                 return Err(StoreError::new("get"));

@@ -2,8 +2,8 @@
 
 デジタコの運行 CSV のアップロード・分割の Cloudflare Worker `alc-dtako` と、その route の crate `alc-dtako-upload`。
 rust-alc-api を Cloudflare Workers へ分ける 2 本目 (Refs ippoan/rust-alc-api#725)。型は 1 本目の ippoan/alc-vein-worker と同じ。
-口は `POST /split-csv/{upload_id}` (分割 1 件) と `POST /split-csv-all` (一括分割。応答は event-stream) の 2 本。構造は `.claude/skills/alc-dtako-worker-map`、詳細は `README.md`。
-直下 = Worker 本体 (workspace の root)。`crates/alc-dtako-upload/` = route の crate (口 `routes`・分割の流れ `split`・SQL の定数 `repo::sql`・それを流す `pg`・保存先の層 `store`。接続も R2 の実装も持たない)。
+口は `POST /upload` (zip の取り込み)・`POST /split-csv/{upload_id}` (分割 1 件)・`POST /split-csv-all` (一括分割。応答は event-stream) の 3 本。構造は `.claude/skills/alc-dtako-worker-map`、詳細は `README.md`。
+直下 = Worker 本体 (workspace の root)。`crates/alc-dtako-upload/` = route の crate (口 `routes`・取り込みの流れ `ingest`・分割の流れ `split`・zip の展開 `archive`・SQL の定数 `repo::sql`・それを流す `pg`・保存先の層 `store`。接続も R2 の実装も持たない)。
 
 ## コマンド
 
@@ -35,9 +35,9 @@ npx wrangler@4.144.0 deploy --dry-run [--env staging]                   # 配信
   (`execute`・`query`・`query_one`・`query_opt`・`prepare`) を足さない** — 使うのは `TenantTx` の `query_typed` 系と `execute_typed` だけ
   (Hyperdrive 経由では名前付きの文で接続が切れる)。生の `tokio_postgres::Client` を `src/db.rs` の外へ出さない。
 - **分割の出力 (R2 の key と中身のバイト列) を backend と変えない** — 分ける本体は `alc_csv_parser::split_csv_entry` を呼ぶ (写さない・整えない)。
-  ログ (`split::LogSink`) と応答の本文に key・運行NO・upload_id・テナント ID・エラーの生の文を出さない。`unsafe` を書かない (`Send` は `worker::send` の型で)。
+  ログ (`split::LogSink`)・応答の本文・履歴の `error_message` に key・運行NO・upload_id・テナント ID・入力の値・エラーの生の文を出さない (固定の語だけ)。`unsafe` を書かない (`Send` は `worker::send` の型で)。
 - **DB の検査と coverage の gate を弱めない。** `tests/sql_db.rs` は migration が未取得なら失敗する作り (skip・`#[ignore]` にしない)。
-  CI は本数を target ごとに固定して回す (`ci.yml` の `sql_db` 15・`store` 9・`split_flow` 20。足したら数も上げる)。`coverage_100.toml` の登録を外さない。
+  CI は本数を target ごとに固定して回す (`ci.yml` の `sql_db` 15・`store` 9・`split_flow` 20・`upload_flow` 6。足したら数も上げる)。`coverage_100.toml` の登録を外さない。
   route の crate の通常の依存に `tokio` を入れない (待ちは `store::Sleeper` 越し。R2 の読み書きは `store::ObjectStore` 越し)。
 - **`pglite-oxide` は `=0.5.0` に固定**、wasmer 系 13 crate は `Cargo.lock` で alpha 版に pin (Rust 1.92.0 で通る版。toolchain は上げない)。
   lock を作り直したら pin し直す (README の「lock の pin」)。本番の wasm に pglite / wasmer を入れない。

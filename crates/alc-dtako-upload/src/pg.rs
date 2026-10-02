@@ -731,6 +731,16 @@ pub enum ApplyUploadError {
     Db(tokio_postgres::Error),
 }
 
+impl ApplyUploadError {
+    /// ログに出せる label (識別子も生の文も含まない。DB の失敗は `alc_worker_db::kind`)。
+    pub fn kind(&self) -> String {
+        match self {
+            Self::LengthMismatch => "length_mismatch".to_owned(),
+            Self::Db(e) => alc_worker_db::kind(e),
+        }
+    }
+}
+
 /// 取り込みの本体 (1 transaction): [`replace_operations_in`] → [`save_daily_hours`] → [`sql::MARK_UPLOAD_COMPLETED`]
 /// (`operations_count` は流した行数)。返すのも、その行数。
 /// `rows` と `inputs` の数が違えば、DB を触る前に [`ApplyUploadError::LengthMismatch`] を返す。

@@ -6,7 +6,7 @@
 #
 # 計測するのは `cargo test -p alc-dtako-upload` の全部 = tests/sql_db.rs (テストの中で起こす組み込みの PostgreSQL。
 # docker は要らないが、先に `bash scripts/fetch-migrations.sh` が要る — 無ければテストが落ちる)・tests/store.rs (偽の保存先)・
-# tests/split_flow.rs (口から DB・偽の保存先まで)。
+# tests/split_flow.rs・tests/upload_flow.rs (口から DB・偽の保存先まで)。
 # 登録したファイルが計測に出ない・実行行が 0 のときも落ちる。
 # repo.rs は SQL の定数だけ、lib.rs は mod 宣言だけで実行行が無いので登録しない。
 # worker 本体 (直下の src/、wasm 専用。R2 の実装 src/r2.rs を含む) は native で計測できないので対象外 (staging の実物で確かめる)。
@@ -23,6 +23,14 @@ path = "crates/alc-dtako-upload/src/store.rs"
 [[files]]
 path = "crates/alc-dtako-upload/src/split.rs"
 
-# 口 (同上。404 / 500 の本文とログまで)
+# アップロードの取り込みの流れ (tests/upload_flow.rs が組み込みの PostgreSQL と偽の保存先で通す)
+[[files]]
+path = "crates/alc-dtako-upload/src/ingest.rs"
+
+# zip の展開と、展開後の大きさの上限 (tests/split_flow.rs と tests/upload_flow.rs が通す)
+[[files]]
+path = "crates/alc-dtako-upload/src/archive.rs"
+
+# 口 (同上。400 / 404 / 500 の本文とログまで)
 [[files]]
 path = "crates/alc-dtako-upload/src/routes.rs"

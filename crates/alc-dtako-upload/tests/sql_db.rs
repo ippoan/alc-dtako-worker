@@ -1036,11 +1036,13 @@ async fn upload_stages_fail_on_a_closed_connection() {
         matches!(applied, Err(ApplyUploadError::LengthMismatch)),
         "{applied:?}"
     );
+    assert_eq!(applied.unwrap_err().kind(), "length_mismatch");
     let applied = pg::apply_upload(&mut c, t, t, rows, vec![input], HashMap::new()).await;
     assert!(
         matches!(&applied, Err(ApplyUploadError::Db(e)) if e.is_closed()),
         "{applied:?}"
     );
+    assert_eq!(applied.unwrap_err().kind(), "closed");
     drop(c);
     db.shutdown();
 }
@@ -1382,7 +1384,7 @@ async fn daily_hours_keep_both_entries_of_a_day_and_skip_unresolved_drivers() {
     let days = "SELECT e.name AS driver, h.work_date, h.start_time, h.total_work_minutes \
                 FROM dtako_daily_work_hours h JOIN employees e ON e.id = h.driver_id \
                 WHERE h.tenant_id = $1 ORDER BY h.work_date, h.start_time";
-    let segments = "SELECT e.name AS driver, s.work_date, s.work_minutes, to_char(s.start_at AT TIME ZONE 'UTC', 'HH24:MI') AS start_at \
+    let segments = "SELECT e.name AS driver, s.work_date, s.unko_no, s.segment_index, s.work_minutes, to_char(s.start_at AT TIME ZONE 'UTC', 'HH24:MI') AS start_at \
                     FROM dtako_daily_work_segments s JOIN employees e ON e.id = s.driver_id \
                     WHERE s.tenant_id = $1 ORDER BY s.start_at";
     let want_days = [
@@ -1390,8 +1392,8 @@ async fn daily_hours_keep_both_entries_of_a_day_and_skip_unresolved_drivers() {
         json!({ "driver": "TEST-BY-CODE", "work_date": "2026-03-04", "start_time": "15:15:00", "total_work_minutes": 480 }),
     ];
     let want_segments = [
-        json!({ "driver": "TEST-BY-CODE", "work_date": "2026-03-04", "work_minutes": 240, "start_at": "01:15" }),
-        json!({ "driver": "TEST-BY-CODE", "work_date": "2026-03-04", "work_minutes": 480, "start_at": "15:15" }),
+        json!({ "driver": "TEST-BY-CODE", "work_date": "2026-03-04", "unko_no": "TWICE-1", "segment_index": 0, "work_minutes": 240, "start_at": "01:15" }),
+        json!({ "driver": "TEST-BY-CODE", "work_date": "2026-03-04", "unko_no": "TWICE-1", "segment_index": 0, "work_minutes": 480, "start_at": "15:15" }),
     ];
     let want_operations = [
         json!({ "unko_no": "EMPTY-1", "driver": null, "departure": "05 08:15" }),

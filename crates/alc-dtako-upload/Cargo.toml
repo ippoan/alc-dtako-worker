@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 # デジタコの運行 CSV のアップロード・分割の route の crate (Refs ippoan/rust-alc-api#725)。
-# 口 (`routes`)・分割の流れ (`split`)・DB の層 (SQL の定数 `repo::sql`・それを流す `pg`)・保存先の層 (`store`)。
+# 口 (`routes`)・取り込みの流れ (`ingest`)・分割の流れ (`split`)・zip の展開 (`archive`)・DB の層 (SQL の定数 `repo::sql`・それを流す `pg`)・保存先の層 (`store`)。
 [dependencies]
 # 出どころは直下の Cargo.toml の [workspace.dependencies] の 1 か所 (ここに git / path を書かない)
 alc-core-wasm = { workspace = true }
@@ -14,7 +14,7 @@ alc-worker-db = { workspace = true }
 alc-compare = { workspace = true }
 # 分割の純粋な部分 (backend と共有)
 alc-csv-parser = { workspace = true }
-axum = { version = "0.8", default-features = false, features = ["json"] }
+axum = { version = "0.8", default-features = false, features = ["json", "multipart"] }
 # 運行の日付・日時を DB に渡す型 (`pg`)。alc-csv-parser の `KudguriRow` と同じ版
 chrono = { version = "0.4", default-features = false }
 # `store` の `buffer_unordered` (同時に走らせる PUT の数の上限)・`BoxFuture`、state の async の Mutex
@@ -26,7 +26,7 @@ serde_json = "1"
 tokio-postgres = { version = "0.7", default-features = false, features = ["with-uuid-1", "with-chrono-0_4", "with-serde_json-1"] }
 # 口の `Path<Uuid>` に `serde` が要る
 uuid = { version = "1", features = ["serde"] }
-# アップロードされた zip の展開。deflate (と無圧縮) だけ — 既定 features は C の依存 (bzip2 等) を連れてきて wasm32 に載らない
+# アップロードされた zip の展開 (`archive`)。deflate (と無圧縮) だけ — 既定 features は C の依存 (bzip2 等) を連れてきて wasm32 に載らない
 zip = { version = "2", default-features = false, features = ["deflate"] }
 
 # native でも wasm32-unknown-unknown でもビルドできる (接続は持たない。張るのは直下の worker と tests/sql_db.rs)。
@@ -39,7 +39,9 @@ pglite-oxide = "=0.5.0"
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
 # tests/sql_db.rs 用の native の接続 (runtime 付き)。dev-dependency なので wasm のビルドには入らない
 tokio-postgres = { version = "0.7", features = ["with-uuid-1", "with-chrono-0_4", "with-serde_json-1"] }
-# tests/split_flow.rs: 口を `oneshot` で叩く
+# tests/upload_flow.rs: 作り物の KUDGURI・KUDGIVT を Shift_JIS にする (alc-csv-parser が通常の依存で引いているのと同じ crate)
+encoding_rs = "0.8"
+# tests/split_flow.rs・tests/upload_flow.rs: 口を `oneshot` で叩く
 tower = { version = "0.5", features = ["util"] }
 # テストごとの乱数のテナント ID
 uuid = { version = "1", features = ["v4"] }

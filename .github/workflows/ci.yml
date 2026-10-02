@@ -49,10 +49,10 @@ jobs:
       - run: bash scripts/fetch-migrations.sh
       - uses: taiki-e/install-action@cargo-llvm-cov
       # crates/alc-dtako-upload の tests/sql_db.rs (組み込みの PostgreSQL。docker も env も要らない)・tests/store.rs
-      # (偽の保存先)・tests/split_flow.rs (口から DB・偽の保存先まで) を、計測つきで 1 回だけ走らせる (素の cargo test と分けると、dev-dependency を 2 回 compile することになる)。
+      # (偽の保存先)・tests/split_flow.rs・tests/upload_flow.rs (口から DB・偽の保存先まで) を、計測つきで 1 回だけ走らせる (素の cargo test と分けると、dev-dependency を 2 回 compile することになる)。
       # テストの target ごとに本数を固定する (減ったら落ちる。テストを足したらここの数も上げる)。
       # 行カバレッジ 100% の gate の登録簿は直下の coverage_100.toml
-      - name: sql_db・store・split_flow + Coverage 100% gate (crates/alc-dtako-upload)
+      - name: sql_db・store・split_flow・upload_flow + Coverage 100% gate (crates/alc-dtako-upload)
         run: |
           set -o pipefail
           # 前の計測の残り (cache から戻った profraw) を数えない
@@ -65,6 +65,8 @@ jobs:
             | grep -Eq '^test result: ok\. 9 passed; 0 failed; 0 ignored'
           awk '/Running.*tests\/split_flow\.rs \(/{f=1} f && /^test result:/{print; exit}' "$RUNNER_TEMP/alc-dtako-upload-test.txt" \
             | grep -Eq '^test result: ok\. 20 passed; 0 failed; 0 ignored'
+          awk '/Running.*tests\/upload_flow\.rs \(/{f=1} f && /^test result:/{print; exit}' "$RUNNER_TEMP/alc-dtako-upload-test.txt" \
+            | grep -Eq '^test result: ok\. 6 passed; 0 failed; 0 ignored'
           cov="$RUNNER_TEMP/alc-dtako-upload-cov.txt"
           # -p を付けないと直下の package (worker) だけが対象になり、報告が空になる
           cargo llvm-cov report --locked -p alc-dtako-upload --text > "$cov"

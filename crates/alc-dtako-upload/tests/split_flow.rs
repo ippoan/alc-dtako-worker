@@ -26,7 +26,7 @@ use axum::body::Body;
 use axum::http::{HeaderMap, Request, StatusCode};
 use axum::{middleware, Extension};
 use embedded::{kudgivt_flags, operation, tenant, upload, Embedded, Held, APP_ROLE};
-use fakes::{FakeSleeper, FakeStore, Logs};
+use fakes::{declare_uncompressed_size, FakeSleeper, FakeStore, Logs};
 use futures_util::lock::Mutex;
 use serde_json::{json, Value};
 use tower::ServiceExt;
@@ -419,11 +419,23 @@ async fn broken_zip_is_500_and_writes_nothing() {
     );
     assert_eq!(ctx.store.total_put_calls(), 0);
 
+    // 書かれた非圧縮サイズの合計が上限 (64MB) を超える (展開しない)
+    let mut too_large = zip_of(&[("KUDGIVT.csv", b"unko,event\n8001,TEST-A\n", Deflated)]);
+    declare_uncompressed_size(&mut too_large, 65 * 1024 * 1024);
+    ctx.store.seed(ZIP_KEY, too_large, ZIP_TYPE);
+    let (status, too_large) = ctx.post_split(t, up).await;
+    assert_eq!(
+        (status, too_large.as_str()),
+        (StatusCode::INTERNAL_SERVER_ERROR, INTERNAL_ERROR)
+    );
+    assert_eq!(ctx.store.total_put_calls(), 0);
+
     let zip_error = (LogLevel::Error, "split-csv failed: zip".to_owned());
-    assert_eq!(ctx.logs.all(), [zip_error.clone(), zip_error]);
+    let want_logs = [zip_error.clone(), zip_error.clone(), zip_error];
+    assert_eq!(ctx.logs.all(), want_logs);
     assert_eq!(ctx.flags(t).await, [("8001".to_owned(), 0, false)]);
     let ids = [t.to_string(), up.to_string(), "8001".to_owned()];
-    assert_no_identifiers(&ctx, &[&broken_entry, &not_zip], &ids);
+    assert_no_identifiers(&ctx, &[&broken_entry, &not_zip, &too_large], &ids);
     ctx.finish().await;
 }
 

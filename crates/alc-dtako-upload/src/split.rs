@@ -10,15 +10,14 @@
 
 use std::collections::HashSet;
 use std::fmt;
-use std::io::{Cursor, Read};
 use std::sync::Arc;
 
 use alc_csv_parser::find_unmatched_kudgivt_unko_nos;
 use alc_worker_db::PgClient;
 use futures_util::lock::Mutex;
 use uuid::Uuid;
-use zip::ZipArchive;
 
+use crate::archive::{Archive, ArchiveError, MAX_UNCOMPRESSED_BYTES};
 use crate::pg;
 use crate::store::{put_all_with_retry, ObjectStore, PutItem, Sleeper};
 
@@ -56,7 +55,7 @@ pub enum SplitError {
     Db(String),
     /// zip が保存先に無い、または読めない
     Storage,
-    /// zip を開けない、または展開できないエントリが在る
+    /// zip を開けない、展開できないエントリが在る、または非圧縮サイズの合計が上限を超える
     Zip,
 }
 
@@ -77,20 +76,9 @@ fn db_error(e: tokio_postgres::Error) -> SplitError {
     SplitError::Db(alc_worker_db::kind(&e))
 }
 
-fn open_zip(zip_bytes: &[u8]) -> Result<ZipArchive<Cursor<&[u8]>>, SplitError> {
-    ZipArchive::new(Cursor::new(zip_bytes)).map_err(|_| SplitError::Zip)
-}
-
-/// `index` 番目のエントリを展開する → (名前, 中身)。名前は zip に書かれた生の値。
-fn read_entry(
-    archive: &mut ZipArchive<Cursor<&[u8]>>,
-    index: usize,
-) -> Result<(String, Vec<u8>), SplitError> {
-    let mut file = archive.by_index(index).map_err(|_| SplitError::Zip)?;
-    let name = file.name().to_string();
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes).map_err(|_| SplitError::Zip)?;
-    Ok((name, bytes))
+/// zip の失敗は、開けない・展開できない・大きすぎるのどれも [`SplitError::Zip`]。
+fn zip_error(_: ArchiveError) -> SplitError {
+    SplitError::Zip
 }
 
 /// アップロード 1 件を分割する。
@@ -120,9 +108,9 @@ pub async fn split_upload(
     let zip_bytes = zip_bytes.ok_or(SplitError::Storage)?;
 
     // 1 巡目 (検査): 全エントリを最後まで読んで捨てる
-    let mut archive = open_zip(&zip_bytes)?;
+    let mut archive = Archive::open(&zip_bytes, MAX_UNCOMPRESSED_BYTES).map_err(zip_error)?;
     for index in 0..archive.len() {
-        read_entry(&mut archive, index)?;
+        archive.read_entry(index).map_err(zip_error)?;
     }
 
     // 2 巡目 (処理)
@@ -131,7 +119,7 @@ pub async fn split_upload(
     let mut succeeded_unko_nos: Vec<String> = Vec::new();
     let mut failed_unko_nos: Vec<String> = Vec::new();
     for index in 0..archive.len() {
-        let (name, bytes) = read_entry(&mut archive, index)?;
+        let (name, bytes) = archive.read_entry(index).map_err(zip_error)?;
         let items: Vec<PutItem<(bool, String)>> =
             alc_csv_parser::split_csv_entry(&key_tenant, &name, &bytes)
                 .into_iter()

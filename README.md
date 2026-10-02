@@ -4,16 +4,16 @@
 rust-alc-api を Cloudflare Workers へ段階移行する 2 本目 (Refs ippoan/rust-alc-api#725) で、型は 1 本目の
 ippoan/alc-vein-worker に合わせている。
 
-口は **`POST /split-csv/{upload_id}`** (アップロード 1 件の分割) と **`POST /split-csv-all`** (一括分割) の 2 本 (どちらも `/api` 付きでも受ける)。それ以外の path は、
+口は **`POST /upload`** (zip の取り込み)・**`POST /split-csv/{upload_id}`** (アップロード 1 件の分割)・**`POST /split-csv-all`** (一括分割) の 3 本 (どれも `/api` 付きでも受ける)。それ以外の path は、
 tenant ヘッダー無しが 401・有りが 404 (どのリクエストも、その前に DB へ繋ぐので、繋げなければ 503 / 500)。
-アップロード本体の口は後続の PR で足す。本番ではまだ誰もこの口を呼ばない (auth-worker の振り分け表に足すのは、アップロード本体が揃った後)。
+本番ではまだ誰もこの口を呼ばない (auth-worker の振り分け表に足すのは後)。
 
 ## 配置
 
 | 場所 | 中身 |
 |---|---|
 | 直下 (`Cargo.toml`・`wrangler.toml`・`src/`) | Worker 本体 (package `alc-dtako-worker`、wasm32-unknown-unknown)。workspace の root で、`Cargo.lock` はここの 1 つだけ。`src/lib.rs` (workers-rs への載せ方)・`src/db.rs` (DB への経路)・`src/r2.rs` (R2 の binding と待ちを、保存先の層に載せる実装)・`src/tcp.rs` (VPC の binding の extern) |
-| `crates/alc-dtako-upload/` | route の crate (package `alc-dtako-upload`)。口 (`src/routes.rs`)・分割の流れ (`src/split.rs`)・SQL の定数 (`src/repo.rs` の `sql`)・それを流す tokio-postgres 実装 (`src/pg.rs`)・保存先の抽象と PUT のやり直し (`src/store.rs`)。接続も R2 の実装も持たない (張るのは Worker とテスト。テストの DB は process の中で起こす組み込みの PostgreSQL — 下の「DB の検査」) |
+| `crates/alc-dtako-upload/` | route の crate (package `alc-dtako-upload`)。口 (`src/routes.rs`)・取り込みの流れ (`src/ingest.rs`)・分割の流れ (`src/split.rs`)・zip の展開 (`src/archive.rs`。私有)・SQL の定数 (`src/repo.rs` の `sql`)・それを流す tokio-postgres 実装 (`src/pg.rs`)・保存先の抽象と PUT のやり直し (`src/store.rs`)。接続も R2 の実装も持たない (張るのは Worker とテスト。テストの DB は process の中で起こす組み込みの PostgreSQL — 下の「DB の検査」) |
 | `scripts/` | 公開範囲の検査 (`check-exposure.sh` と陰性対照 `check-exposure-test.sh`)、`fetch-migrations.sh` (版は `ALC_MIGRATIONS_REV`)、coverage の gate (`check_coverage_100.sh`、登録簿は直下の `coverage_100.toml`) |
 | `.github/workflows/` | `ci.yml` (検査) / `deploy.yml` (デプロイ) / `tag-release.yml` (本番用のタグ) |
 
@@ -92,7 +92,7 @@ SQL は `src/repo.rs` の `sql` の 1 か所、流すのは `src/pg.rs` の 1 �
 
 分割 1 件の口が使うのは `upload_zip_key` と `mark_has_kudgivt`、一括分割の口は候補を `uploads_needing_split` で引く。
 
-### アップロードの取り込みの段 (口はまだ無い。後続の PR で足す)
+### アップロードの取り込みの段 (呼ぶのは `POST /upload` の流れ = `ingest.rs`)
 
 zip の取り込みのうち DB に書く部分。**SQL は backend (ippoan/rust-alc-api) の文と同じ** (同じ入力が同じ行になることを、文が同じであることで担保する。
 まとめ直さない)。`pg.rs` は 2 つの層に分かれる: `&mut PgClient` を取って transaction を 1 回開く**段の関数**と、その中から呼ぶ
@@ -129,7 +129,49 @@ zip の取り込みのうち DB に書く部分。**SQL は backend (ippoan/rust
   先に入れたセグメントが後の日エントリの保存で消え、結果が実行ごとに変わりうる。worker は両方のセグメントが残る。
 - 「運行NO でセグメントを消す」は、乗務員ごとに `unko_no = ANY($3)` の 1 文 (旧は 乗務員 × 運行NO の数だけ流す。消える行は同じ)。
 - 完了の印の UPDATE に `AND tenant_id` を足している (RLS に加えて文でも絞る。ほかの文と同じ形)。
-- 運行の入れ替え・日別の保存・完了の印が 1 つの transaction (旧は文ごとに別)。
+- 運行の入れ替え・日別の保存・完了の印が 1 つの transaction (旧は文ごとに別)。そのため、1 回のアップロードで入る運行と変更記録の時刻
+  (`created_at`・`recorded_at` などの DB の既定値) は全部同じ値になる (旧は行ごとに別の時刻)。
+
+## アップロードの口 `POST /upload`
+
+デジタコの zip を受け取り、保存先に置き、運行と日別を DB に入れ、運行NO ごとの CSV に分割する。backend (ippoan/rust-alc-api) の
+`POST /api/upload` と同じ仕事・同じ順で、**応答の形も同じ**。流れは `crates/alc-dtako-upload/src/ingest.rs`。
+
+- 入力: `multipart/form-data` の **`file` field** (filename が無ければ `upload.zip`)。body は 20MB まで。
+- 段の順:
+  1. 履歴を作る (`processing`)
+  2. zip を保存先に置く (key = `{テナント}/uploads/{履歴の id}/{filename}`。filename は加工しない)
+  3. key を履歴に記録する
+  4. zip を展開して KUDGURI と KUDGIVT を読む (名前に `KUDGURI`・`KUDGIVT` を含む最初のエントリ。Shift_JIS)。
+     KUDGURI が 0 行なら、KUDGIVT が無くても運行 0 件として進む
+  5. 営業所・車輌・乗務員を解決し、運行が既に在るかを見て、分類を読む (上の `prepare_upload`)
+  6. 既に在る運行だけ、前回の分割が置いた旧 KUDGIVT (`{テナント}/unko/{運行NO}/KUDGIVT.csv`) を保存先から読んで前回の分数を出す
+     (運行NO ごとに 1 回。読めない・無い・parse できないときは「取れなかった」として続け、変更記録の before に印が残る)。
+     今回の分数と日別は、backend と共有の関数 (`alc_csv_parser::operation_changes`・`alc_compare::upload_daily::compute_daily_hours`) で出す
+  7. 運行の入れ替え + 日別の保存 + 完了の印 (上の `apply_upload`。1 transaction)。`operations_count` は KUDGURI の行数
+  8. 分割 (下の分割の口と同じ `split_upload`。zip は保存先から読み直す)。丸ごと失敗したら待って、全体を最大 3 回 (待ち 300ms・800ms)。
+     尽きても応答は 200 のままで、`split_failed` が 1 になる (後から分割の口で復旧できる)
+- 応答 (200): `upload_id`・`operations_count`・`status` (`"completed"`)・`split_failed`・`split_unko_nos`・`split_unko_nos_total`・
+  `split_failed_unko_nos`・`split_failed_unko_nos_total` (運行NO の一覧は 500 件で切り、総数は `_total`)。
+- 失敗:
+  - **入力の誤りは 400 `{"error": "<語>"}`**。語は固定: `invalid_multipart` (multipart として読めない・body が上限を超える)・`no_file`・
+    `tenant_not_found`・`invalid_zip`・`zip_too_large`・`kudguri_not_found`・`kudguri_invalid`・`kudgivt_not_found`・`kudgivt_invalid`
+  - **保存先・DB の失敗は 500 `{"error": "internal_error"}`** (原因はログに、段の名前と kind だけ)
+  - 履歴を作った後の失敗は、履歴に失敗の印を付けてから返す (`error_message` は上の語。500 のときは段の名前 `storage`・`db`)。
+    準備 (5) が通って 7 が失敗したとき、営業所・車輌・乗務員・分類の行は残る
+- zip の展開 (`archive.rs`。分割の口も同じものを使う): 圧縮は deflate と無圧縮だけ。**非圧縮サイズの合計が 64MB を超える zip は展開しない**
+  (アップロードでは `zip_too_large`、分割では失敗)。読むときも、エントリに書かれた非圧縮サイズまでしか読まない (書かれた値より中身が大きい zip は不正)。
+
+### 旧 (backend) との違い
+
+- **400 の本文は固定の語** (旧は parser や DB のエラーの文をそのまま本文と履歴に入れる)。入力の値・テナント ID・エラーの生の文を、本文・履歴・ログに出さない。
+- **保存先・DB の失敗は 500** (旧は取り込みの中の失敗を、種類を問わず 400 で返す)。
+- **展開後の大きさに上限 (64MB)** が在り、圧縮は deflate と無圧縮だけ (旧は上限なしで、ほかの圧縮方式も展開する)。
+- 取り込みの本体が 1 つの transaction (上の「アップロードの取り込みの段 > 旧との違い」)。旧は行ごとに別で、途中で落ちると前半の行が入ったまま失敗になる。
+  日別のセグメントの消し方が決定的 (同じ節)。
+- 旧 KUDGIVT を読むのは運行NO ごとに 1 回 (旧は行ごと)。
+- **呼び手との接続が切れると、失敗の印も付かずに途中で止まることがある** (Workers はリクエストが終わると処理を打ち切る)。履歴が `processing` のまま残る・
+  分割が未完になる、がありうる。運行と日別は 1 つの transaction なので半端には入らない。分割の未完は、分割の口 (下) で復旧する。
 
 ## 分割の口 `POST /split-csv/{upload_id}`
 
@@ -257,6 +299,13 @@ cargo test -p alc-dtako-upload --test sql_db
 cargo llvm-cov --locked -p alc-dtako-upload --text > cov.txt && bash scripts/check_coverage_100.sh --use-cache cov.txt
 ```
 
+`tests/upload_flow.rs` (6 本。口から、組み込みの PostgreSQL と偽の保存先まで) はアップロードの口を確かめる。zip はテストの中で作る
+(`upload_zip`。KUDGURI・KUDGIVT は Shift_JIS・CRLF): 端から端 (応答の 8 field・履歴・運行・日別・セグメント・保存先の zip と分割の出力・分割済みの印) /
+上げ直し (同じ zip は記録なし・値が変われば before と after の分数・旧 KUDGIVT が無い / 読めないときの印) / リクエストの形の誤り (400 の語・
+tenant ヘッダー無しは 401・body は 2MB を超えても通り 20MB を超えると読めない) / zip の中身の誤り (語ごとに履歴の `error_message`・展開後の上限・
+KUDGURI が 0 行は 0 件で completed) / 保存先と DB の失敗 (500・履歴の段の名前・取り込みの本体の途中の失敗で運行も日別も入らない・切れた接続) /
+分割のやり直し (2 回失敗 → 3 回目で通る・3 回とも失敗 → `split_failed = 1` で 200・後から分割の口で復旧)。本文とログに識別子が出ないことも見る。
+
 `tests/split_flow.rs` (20 本。口から、組み込みの PostgreSQL と偽の保存先まで) は 2 つの口を確かめる。一括分割 (6 本): 候補 0 件は `done` だけ /
 新しい順に 1 件ずつ `progress` → `done` / 1 件の失敗を数えて続ける / 上限 50 件と `skipped` / 候補の取得の失敗は固定の `error` / tenant ヘッダー無しは 401。
 本文は、呼び手と同じ読み方 (空行で割り、`data:` の行を JSON に) で読む。**分割の出力の固定の期待値 (1 本)**: Shift_JIS・CRLF の KUDGIVT を通し、
@@ -270,7 +319,7 @@ cargo llvm-cov --locked -p alc-dtako-upload --text > cov.txt && bash scripts/che
 1 回失敗は 2 回目で成功し、成功済みは再送しない / 2 回失敗は 3 回目で成功 (待ちは 300・800) / 3 回とも失敗は `failed` (3 回目の後は待たない) /
 同時に走る PUT は 6 本まで / 空の入力は何も呼ばない / `get` の 3 通り / `StoreError` の文に key が出ない。
 
-CI は target ごとに本数を固定で見る (`sql_db` は `15 passed`、`store` は `9 passed`、`split_flow` は `20 passed`、どれも `0 failed; 0 ignored`)。減らすと落ちる。
+CI は target ごとに本数を固定で見る (`sql_db` は `15 passed`、`store` は `9 passed`、`split_flow` は `20 passed`、`upload_flow` は `6 passed`、どれも `0 failed; 0 ignored`)。減らすと落ちる。
 足したら `ci.yml` の数も上げる (テスト 1 本ごとに DB を起動して全 migration を流すので、本数を増やさず 1 本に筋書きを束ねる)。
 `sql_db` が確かめること (15 本)。取り込みの DB の層 (8 本):
 
@@ -301,7 +350,7 @@ CI は target ごとに本数を固定で見る (`sql_db` は `15 passed`、`sto
 - テナントを設定しない素の接続では、この crate が触る 9 つの表の行が読めない (エラーか 0 行)
 - DB のエラーがそのまま `Err` で返り、失敗した transaction が残らない / 権限の無いロールは 42501 / 切れた接続は `Err`
 
-`crates/alc-dtako-upload/src/` の `pg.rs`・`store.rs`・`split.rs`・`routes.rs` は行カバレッジ 100% を保つ (登録簿は直下の `coverage_100.toml`。`repo.rs` は定数だけで実行行が無いので登録しない)。
+`crates/alc-dtako-upload/src/` の `pg.rs`・`store.rs`・`split.rs`・`routes.rs`・`ingest.rs`・`archive.rs` は行カバレッジ 100% を保つ (登録簿は直下の `coverage_100.toml`。`repo.rs` は定数だけで実行行が無いので登録しない)。
 
 作りと、本物の DB との違い:
 

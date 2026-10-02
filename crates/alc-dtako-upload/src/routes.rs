@@ -1,5 +1,6 @@
 //! 口 (Refs ippoan/rust-alc-api#725)。
 //!
+//! - `POST /upload` → デジタコの zip (multipart の `file` field) を取り込む ([`crate::ingest::ingest_upload`])
 //! - `POST /split-csv/{upload_id}` → アップロード 1 件を分割する ([`crate::split::split_upload`])
 //! - `POST /split-csv-all` → 未分割の運行が在るテナントの、分割の元にできるアップロードを新しい順に
 //!   最大 [`SPLIT_CSV_ALL_LIMIT`] 件、1 件ずつ分割し直す。応答は `text/event-stream` (1 件ごとに `progress`、終わりに `done`)
@@ -12,8 +13,9 @@ use std::sync::Arc;
 
 use alc_core_wasm::TenantId;
 use alc_worker_db::PgClient;
-use axum::body::Body;
-use axum::extract::{Path, State};
+use axum::body::{Body, Bytes};
+use axum::extract::multipart::MultipartRejection;
+use axum::extract::{DefaultBodyLimit, Multipart, Path, State};
 use axum::http::header::{HeaderName, CACHE_CONTROL, CONTENT_TYPE};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -24,6 +26,7 @@ use futures_util::stream;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
+use crate::ingest::{ingest_upload, IngestError, IngestLimits};
 use crate::pg;
 use crate::split::{split_upload, LogLevel, LogSink, SplitError};
 use crate::store::{ObjectStore, Sleeper};
@@ -44,8 +47,27 @@ pub struct DtakoState {
     pub log: LogSink,
 }
 
+/// `POST /upload` が受ける body の上限 (axum の既定は 2MB)。
+pub const UPLOAD_BODY_LIMIT: usize = 20 * 1024 * 1024;
+
 pub fn tenant_router() -> Router<DtakoState> {
+    tenant_router_with(IngestLimits::default())
+}
+
+/// 取り込みの上限を指定して作る ([`tenant_router`] は既定の値)。
+pub fn tenant_router_with(limits: IngestLimits) -> Router<DtakoState> {
+    let upload = post(
+        move |state: State<DtakoState>,
+              tenant: Extension<TenantId>,
+              multipart: Result<Multipart, MultipartRejection>| {
+            upload(limits, state, tenant, multipart)
+        },
+    );
     Router::new()
+        .route(
+            "/upload",
+            upload.layer(DefaultBodyLimit::max(UPLOAD_BODY_LIMIT)),
+        )
         .route("/split-csv/{upload_id}", post(split_csv))
         .route("/split-csv-all", post(split_csv_all))
 }
@@ -60,6 +82,69 @@ fn split_error(log: &LogSink, e: SplitError) -> ApiError {
     log(LogLevel::Error, &format!("split-csv failed: {e}"));
     let body = json!({ "error": "internal_error" });
     (StatusCode::INTERNAL_SERVER_ERROR, Json(body))
+}
+
+fn bad_request(label: &'static str) -> ApiError {
+    (StatusCode::BAD_REQUEST, Json(json!({ "error": label })))
+}
+
+/// 入力の誤りは 400 と固定の語。こちら側の失敗は 500 (原因は `log` に、段の名前と kind だけを出す)。
+fn upload_error(log: &LogSink, e: IngestError) -> ApiError {
+    if e.is_input_error() {
+        return bad_request(e.label());
+    }
+    log(LogLevel::Error, &format!("upload failed: {e}"));
+    let body = json!({ "error": "internal_error" });
+    (StatusCode::INTERNAL_SERVER_ERROR, Json(body))
+}
+
+/// multipart から `file` field を読む → (filename, 中身)。filename が無ければ `upload.zip` (backend と同じ)。
+/// 失敗は固定の語 (multipart として読めない・body が上限を超える = `invalid_multipart` / `file` が無い = `no_file`)。
+async fn read_file(mut multipart: Multipart) -> Result<(String, Bytes), &'static str> {
+    loop {
+        let field = multipart.next_field().await;
+        let Some(field) = field.map_err(|_| "invalid_multipart")? else {
+            return Err("no_file");
+        };
+        if field.name() == Some("file") {
+            let filename = field.file_name().unwrap_or("upload.zip").to_string();
+            let bytes = field.bytes().await.map_err(|_| "invalid_multipart")?;
+            return Ok((filename, bytes));
+        }
+    }
+}
+
+/// 応答は backend の `POST /api/upload` と同じ 8 フィールド。
+async fn upload(
+    limits: IngestLimits,
+    State(state): State<DtakoState>,
+    Extension(TenantId(tenant_id)): Extension<TenantId>,
+    multipart: Result<Multipart, MultipartRejection>,
+) -> Result<Json<Value>, ApiError> {
+    let multipart = multipart.map_err(|_| bad_request("invalid_multipart"))?;
+    let (filename, zip_bytes) = read_file(multipart).await.map_err(bad_request)?;
+    let (store, sleeper) = (state.store.as_ref(), state.sleeper.as_ref());
+    let ingest = ingest_upload(
+        &state.pg, store, sleeper, &state.log, limits, tenant_id, filename, zip_bytes,
+    );
+    let outcome = ingest.await.map_err(|e| upload_error(&state.log, e))?;
+    let (split_unko_nos, split_unko_nos_total) = alc_csv_parser::cap_sorted(
+        outcome.split.succeeded_unko_nos,
+        SPLIT_UNKO_NOS_DISPLAY_LIMIT,
+    );
+    let (split_failed_unko_nos, split_failed_unko_nos_total) =
+        alc_csv_parser::cap_sorted(outcome.split.failed_unko_nos, SPLIT_UNKO_NOS_DISPLAY_LIMIT);
+
+    Ok(Json(json!({
+        "upload_id": outcome.upload_id,
+        "operations_count": outcome.operations_count,
+        "status": "completed",
+        "split_failed": outcome.split.put_failed,
+        "split_unko_nos": split_unko_nos,
+        "split_unko_nos_total": split_unko_nos_total,
+        "split_failed_unko_nos": split_failed_unko_nos,
+        "split_failed_unko_nos_total": split_failed_unko_nos_total,
+    })))
 }
 
 /// 応答は backend の `POST /api/split-csv/{upload_id}` と同じ 7 フィールド。

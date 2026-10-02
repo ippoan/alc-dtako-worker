@@ -259,6 +259,11 @@ async fn split_writes_the_shared_split_output_and_marks_kudgivt() {
         })
     );
     assert_eq!(json_of(&body).as_object().unwrap().len(), 7);
+    // 本文のキーの順も固定 (文字列として比べる)
+    let text = format!(
+        r#"{{"status":"ok","upload_id":"{up}","split_failed":0,"split_unko_nos":["5001","5002"],"split_unko_nos_total":2,"split_failed_unko_nos":[],"split_failed_unko_nos_total":0}}"#
+    );
+    assert_eq!(body, text);
 
     // 置かれたもの = 同じ zip に split_csv_entry を当てた結果 (.csv 以外は飛ばす)。content-type は text/csv
     let written = ctx.written();

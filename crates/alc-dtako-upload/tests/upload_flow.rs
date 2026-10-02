@@ -465,6 +465,26 @@ async fn upload_imports_operations_daily_hours_and_splits() {
     assert_eq!(ctx.sleeper.slept(), Vec::<u64>::new());
     assert_eq!(ctx.log_lines(), []);
 
+    // 本文のキーの順は固定で、`upload_id` が先頭に来る (呼び手に、本文の先頭の決まった長さだけから `upload_id` を読むものが在る)。
+    // 運行が多くて運行NO の一覧が長い応答でも変わらない
+    let unko_nos: Vec<String> = (1..=30).map(|n| format!("U-LONG-{n:04}")).collect();
+    let line = |unko_no: &String| kudguri_line(unko_no, 1, "D-ONE", 9, 8, 17);
+    let kudguri: Vec<String> = unko_nos.iter().map(line).collect();
+    let line = |unko_no: &String| kudgivt_line(unko_no, 1, "D-ONE", 9, "08:15", "201", 540);
+    let kudgivt: Vec<String> = unko_nos.iter().map(line).collect();
+    let (status, text) = ctx
+        .upload(t, "many.zip", &upload_zip(&kudguri, &kudgivt))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let many_id = json_of(&text)["upload_id"].as_str().unwrap().to_owned();
+    let listed: Vec<String> = unko_nos.iter().map(|u| format!("\"{u}\"")).collect();
+    let want_text = format!(
+        r#"{{"upload_id":"{many_id}","operations_count":30,"status":"completed","split_failed":0,"split_unko_nos":[{}],"split_unko_nos_total":30,"split_failed_unko_nos":[],"split_failed_unko_nos_total":0}}"#,
+        listed.join(",")
+    );
+    assert_eq!(text, want_text);
+    assert!(text.len() > 300 && text.starts_with(r#"{"upload_id":""#));
+
     // 応答の `Server-Timing` に、段ごとの所要が終えた順に載る (名前と数字だけ。偽の時計は読むたびに 7 進む)
     let stages = "history;dur=7, put_zip;dur=7, parse;dur=7, prepare;dur=7, old_kudgivt;dur=7, apply;dur=7, split;dur=7";
     let timed = ctx.upload_timing(t, &sample_zip(60)).await;
@@ -1004,6 +1024,11 @@ async fn rerun_recovers_a_failed_upload_from_the_stored_zip() {
     let (status, again) = ctx.rerun(t, &upload_id).await;
     assert_eq!(status, StatusCode::OK, "{again}");
     assert_eq!(json_of(&again), want);
+    // 本文のキーの順は、アップロードの口と同じ (文字列として比べる)
+    let want_text = format!(
+        r#"{{"upload_id":"{upload_id}","operations_count":2,"status":"completed","split_failed":0,"split_unko_nos":["U-5001","U-REJECT"],"split_unko_nos_total":2,"split_failed_unko_nos":[],"split_failed_unko_nos_total":0}}"#
+    );
+    assert_eq!(again, want_text);
     assert_eq!(ctx.changes(t).await, Vec::<Value>::new());
     assert_eq!(ctx.history(t).await, [completed]);
     // やり直しの `Server-Timing` は、頭の 2 段が違う (失敗した応答には、終えた段までが載る)

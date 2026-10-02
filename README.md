@@ -153,6 +153,8 @@ zip の取り込みのうち DB に書く部分。**SQL は backend (ippoan/rust
      尽きても応答は 200 のままで、`split_failed` が 1 になる (後から分割の口で復旧できる)
 - 応答 (200): `upload_id`・`operations_count`・`status` (`"completed"`)・`split_failed`・`split_unko_nos`・`split_unko_nos_total`・
   `split_failed_unko_nos`・`split_failed_unko_nos_total` (運行NO の一覧は 500 件で切り、総数は `_total`)。
+  **本文のキーはこの順** (backend と同じ。`upload_id` が先頭)。呼び手に、本文の先頭の決まった長さだけを取っておいて `upload_id` を読むものが在るので、順を変えない
+  (応答は field の順で出す struct。`json!` で組むと名前順になり、長い運行NO の一覧が前に出る)。
 - 失敗:
   - **入力の誤りは 400 `{"error": "<語>"}`**。語は固定: `invalid_multipart` (multipart として読めない・body が上限を超える)・`no_file`・
     `tenant_not_found`・`invalid_zip`・`zip_too_large`・`kudguri_not_found`・`kudguri_invalid`・`kudgivt_not_found`・`kudgivt_invalid`

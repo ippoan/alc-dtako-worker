@@ -24,6 +24,7 @@ use axum::routing::post;
 use axum::{Extension, Json, Router};
 use futures_util::lock::Mutex;
 use futures_util::stream;
+use serde::Serialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
@@ -112,7 +113,22 @@ fn ingest_error(log: &LogSink, what: &str, e: IngestError) -> ApiError {
 }
 
 /// 取り込みの応答 (backend の `POST /api/upload` と同じ 8 フィールド。アップロードとやり直しで同じ形)。
-fn ingest_response(outcome: IngestOutcome) -> Json<Value> {
+///
+/// **field の順 = 本文のキーの順** (backend と同じ順)。呼び手に、本文の先頭の決まった長さだけを取っておき、そこから
+/// `upload_id` を読むものが在るので、`upload_id` を先頭に、長くなりうる運行NO の一覧を後ろに置く (順を変えない)。
+#[derive(Serialize)]
+struct UploadResponse {
+    upload_id: Uuid,
+    operations_count: i32,
+    status: &'static str,
+    split_failed: usize,
+    split_unko_nos: Vec<String>,
+    split_unko_nos_total: usize,
+    split_failed_unko_nos: Vec<String>,
+    split_failed_unko_nos_total: usize,
+}
+
+fn ingest_response(outcome: IngestOutcome) -> Json<UploadResponse> {
     let (split_unko_nos, split_unko_nos_total) = alc_csv_parser::cap_sorted(
         outcome.split.succeeded_unko_nos,
         SPLIT_UNKO_NOS_DISPLAY_LIMIT,
@@ -120,16 +136,16 @@ fn ingest_response(outcome: IngestOutcome) -> Json<Value> {
     let (split_failed_unko_nos, split_failed_unko_nos_total) =
         alc_csv_parser::cap_sorted(outcome.split.failed_unko_nos, SPLIT_UNKO_NOS_DISPLAY_LIMIT);
 
-    Json(json!({
-        "upload_id": outcome.upload_id,
-        "operations_count": outcome.operations_count,
-        "status": "completed",
-        "split_failed": outcome.split.put_failed,
-        "split_unko_nos": split_unko_nos,
-        "split_unko_nos_total": split_unko_nos_total,
-        "split_failed_unko_nos": split_failed_unko_nos,
-        "split_failed_unko_nos_total": split_failed_unko_nos_total,
-    }))
+    Json(UploadResponse {
+        upload_id: outcome.upload_id,
+        operations_count: outcome.operations_count,
+        status: "completed",
+        split_failed: outcome.split.put_failed,
+        split_unko_nos,
+        split_unko_nos_total,
+        split_failed_unko_nos,
+        split_failed_unko_nos_total,
+    })
 }
 
 /// multipart から `file` field を読む → (filename, 中身)。filename が無ければ `upload.zip` (backend と同じ)。
@@ -201,12 +217,24 @@ async fn rerun(
     timed_response(&state.log, "rerun", &timer, outcome)
 }
 
-/// 応答は backend の `POST /api/split-csv/{upload_id}` と同じ 7 フィールド。
+/// 分割 1 件の応答 (backend の `POST /api/split-csv/{upload_id}` と同じ 7 フィールド)。**field の順 = 本文のキーの順**。
+#[derive(Serialize)]
+struct SplitResponse {
+    status: &'static str,
+    upload_id: Uuid,
+    split_failed: usize,
+    split_unko_nos: Vec<String>,
+    split_unko_nos_total: usize,
+    split_failed_unko_nos: Vec<String>,
+    split_failed_unko_nos_total: usize,
+}
+
+/// 応答は [`SplitResponse`]。
 async fn split_csv(
     State(state): State<DtakoState>,
     Extension(TenantId(tenant_id)): Extension<TenantId>,
     Path(upload_id): Path<Uuid>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<SplitResponse>, ApiError> {
     let (store, sleeper) = (state.store.as_ref(), state.sleeper.as_ref());
     let outcome = split_upload(&state.pg, store, sleeper, &state.log, tenant_id, upload_id)
         .await
@@ -216,15 +244,15 @@ async fn split_csv(
     let (split_failed_unko_nos, split_failed_unko_nos_total) =
         alc_csv_parser::cap_sorted(outcome.failed_unko_nos, SPLIT_UNKO_NOS_DISPLAY_LIMIT);
 
-    Ok(Json(json!({
-        "status": "ok",
-        "upload_id": upload_id,
-        "split_failed": outcome.put_failed,
-        "split_unko_nos": split_unko_nos,
-        "split_unko_nos_total": split_unko_nos_total,
-        "split_failed_unko_nos": split_failed_unko_nos,
-        "split_failed_unko_nos_total": split_failed_unko_nos_total,
-    })))
+    Ok(Json(SplitResponse {
+        status: "ok",
+        upload_id,
+        split_failed: outcome.put_failed,
+        split_unko_nos,
+        split_unko_nos_total,
+        split_failed_unko_nos,
+        split_failed_unko_nos_total,
+    }))
 }
 
 /// 一括分割の進み具合 (stream の状態)。

@@ -4,9 +4,10 @@
 rust-alc-api を Cloudflare Workers へ段階移行する 2 本目 (Refs ippoan/rust-alc-api#725) で、型は 1 本目の
 ippoan/alc-vein-worker に合わせている。
 
-口は **`POST /upload`** (zip の取り込み)・**`POST /internal/rerun/{upload_id}`** (やり直し)・**`POST /split-csv/{upload_id}`** (アップロード 1 件の分割)・**`POST /split-csv-all`** (一括分割) の 4 本 (どれも `/api` 付きでも受ける)。それ以外の path は、
+口は 7 本 (どれも `/api` 付きでも受ける): **`POST /upload`** (zip の取り込み)・**`POST /internal/rerun/{upload_id}`** (やり直し)・**`POST /split-csv/{upload_id}`** (アップロード 1 件の分割)・
+**`POST /split-csv-all`** (一括分割) と、履歴の読み取りの **`GET /uploads`**・**`GET /internal/pending`**・**`GET /internal/download/{upload_id}`**。それ以外の path は、
 tenant ヘッダー無しが 401・有りが 404 (どのリクエストも、その前に DB へ繋ぐので、繋げなければ 503 / 500)。
-本番ではまだ誰もこの口を呼ばない (auth-worker の振り分け表に足すのは後)。
+アップロード (`/upload`) と分割の 2 口は、auth-worker の振り分けから呼ばれる。やり直しの口と、履歴の読み取りの 3 口は、まだ振り分けに無い (呼ばれない)。
 
 ## 配置
 
@@ -90,6 +91,9 @@ SQL は `src/repo.rs` の `sql` の 1 か所、流すのは `src/pg.rs` の 1 �
 |---|---|---|
 | `upload_zip_key(pg, tenant_id, upload_id)` | `SELECT_UPLOAD_ZIP_KEY` | アップロード 1 件の ZIP の R2 の key (`Option<String>`。行が無い・key が NULL はどちらも `None`) |
 | `mark_has_kudgivt(pg, tenant_id, unko_nos)` | `MARK_HAS_KUDGIVT` | 渡した運行NO の運行に分割済みの印を付け、付けた行の運行NO を返す (`RETURNING` のまま。同じ運行NO が乗務員ごとに複数行あればその数だけ返る — 呼び手が集合にする)。空の入力は transaction を開かない。backend は 100 件ずつの `IN (…)` だったが、`= ANY($2)` の 1 文にしている (結果は同じ) |
+| `list_uploads(pg, tenant_id)` | `LIST_UPLOADS` | テナントの履歴の一覧 (`Vec<UploadRow>`。新しい順に 50 件。同じ時刻は id の降順)。`error_message`・`r2_zip_key` は NULL のことがある |
+| `list_pending_uploads(pg, tenant_id)` | `LIST_PENDING_UPLOADS` | テナントの、status が `pending_retry` か `failed` の履歴の一覧 (`Vec<PendingUploadRow>`。並びと件数は同じ) |
+| `upload_download(pg, tenant_id, upload_id)` | `SELECT_UPLOAD_DOWNLOAD` | 履歴 1 件の `(r2_zip_key, filename)` (行が無ければ `None`。key が NULL の行は `Some((None, _))`) |
 | `uploads_needing_split(pg, tenant_id)` | `LIST_UPLOADS_NEEDING_SPLIT` | 分割がまだの運行がテナントに 1 件でも在るとき、completed で key の在るアップロードの `(id, filename)` を新しい順に |
 
 分割 1 件の口が使うのは `upload_zip_key` と `mark_has_kudgivt`、一括分割の口は候補を `uploads_needing_split` で引く。
@@ -183,6 +187,24 @@ zip の取り込みのうち DB に書く部分。**SQL は backend (ippoan/rust
 - **呼び手との接続が切れると、失敗の印も付かずに途中で止まることがある** (Workers はリクエストが終わると処理を打ち切る)。履歴が `processing` のまま残る・
   分割が未完になる、がありうる。運行と日別は 1 つの transaction なので半端には入らない。取り込みが終わっていない履歴は、やり直しの口 (下) で、
   分割の未完は、分割の口 (下) で復旧する。
+
+## 履歴の読み取り口 `GET /uploads`・`GET /internal/pending`・`GET /internal/download/{upload_id}`
+
+アップロードの履歴を読む 3 口。**読み取りだけ** (DB にも保存先にも書かない)。テナントを設定した接続で流し、`WHERE tenant_id` でも絞る
+(= 返すのは、ヘッダーのテナントの履歴だけ)。成功の本文のキーの順と日時の書式は、rust-alc-api の同じ口に合わせている。
+
+- **`GET /uploads`**: 履歴の新しい順に 50 件 (同じ時刻は id の降順)。本文は配列で、要素のキーはこの順 —
+  `created_at`・`error`・`filename`・`id`・`r2_zip_key`・`status` (`error` は列 `error_message`。`error`・`r2_zip_key` は `null` のことがある)。
+  `created_at` は UTC の RFC 3339 で末尾 `Z`、小数は在るぶんだけ 3 桁ずつ (例 `2026-03-02T01:02:03.123456Z`・`…02.120Z`・`…01Z`)。
+- **`GET /internal/pending`**: status が `pending_retry` か `failed` の履歴の新しい順に 50 件。要素のキーはこの順 —
+  `created_at`・`error_message`・`filename`・`id`・`status`・`tenant_id`。`created_at` は RFC 3339 で末尾 `+00:00` (例 `2026-03-02T01:02:02.120+00:00`)。
+- **`GET /internal/download/{upload_id}`**: その履歴の zip を保存先から読んで、そのまま返す (200・`Content-Type: application/zip`・
+  `Content-Disposition: attachment; filename="<名前>"`)。`<名前>` は、履歴の filename から ASCII の英数字と `.`・`-`・`_` だけを残したもの
+  (空になったら `download.zip`)。行が無い・zip の key が入っていないは **404 `{"error":"not_found"}`**、保存先に無い・読めないは 500。
+  UUID でない id は axum の既定の 400。
+- 3 口とも、DB の失敗は 500 `{"error":"internal_error"}` (原因はログに、段の名前と kind だけ)。GET 以外の method は 405。
+- **本文の規約の例外**: 「本文に識別子を出さない」は、エラーの本文とログの規約。一覧 2 口の**成功の本文**は、ヘッダーのテナント自身の履歴の列
+  (`r2_zip_key`・`tenant_id`・`error` / `error_message` を含む) をそのまま返す。
 
 ## やり直しの口 `POST /internal/rerun/{upload_id}`
 
@@ -333,7 +355,7 @@ cargo test -p alc-dtako-upload --test sql_db
 cargo llvm-cov --locked -p alc-dtako-upload --text > cov.txt && bash scripts/check_coverage_100.sh --use-cache cov.txt
 ```
 
-`tests/upload_flow.rs` (9 本。口から、組み込みの PostgreSQL と偽の保存先まで) はアップロードの口 (7 本) とやり直しの口 (2 本) を確かめる。zip はテストの中で作る
+`tests/upload_flow.rs` (12 本。口から、組み込みの PostgreSQL と偽の保存先まで) はアップロードの口 (7 本)・やり直しの口 (2 本)・履歴の読み取り口 (3 本) を確かめる。zip はテストの中で作る
 (`upload_zip`。KUDGURI・KUDGIVT は Shift_JIS・CRLF): 端から端 (応答の 8 field・履歴・運行・日別・セグメント・保存先の zip と分割の出力・分割済みの印) /
 上げ直し (同じ zip は記録なし・値が変われば before と after の分数・旧 KUDGIVT が無い / 読めないときの印) / リクエストの形の誤り (400 の語・
 tenant ヘッダー無しは 401・body は 2MB を超えても通り 20MB を超えると読めない) / zip の中身の誤り (語ごとに履歴の `error_message`・展開後の上限・
@@ -342,7 +364,9 @@ KUDGURI が 0 行は 0 件で completed) / 保存先と DB の失敗 (500・履�
 前回の KUDGIVT の読み込み (8 運行の上げ直しで、同時の読み込みが上限の 6 本まで・結果が運行NO どおりに結び付く・1 本の読み込みの失敗はその運行だけ)。やり直しの口: 復旧 (途中で失敗した履歴を
 取り込み直す → completed と行数・運行と日別と分割の出力・もう一度やり直しても変更記録が増えない・zip は置き直さない) / 引けない・読めない
 (存在しない id・別テナントの履歴・key が NULL は 404 / zip が無い・読めないは 500 / 壊れた zip は 400 / UUID でない id・tenant ヘッダー無し・切れた接続)。
-本文とログに識別子が出ないことも見る。
+本文とログに識別子が出ないことも見る。履歴の読み取り口: 一覧 2 口の本文を文字列で固定 (キーの順と、`created_at` の 3 通りの書式)・別テナントは空の配列・
+GET 以外は 405・切れた接続は 500 / ダウンロード (本文が保存先の bytes と同じ・2 つのヘッダー・filename の残し方・404 の 3 通り・保存先に無い / 読めないは 500・
+エラーの本文とログに id と filename が出ない) / filename の残し方の規則だけを見る 1 本 (DB を使わない)。
 
 `tests/split_flow.rs` (20 本。口から、組み込みの PostgreSQL と偽の保存先まで) は 2 つの口を確かめる。一括分割 (6 本): 候補 0 件は `done` だけ /
 新しい順に 1 件ずつ `progress` → `done` / 1 件の失敗を数えて続ける / 上限 50 件と `skipped` / 候補の取得の失敗は固定の `error` / tenant ヘッダー無しは 401。
@@ -358,9 +382,10 @@ KUDGURI が 0 行は 0 件で completed) / 保存先と DB の失敗 (500・履�
 同時に走る PUT は 6 本まで / 空の入力は何も呼ばない / `get` の 3 通り / `StoreError` の文に key が出ない /
 まとめて読む `get_all` (同時 6 本まで・結果は tag に結び付く・無い / 読めないは `None`・やり直さない・空の入力は何も呼ばない)。
 
-CI は target ごとに本数を固定で見る (`sql_db` は `15 passed`、`store` は `10 passed`、`split_flow` は `20 passed`、`upload_flow` は `9 passed`、どれも `0 failed; 0 ignored`)。減らすと落ちる。
+CI は target ごとに本数を固定で見る (`sql_db` は `16 passed`、`store` は `10 passed`、`split_flow` は `20 passed`、`upload_flow` は `12 passed`、どれも `0 failed; 0 ignored`)。減らすと落ちる。
 足したら `ci.yml` の数も上げる (テスト 1 本ごとに DB を起動して全 migration を流すので、本数を増やさず 1 本に筋書きを束ねる)。
-`sql_db` が確かめること (15 本)。取り込みの DB の層 (8 本):
+`sql_db` が確かめること (16 本)。履歴の読み取り (1 本): 一覧 2 つが新しい順・同じ時刻は id の降順・51 行入れて 50 件・別テナントの行が出ない・
+NULL の列・pending は `pending_retry` と `failed` だけ / ダウンロード用の行 (在る・無い・別テナントの id・key が NULL) / 切れた接続。取り込みの DB の層 (8 本):
 
 - 乗務員の解決: `code` の行を使って `driver_cd` を埋める / `driver_cd` の行へ落ちる / 新規 / 別の生存行が同じ driver_cd を持つときは埋めない /
   論理削除済みは対象外 / INSERT が一意の制約に当たったら引き直す

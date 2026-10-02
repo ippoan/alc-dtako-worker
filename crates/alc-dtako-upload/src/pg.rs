@@ -31,7 +31,7 @@ use alc_csv_parser::operation_changes::{
 };
 use alc_csv_parser::work_segments::{default_classification, EventClass};
 use alc_worker_db::{PgClient, TenantTx, TxOutput};
-use chrono::{NaiveDate, NaiveDateTime};
+use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
 use tokio_postgres::error::SqlState;
 use tokio_postgres::types::Type;
 use uuid::Uuid;
@@ -99,6 +99,99 @@ pub async fn uploads_needing_split(
 }
 
 // ---- アップロードの取り込み ----
+
+/// 履歴の一覧の 1 行 ([`sql::LIST_UPLOADS`])。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UploadRow {
+    pub id: Uuid,
+    pub filename: String,
+    pub status: String,
+    pub error_message: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub r2_zip_key: Option<String>,
+}
+
+impl TxOutput for UploadRow {}
+
+/// やり直し待ち・失敗の履歴の一覧の 1 行 ([`sql::LIST_PENDING_UPLOADS`])。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingUploadRow {
+    pub id: Uuid,
+    pub tenant_id: Uuid,
+    pub filename: String,
+    pub status: String,
+    pub error_message: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+impl TxOutput for PendingUploadRow {}
+
+/// [`sql::LIST_UPLOADS`]。
+pub async fn list_uploads(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+) -> Result<Vec<UploadRow>, tokio_postgres::Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            let rows = tx
+                .query_typed(sql::LIST_UPLOADS, &[(&tenant_id, Type::UUID)])
+                .await?;
+            let row = |r: tokio_postgres::Row| UploadRow {
+                id: r.get(0),
+                filename: r.get(1),
+                status: r.get(2),
+                error_message: r.get(3),
+                created_at: r.get(4),
+                r2_zip_key: r.get(5),
+            };
+            Ok(rows.into_iter().map(row).collect())
+        })
+    })
+    .await
+}
+
+/// [`sql::LIST_PENDING_UPLOADS`]。
+pub async fn list_pending_uploads(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+) -> Result<Vec<PendingUploadRow>, tokio_postgres::Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            let rows = tx
+                .query_typed(sql::LIST_PENDING_UPLOADS, &[(&tenant_id, Type::UUID)])
+                .await?;
+            let row = |r: tokio_postgres::Row| PendingUploadRow {
+                id: r.get(0),
+                tenant_id: r.get(1),
+                filename: r.get(2),
+                status: r.get(3),
+                error_message: r.get(4),
+                created_at: r.get(5),
+            };
+            Ok(rows.into_iter().map(row).collect())
+        })
+    })
+    .await
+}
+
+/// [`sql::SELECT_UPLOAD_DOWNLOAD`] → `(r2_zip_key, filename)`。行が無ければ `None` (key が NULL の行は `Some((None, _))`)。
+pub async fn upload_download(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+    upload_id: Uuid,
+) -> Result<Option<(Option<String>, String)>, tokio_postgres::Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            let params: [(&(dyn tokio_postgres::types::ToSql + Sync), Type); 2] =
+                [(&upload_id, Type::UUID), (&tenant_id, Type::UUID)];
+            let row = tx
+                .query_typed_opt(sql::SELECT_UPLOAD_DOWNLOAD, &params)
+                .await?;
+            Ok(row.map(|r| (r.get(0), r.get(1))))
+        })
+    })
+    .await
+}
 
 /// 履歴の `tenant_id` の外部キー制約の名前 (テナントが存在しないときに当たる)。
 const UPLOAD_HISTORY_TENANT_FK: &str = "dtako_upload_history_tenant_id_fkey";

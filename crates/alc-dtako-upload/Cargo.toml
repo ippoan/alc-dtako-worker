@@ -10,6 +10,8 @@ edition = "2021"
 alc-core-wasm = { workspace = true }
 # テナントの transaction の部品 (`PgClient`・`TenantTx`・`TxOutput`)。`pg` が使う
 alc-worker-db = { workspace = true }
+# 日別の集計の計算 (backend と共有)
+alc-compare = { workspace = true }
 # 分割の純粋な部分 (backend と共有)
 alc-csv-parser = { workspace = true }
 axum = { version = "0.8", default-features = false, features = ["json"] }

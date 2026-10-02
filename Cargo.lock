@@ -27,9 +27,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "alc-compare"
+version = "0.1.0"
+source = "git+https://github.com/ippoan/rust-alc-api?rev=0075c3f605f763403ff5deb2a7264c3b6bd867a7#0075c3f605f763403ff5deb2a7264c3b6bd867a7"
+dependencies = [
+ "alc-csv-parser",
+ "chrono",
+ "encoding_rs",
+ "serde",
+]
+
+[[package]]
 name = "alc-core-wasm"
 version = "0.1.0"
-source = "git+https://github.com/ippoan/rust-alc-api?rev=19b29c45feb6742441f2331ebc820df45d12939c#19b29c45feb6742441f2331ebc820df45d12939c"
+source = "git+https://github.com/ippoan/rust-alc-api?rev=0075c3f605f763403ff5deb2a7264c3b6bd867a7#0075c3f605f763403ff5deb2a7264c3b6bd867a7"
 dependencies = [
  "axum",
  "serde",
@@ -42,7 +53,7 @@ dependencies = [
 [[package]]
 name = "alc-csv-parser"
 version = "0.1.0"
-source = "git+https://github.com/ippoan/rust-alc-api?rev=19b29c45feb6742441f2331ebc820df45d12939c#19b29c45feb6742441f2331ebc820df45d12939c"
+source = "git+https://github.com/ippoan/rust-alc-api?rev=0075c3f605f763403ff5deb2a7264c3b6bd867a7#0075c3f605f763403ff5deb2a7264c3b6bd867a7"
 dependencies = [
  "anyhow",
  "chrono",
@@ -54,6 +65,7 @@ dependencies = [
 name = "alc-dtako-upload"
 version = "0.1.0"
 dependencies = [
+ "alc-compare",
  "alc-core-wasm",
  "alc-csv-parser",
  "alc-worker-db",

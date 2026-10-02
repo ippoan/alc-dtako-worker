@@ -30,6 +30,9 @@ tenant ヘッダー無しが 401・有りが 404 (どのリクエストも、そ
 - **`alc-csv-parser`** (分割の純粋な部分 `split_csv_entry`・`cap_sorted`。backend と同じ関数を呼ぶ) も ippoan/rust-alc-api の crate。
   `alc-core-wasm` と**同じ rev** で、同じく `[workspace.dependencies]` の 1 か所に書く (`default-features = false` = zip の展開を引かない。
   zip の既定 features は C の依存を連れてきて wasm32 に載らないので、展開は route の crate が `zip` を deflate だけで直接引く)。
+- **`alc-compare`** (日別の労働時間とセグメントの計算 `upload_daily::compute_daily_hours`。backend と同じ関数を呼ぶ) も ippoan/rust-alc-api の crate。
+  上の 2 つと**同じ rev** (3 行とも同じ値) で、同じく `[workspace.dependencies]` の 1 か所に書く。`alc-csv-parser` を中から引くので、
+  `cargo tree -i alc-csv-parser --target wasm32-unknown-unknown` で出どころが 1 つだけ (直接と `alc-compare` 経由が同じもの) を確かめる。
 - **`alc-worker-db`** (テナントの transaction の部品 `PgClient`・`TenantTx`・`TxOutput`) は ippoan/alc-worker-kit (public) に在る。
   同じく直下の `[workspace.dependencies]` に **git 依存・rev 固定で 1 か所だけ**書く (feature `chrono`。
   出どころが 2 つになると `PgClient` が別の型になる)。
@@ -91,7 +94,7 @@ SQL は `src/repo.rs` の `sql` の 1 か所、流すのは `src/pg.rs` の 1 �
 
 ### アップロードの取り込みの段 (口はまだ無い。後続の PR で足す)
 
-zip の取り込みのうち DB に書く部分の前半。**SQL は backend (ippoan/rust-alc-api) の文と同じ** (同じ入力が同じ行になることを、文が同じであることで担保する。
+zip の取り込みのうち DB に書く部分。**SQL は backend (ippoan/rust-alc-api) の文と同じ** (同じ入力が同じ行になることを、文が同じであることで担保する。
 まとめ直さない)。`pg.rs` は 2 つの層に分かれる: `&mut PgClient` を取って transaction を 1 回開く**段の関数**と、その中から呼ぶ
 `&TenantTx` を取る**文の関数** (transaction を開かない。`TenantTx` はテナントを設定した transaction の中でしか手に入らない)。
 
@@ -100,7 +103,7 @@ zip の取り込みのうち DB に書く部分の前半。**SQL は backend (ip
 | `create_upload(pg, tenant_id, filename)` | 履歴を作り id を返す (id は DB の既定値)。**テナントが存在しない**ときは `CreateUploadError::TenantNotFound` (ほかの DB の失敗と区別する) |
 | `set_upload_zip_key(pg, tenant_id, upload_id, key)` | 履歴に zip の key を記録する。**単独の transaction** (後の段が落ちても key は残る)。返すのは更新した行数 |
 | `prepare_upload(pg, tenant_id, rows, kudgivt_rows)` | 1 transaction の中で、**KUDGURI の行の順に** 営業所・車輌・乗務員を解決し、運行が既に在るかを見て、続けて分類を読み、未登録のイベントCD を既定の分類で足す。「既に在る」= DB に在る、または同じ zip の中で先の行に同じ (運行NO, crew_role) が出た |
-| `replace_operations(pg, tenant_id, upload_id, rows, inputs)` | 1 transaction の中で、行の順に運行を入れ替え、前の行と違えば変更記録を残す。返すのは流した**行数** (運行NO の種類の数ではない)。中身は `replace_operations_in(tx, …)` (同じ transaction の後ろに続きを足せる形) |
+| `apply_upload(pg, tenant_id, upload_id, rows, inputs, daily)` | 取り込みの本体。**1 transaction の中で** 運行の入れ替え (`replace_operations_in`。行の順に入れ替え、前の行と違えば変更記録) → 日別の保存 (`save_daily_hours`) → 履歴に完了の印 (`operations_count` = 流した**行数**。運行NO の種類の数ではない)。途中で落ちたら、運行も日別も履歴も元のまま。`rows` と `inputs` の数が違えば DB を触る前に `ApplyUploadError::LengthMismatch` |
 | `mark_upload_failed(pg, tenant_id, upload_id, label)` | 履歴に失敗の印を付ける。`label` は呼び手が渡す固定の語 (生のエラー文を入れない) |
 
 - **乗務員の解決 (`upsert_driver`)**: 乗務員CD は `code` 列に入っていることも `driver_cd` 列に入っていることも在るので、順に当てる —
@@ -111,6 +114,22 @@ zip の取り込みのうち DB に書く部分の前半。**SQL は backend (ip
   変更記録は追記だけ (UPDATE・DELETE を書かない)。
 - 日時 (出発・帰着・出庫・入庫) は、KUDGURI の壁時計を**そのまま UTC の時刻として**入れる。営業所・車輌・乗務員の cd が空なら DB を引かず NULL。
 - 分類は `(event_cd, 分類の文字列)` で返す。`PreparedUpload::classification_map()` が `EventClass` の map にする。
+- **日別の保存 (`save_daily_hours`)**: `daily` は `alc_compare::upload_daily::compute_daily_hours` (backend と同じ関数) の出力そのまま。
+  ここでは計算しない (保存する値のうち 2 つは `DailyHours::saved_total_drive_minutes()`・`saved_late_night_minutes()` を呼ぶ。ほかは field の写し)。順:
+  1. 日エントリの乗務員CD のうち空でないものの id を引く (`get_employee_id_by_driver_cd` = `code` の行 → 無ければ `driver_cd` の行。**読むだけ**で、
+     埋めない・作らない。運行の `upsert_driver` とは別の id を返しうる)。id が引けない CD と空の CD の日エントリは、消す対象にも保存の対象にもしない
+  2. 引けた乗務員ごとに、全日エントリの運行NO で、セグメントと日別 (`unko_nos` が重なる行) を消す (上げ直しで帰属日が変わっても古い行が残らない)
+  3. 日エントリを保存: (乗務員, 日, 開始時刻) の日別を消す → 日別を入れる → (乗務員, 日) のセグメントを消す → セグメントを入れる
+- 日別の日は `DATE`、開始時刻は `TIME`、セグメントの開始・終了は壁時計を**そのまま UTC の時刻として**入れる。
+
+#### 旧 (backend) との違い
+
+- **保存の順と、セグメントの消し方が決定的**: 日エントリを (乗務員CD, 日, 開始時刻) の順に保存し、「(乗務員, 日) のセグメントを消す」は
+  **(乗務員, 日) ごとに最初の 1 回だけ**流す。旧は順が決まっておらず、日エントリごとに毎回消すので、同じ乗務員・同じ日に日エントリが 2 つ以上在ると、
+  先に入れたセグメントが後の日エントリの保存で消え、結果が実行ごとに変わりうる。worker は両方のセグメントが残る。
+- 「運行NO でセグメントを消す」は、乗務員ごとに `unko_no = ANY($3)` の 1 文 (旧は 乗務員 × 運行NO の数だけ流す。消える行は同じ)。
+- 完了の印の UPDATE に `AND tenant_id` を足している (RLS に加えて文でも絞る。ほかの文と同じ形)。
+- 運行の入れ替え・日別の保存・完了の印が 1 つの transaction (旧は文ごとに別)。
 
 ## 分割の口 `POST /split-csv/{upload_id}`
 
@@ -251,19 +270,27 @@ cargo llvm-cov --locked -p alc-dtako-upload --text > cov.txt && bash scripts/che
 1 回失敗は 2 回目で成功し、成功済みは再送しない / 2 回失敗は 3 回目で成功 (待ちは 300・800) / 3 回とも失敗は `failed` (3 回目の後は待たない) /
 同時に走る PUT は 6 本まで / 空の入力は何も呼ばない / `get` の 3 通り / `StoreError` の文に key が出ない。
 
-CI は target ごとに本数を固定で見る (`sql_db` は `12 passed`、`store` は `9 passed`、`split_flow` は `20 passed`、どれも `0 failed; 0 ignored`)。減らすと落ちる。
+CI は target ごとに本数を固定で見る (`sql_db` は `15 passed`、`store` は `9 passed`、`split_flow` は `20 passed`、どれも `0 failed; 0 ignored`)。減らすと落ちる。
 足したら `ci.yml` の数も上げる (テスト 1 本ごとに DB を起動して全 migration を流すので、本数を増やさず 1 本に筋書きを束ねる)。
-`sql_db` が確かめること (12 本)。取り込みの DB の層 (5 本):
+`sql_db` が確かめること (15 本)。取り込みの DB の層 (8 本):
 
 - 乗務員の解決: `code` の行を使って `driver_cd` を埋める / `driver_cd` の行へ落ちる / 新規 / 別の生存行が同じ driver_cd を持つときは埋めない /
   論理削除済みは対象外 / INSERT が一意の制約に当たったら引き直す
 - 上げ直しと変更記録: 初回は記録なし / 同じ値は記録なし / 値が変わったら 1 件 (before・after の JSON をリテラルで比べる) / 2 人乗務は crew_role ごと /
-  前回の分数が取れないときの印 / 同じ zip の中の重複行 (後の行が残り、流した数は行の数)
+  前回の分数が取れないときの印 / 同じ zip の中の重複行 (後の行が残り、流した数は行の数。記録の before・after もリテラルで比べる)
 - 運行の 23 列: 全 field に別々の値を入れ、列ごとに読み戻して比べる (引数の順の取り違えを捕まえる)。日時は壁時計がそのまま UTC として入る。
   省ける field が空の行は NULL。同じ cd の営業所・車輌は名前だけ更新する
 - テナントの分離・履歴・分類: 同じ cd・同じ運行NO でもテナントごとに別の行 / 別テナントの履歴の id には 0 行 / 存在しないテナントは区別された失敗 /
   未登録のイベントCD を既定の分類で足す (2 回目は増えない)
-- 切れた接続では各段が DB の失敗を返す
+- 切れた接続では各段が DB の失敗を返す。行と入力の数が違うときは、切れた接続でも DB の失敗ではなく数の不一致が返る (DB に触れていない)
+- 日別の保存: 計算の出力 (2 日にまたがる 1 運行) と、全 field に別々の値を入れた日エントリを保存し、日別の 17 列・セグメントの 11 列と乗務員を
+  リテラルで読み戻す (引数の順の取り違え・保存する 2 つの値が method の値であること) / 前から在る行のうち、同じ (乗務員, 日, 開始時刻)・
+  その日のセグメント・同じ運行NO を持つ別の日の行は消え、当たらない行は残る / 上げ直しで帰属日が変わると古い日別とセグメントが消える /
+  その zip に出てこない乗務員の行はそのまま / 履歴が completed と行数になる
+- 決定的な消し方と skip: 同じ乗務員・同じ日の日エントリ 2 つ (1 運行の中の休息で分かれる) の両方のセグメントが残る (2 回流しても同じ) /
+  乗務員CD が空・id が引けない日エントリは保存されず、乗務員も作られない / 運行は `upsert_driver` の id、日別は `get_employee_id_by_driver_cd` の id に付く
+- 日別の分離と失敗: 別テナントの日別・セグメント・履歴は変わらない / 別テナントの履歴の id を渡しても completed にならない /
+  セグメントの INSERT が落ちると、運行の入れ替え・変更記録・日別・履歴が元のまま / 行と入力の数が違うと何も変わらない
 
 分割の口が使う 3 関数 (7 本):
 
@@ -271,7 +298,7 @@ CI は target ごとに本数を固定で見る (`sql_db` は `12 passed`、`sto
 - 分割済みの印: 渡した運行NO の行だけに付き `RETURNING` が返る / 同じ運行NO が 2 行なら 2 つ返る / 別テナントの同じ運行NO は変わらない /
   空の入力は何もしない / 101 件以上を 1 回で渡せる
 - 分割待ちの一覧: 未分割が在れば completed かつ key ありの履歴が新しい順 / 未分割が無ければ空 / completed でない・key が NULL・別テナントは出ない
-- テナントを設定しない素の接続では、この crate が触る 7 つの表の行が読めない (エラーか 0 行)
+- テナントを設定しない素の接続では、この crate が触る 9 つの表の行が読めない (エラーか 0 行)
 - DB のエラーがそのまま `Err` で返り、失敗した transaction が残らない / 権限の無いロールは 42501 / 切れた接続は `Err`
 
 `crates/alc-dtako-upload/src/` の `pg.rs`・`store.rs`・`split.rs`・`routes.rs` は行カバレッジ 100% を保つ (登録簿は直下の `coverage_100.toml`。`repo.rs` は定数だけで実行行が無いので登録しない)。

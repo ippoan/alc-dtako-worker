@@ -29,7 +29,7 @@ dependencies = [
 [[package]]
 name = "alc-core-wasm"
 version = "0.1.0"
-source = "git+https://github.com/ippoan/rust-alc-api?rev=e8cdf85b45ba75fa63ba222ca59c9348795fdb68#e8cdf85b45ba75fa63ba222ca59c9348795fdb68"
+source = "git+https://github.com/ippoan/rust-alc-api?rev=4aa019cb9da149c01d7b04fae2f646410b439c4f#4aa019cb9da149c01d7b04fae2f646410b439c4f"
 dependencies = [
  "axum",
  "serde",
@@ -42,7 +42,7 @@ dependencies = [
 [[package]]
 name = "alc-csv-parser"
 version = "0.1.0"
-source = "git+https://github.com/ippoan/rust-alc-api?rev=e8cdf85b45ba75fa63ba222ca59c9348795fdb68#e8cdf85b45ba75fa63ba222ca59c9348795fdb68"
+source = "git+https://github.com/ippoan/rust-alc-api?rev=4aa019cb9da149c01d7b04fae2f646410b439c4f#4aa019cb9da149c01d7b04fae2f646410b439c4f"
 dependencies = [
  "anyhow",
  "chrono",

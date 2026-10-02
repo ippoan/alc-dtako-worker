@@ -13,6 +13,7 @@ use std::fmt;
 use std::io::{Cursor, Read};
 use std::sync::Arc;
 
+use alc_csv_parser::find_unmatched_kudgivt_unko_nos;
 use alc_worker_db::PgClient;
 use futures_util::lock::Mutex;
 use uuid::Uuid;
@@ -160,12 +161,8 @@ pub async fn split_upload(
         };
         let matched: HashSet<String> = marked.map_err(db_error)?.into_iter().collect();
         // 運行NO は乗務員ごとに複数行あることが在るので、行数ではなく集合で比べる。当たらなかったものは、
-        // 突合キーのずれ (保存先の側は整えない生の文字列) を疑う材料として件数を出す。
-        // backend の `find_unmatched_kudgivt_unko_nos` と同じ数え方 — rust-alc-api 側で共有の関数になったら置き換える
-        let unmatched = succeeded_unko_nos
-            .iter()
-            .filter(|u| !matched.contains(u.as_str()))
-            .count();
+        // 突合キーのずれ (保存先の側は整えない生の文字列) を疑う材料として件数を出す。数え方は backend と共有の関数
+        let unmatched = find_unmatched_kudgivt_unko_nos(&succeeded_unko_nos, &matched).len();
         if unmatched > 0 {
             let message = format!("split: has_kudgivt not applied: {unmatched} unko_no(s)");
             log(LogLevel::Warn, &message);

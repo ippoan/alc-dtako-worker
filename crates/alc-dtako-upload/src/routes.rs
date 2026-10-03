@@ -6,6 +6,8 @@
 //! - `POST /upload` → デジタコの zip (multipart の `file` field) を取り込む ([`crate::ingest::ingest_upload`])
 //! - `POST /internal/rerun/{upload_id}` → 既に保存先に在る zip を、もう一度取り込む ([`crate::ingest::rerun_upload`])
 //! - `POST /recalculate?year=&month=` → 月の全員の日別を計算し直す ([`crate::recalc`])。応答は `text/event-stream`
+//! - `POST /recalculate-driver?year=&month=&driver_id=` → 乗務員 1 人の月の日別を計算し直す。応答は `text/event-stream`
+//! - `POST /recalculate-drivers` (JSON `{year, month, driver_ids}`) → 乗務員の一括。応答は `text/event-stream`
 //! - `POST /split-csv/{upload_id}` → アップロード 1 件を分割する ([`crate::split::split_upload`])
 //! - `POST /split-csv-all` → 未分割の運行が在るテナントの、分割の元にできるアップロードを新しい順に
 //!   最大 [`SPLIT_CSV_ALL_LIMIT`] 件、1 件ずつ分割し直す。応答は `text/event-stream` (1 件ごとに `progress`、終わりに `done`)
@@ -20,6 +22,7 @@ use alc_core_wasm::TenantId;
 use alc_worker_db::PgClient;
 use axum::body::{Body, Bytes};
 use axum::extract::multipart::MultipartRejection;
+use axum::extract::rejection::{JsonRejection, QueryRejection};
 use axum::extract::{DefaultBodyLimit, Multipart, Path, Query, State};
 use axum::http::header::{HeaderName, CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_TYPE};
 use axum::http::{HeaderValue, StatusCode};
@@ -91,6 +94,8 @@ pub fn tenant_router_with(limits: IngestLimits) -> Router<DtakoState> {
         .route("/split-csv/{upload_id}", post(split_csv))
         .route("/split-csv-all", post(split_csv_all))
         .route("/recalculate", post(recalculate))
+        .route("/recalculate-driver", post(recalculate_driver))
+        .route("/recalculate-drivers", post(recalculate_drivers))
 }
 
 type ApiError = (StatusCode, Json<Value>);
@@ -495,19 +500,66 @@ async fn recalculate(
     Extension(TenantId(tenant_id)): Extension<TenantId>,
     Query(query): Query<RecalcQuery>,
 ) -> Response {
-    let run = RecalcRun::new(
-        state.pg.clone(),
-        state.store.clone(),
-        state.log.clone(),
-        tenant_id,
-        query.year,
-        query.month,
-    );
+    recalc_response(recalc_run(&state, tenant_id, query.year, query.month))
+}
+
+fn recalc_run(state: &DtakoState, tenant_id: Uuid, year: i32, month: u32) -> RecalcRun {
+    let (pg, store, log) = (state.pg.clone(), state.store.clone(), state.log.clone());
+    RecalcRun::new(pg, store, log, tenant_id, year, month)
+}
+
+/// 再計算の event を応答の stream の中で 1 歩ずつ進める。
+fn recalc_response(run: RecalcRun) -> Response {
     let events = stream::unfold(run, |run| async {
         let (event, run) = next_recalc_event(run).await?;
         Some((sse_frame(event), run))
     });
     event_stream_response(events)
+}
+
+/// `POST /recalculate-driver` の query。
+#[derive(serde::Deserialize)]
+struct RecalcDriverQuery {
+    year: i32,
+    month: u32,
+    driver_id: Uuid,
+}
+
+/// 乗務員 1 人の再計算。query が読めなければ、その status で `{"error":"invalid_query"}` (入力の値を返さない)。
+async fn recalculate_driver(
+    State(state): State<DtakoState>,
+    Extension(TenantId(tenant_id)): Extension<TenantId>,
+    query: Result<Query<RecalcDriverQuery>, QueryRejection>,
+) -> Response {
+    let query = match query {
+        Ok(Query(query)) => query,
+        Err(e) => return (e.status(), Json(json!({ "error": "invalid_query" }))).into_response(),
+    };
+    let run = recalc_run(&state, tenant_id, query.year, query.month);
+    recalc_response(run.driver(query.driver_id))
+}
+
+/// `POST /recalculate-drivers` の body。
+#[derive(serde::Deserialize)]
+struct RecalcDriversBody {
+    year: i32,
+    month: u32,
+    driver_ids: Vec<Uuid>,
+}
+
+/// 乗務員の一括の再計算。body が読めなければ、axum の JSON の拒否と同じ status で `{"error":"invalid_body"}`
+/// (入力の値を返さない)。
+async fn recalculate_drivers(
+    State(state): State<DtakoState>,
+    Extension(TenantId(tenant_id)): Extension<TenantId>,
+    body: Result<Json<RecalcDriversBody>, JsonRejection>,
+) -> Response {
+    let body = match body {
+        Ok(Json(body)) => body,
+        Err(e) => return (e.status(), Json(json!({ "error": "invalid_body" }))).into_response(),
+    };
+    let run = recalc_run(&state, tenant_id, body.year, body.month);
+    recalc_response(run.drivers(body.driver_ids))
 }
 
 /// `text/event-stream` の応答 (`Cache-Control: no-cache`・`X-Accel-Buffering: no`)。

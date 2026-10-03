@@ -63,6 +63,30 @@ pub mod sql {
                       OR o.reading_date >= $2 AND o.reading_date <= $3)
                ORDER BY o.reading_date, o.unko_no"#;
 
+    /// 乗務員ごとの再計算が読み直す zip の key。$1 tenant_id / $2 月初 → r2_zip_key (NULL 可。重複なし・key の順)。
+    /// 範囲は月初の 60 日前から (上の端なし)。
+    pub const LIST_ZIP_KEYS_FOR_RECALC: &str = r#"SELECT DISTINCT r2_zip_key FROM alc_api.dtako_upload_history
+               WHERE tenant_id = $1 AND status = 'completed'
+                 AND created_at >= ($2::date - interval '60 days')
+               ORDER BY r2_zip_key"#;
+
+    /// 乗務員の id → 乗務員CD。$1 id / $2 tenant_id → driver_cd (NULL 可)。
+    pub const SELECT_DRIVER_CD: &str =
+        "SELECT driver_cd FROM alc_api.employees WHERE id = $1 AND tenant_id = $2";
+
+    /// 乗務員 1 人の、月の再計算の対象の運行。$1 tenant_id / $2 driver_id / $3 月初 / $4 月末の翌日 →
+    /// unko_no, reading_date, operation_date, departure_at, return_at, total_distance,
+    /// drive_time_general, drive_time_highway, drive_time_bypass (読取日・運行NO の順)。
+    pub const LIST_DRIVER_OPERATIONS_FOR_RECALC: &str = r#"SELECT DISTINCT o.unko_no, o.reading_date, o.operation_date,
+                      o.departure_at, o.return_at,
+                      o.total_distance,
+                      o.drive_time_general, o.drive_time_highway, o.drive_time_bypass
+               FROM alc_api.dtako_operations o
+               WHERE o.tenant_id = $1 AND o.driver_id = $2
+                 AND (o.operation_date >= $3 AND o.operation_date <= $4
+                      OR o.reading_date >= $3 AND o.reading_date <= $4)
+               ORDER BY o.reading_date, o.unko_no"#;
+
     // ---- アップロードの取り込み (履歴・営業所と車輌と乗務員の解決・運行の入れ替え・変更記録・分類) ----
 
     /// アップロードの履歴を作る (status は `processing`)。$1 tenant_id / $2 filename → id (DB の既定値)。

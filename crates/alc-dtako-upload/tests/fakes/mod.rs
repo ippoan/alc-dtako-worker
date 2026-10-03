@@ -18,6 +18,8 @@ pub struct FakeStore {
     fail_left: Mutex<HashMap<String, u32>>,
     /// key → PUT が呼ばれた回数
     put_calls: Mutex<HashMap<String, u32>>,
+    /// key → GET が呼ばれた回数
+    get_calls: Mutex<HashMap<String, u32>>,
     /// key → (bytes, content_type)
     objects: Mutex<BTreeMap<String, (Vec<u8>, String)>>,
     running: AtomicUsize,
@@ -92,6 +94,18 @@ impl FakeStore {
             .unwrap_or(0)
     }
 
+    /// key に `needle` を含む GET が呼ばれた回数 (key ごと。key の順)。
+    pub fn get_calls_containing(&self, needle: &str) -> Vec<(String, u32)> {
+        let calls = self.get_calls.lock().unwrap();
+        let mut hits: Vec<(String, u32)> = calls
+            .iter()
+            .filter(|(key, _)| key.contains(needle))
+            .map(|(key, n)| (key.clone(), *n))
+            .collect();
+        hits.sort();
+        hits
+    }
+
     pub fn total_put_calls(&self) -> u32 {
         self.put_calls.lock().unwrap().values().sum()
     }
@@ -127,6 +141,12 @@ impl ObjectStore for FakeStore {
             // ここで他の GET に順番を譲る (同時に走っている状態を作る)
             tokio::task::yield_now().await;
             self.get_running.fetch_sub(1, Ordering::SeqCst);
+            *self
+                .get_calls
+                .lock()
+                .unwrap()
+                .entry(key.to_owned())
+                .or_insert(0) += 1;
             let broken = self.get_broken.load(Ordering::SeqCst);
             if broken || take_failure(&self.get_fail_patterns, key) {
                 return Err(StoreError::new("get"));

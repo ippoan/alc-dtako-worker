@@ -152,6 +152,72 @@ pub async fn operations_for_recalc(
     .await
 }
 
+/// [`sql::LIST_ZIP_KEYS_FOR_RECALC`]。key が NULL の行は除く。
+pub async fn zip_keys_for_recalc(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+    month_start: NaiveDate,
+) -> Result<Vec<String>, tokio_postgres::Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            let params: [(&(dyn tokio_postgres::types::ToSql + Sync), Type); 2] =
+                [(&tenant_id, Type::UUID), (&month_start, Type::DATE)];
+            let rows = tx
+                .query_typed(sql::LIST_ZIP_KEYS_FOR_RECALC, &params)
+                .await?;
+            let key = |r: tokio_postgres::Row| r.get::<_, Option<String>>(0);
+            Ok(rows.into_iter().filter_map(key).collect())
+        })
+    })
+    .await
+}
+
+/// 乗務員 1 人の乗務員CD ([`sql::SELECT_DRIVER_CD`]) と、月の再計算の対象の運行
+/// ([`sql::LIST_DRIVER_OPERATIONS_FOR_RECALC`]。`driver_cd` には引いた乗務員CD を入れる) を 1 transaction で。
+/// 乗務員が無い・乗務員CD が NULL なら `None` (運行を引かない)。`fetch_end` は月末の翌日。
+pub async fn driver_operations_for_recalc(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+    driver_id: Uuid,
+    month_start: NaiveDate,
+    fetch_end: NaiveDate,
+) -> Result<Option<(String, Vec<RecalcOperationRow>)>, tokio_postgres::Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            let params: [(&(dyn tokio_postgres::types::ToSql + Sync), Type); 2] =
+                [(&driver_id, Type::UUID), (&tenant_id, Type::UUID)];
+            let driver_cd = tx.query_typed_opt(sql::SELECT_DRIVER_CD, &params).await?;
+            let Some(driver_cd) = driver_cd.and_then(|r| r.get::<_, Option<String>>(0)) else {
+                return Ok(None);
+            };
+            let params: [(&(dyn tokio_postgres::types::ToSql + Sync), Type); 4] = [
+                (&tenant_id, Type::UUID),
+                (&driver_id, Type::UUID),
+                (&month_start, Type::DATE),
+                (&fetch_end, Type::DATE),
+            ];
+            let rows = tx
+                .query_typed(sql::LIST_DRIVER_OPERATIONS_FOR_RECALC, &params)
+                .await?;
+            let row = |r: tokio_postgres::Row| RecalcOperationRow {
+                unko_no: r.get(0),
+                reading_date: r.get(1),
+                operation_date: r.get(2),
+                departure_at: r.get(3),
+                return_at: r.get(4),
+                driver_cd: Some(driver_cd.clone()),
+                total_distance: r.get(5),
+                drive_time_general: r.get(6),
+                drive_time_highway: r.get(7),
+                drive_time_bypass: r.get(8),
+            };
+            let ops = rows.into_iter().map(row).collect();
+            Ok(Some((driver_cd, ops)))
+        })
+    })
+    .await
+}
+
 /// 日別の保存の段 (1 transaction): [`save_daily_hours_with`] を流す。再計算が乗務員ごとに呼ぶ。
 pub async fn save_daily_hours_in_tx(
     pg: &mut PgClient,

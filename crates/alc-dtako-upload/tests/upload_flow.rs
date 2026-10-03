@@ -1552,8 +1552,8 @@ const SEGMENTS_QUERY: &str = "SELECT e.driver_cd, s.work_date, s.unko_no, s.segm
      FROM dtako_daily_work_segments s JOIN employees e ON e.id = s.driver_id \
      WHERE s.tenant_id = $1 ORDER BY e.driver_cd, s.work_date, s.start_at";
 
-/// 再計算は、アップロードしたときと同じ日別とセグメントを作り直す (分割の出力は運行NO ごとに 1 回だけ読む = 2 人乗務の
-/// 運行でも休息の分数は 1 倍)。event の並び。フェリーの記録 (KUDGFRY) が在れば、それも計算に入る。
+/// 再計算は、アップロードしたときと同じ日別とセグメントを作り直す (分割の出力は運行NO ごとに 1 回だけ読む。2 人乗務の
+/// 運行も、休息の分数はアップロードしたときと同じ)。event の並び。フェリーの記録 (KUDGFRY) が在れば、それも計算に入る。
 #[tokio::test(flavor = "multi_thread")]
 async fn recalculate_rebuilds_the_same_daily_hours_as_the_upload() {
     let ctx = Ctx::start().await;
@@ -1577,7 +1577,7 @@ async fn recalculate_rebuilds_the_same_daily_hours_as_the_upload() {
     ];
     assert_eq!(rest(&days), want_rest);
 
-    // 日別とセグメントを消してから再計算する → 同じ行が戻る (休息の分数も同じ = 1 倍)
+    // 日別とセグメントを消してから再計算する → 同じ行が戻る (休息の分数も同じ)
     {
         let mut c = ctx.pg.inner.lock().await;
         exec(
@@ -1797,4 +1797,513 @@ async fn recalculate_reports_fixed_words_and_saves_per_driver() {
         )
     );
     db.shutdown();
+}
+
+// ---- 乗務員ごとの再計算 ----
+
+/// `POST {uri}` (body は `(content-type, 本文)`) → (status, event の列, 本文)。
+async fn post_events(
+    app: Router,
+    uri: &str,
+    body: Option<(&str, &str)>,
+) -> (StatusCode, Vec<Value>, String) {
+    let req = Request::builder().method("POST").uri(uri);
+    let req = match body {
+        Some((content_type, body)) => req
+            .header("content-type", content_type)
+            .body(Body::from(body.to_owned())),
+        None => req.body(Body::empty()),
+    };
+    let (status, _, body) = call(app, req.unwrap()).await;
+    let events = if status == StatusCode::OK {
+        sse_events(&body)
+    } else {
+        Vec::new()
+    };
+    (status, events, body)
+}
+
+/// `POST /recalculate-driver?year=2026&month={month}&driver_id={id}`。
+async fn recalc_driver(app: Router, month: u32, id: &str) -> (StatusCode, Vec<Value>, String) {
+    let uri = format!("/recalculate-driver?year=2026&month={month}&driver_id={id}");
+    post_events(app, &uri, None).await
+}
+
+/// `POST /recalculate-drivers` (JSON `{year: 2026, month, driver_ids}`)。
+async fn recalc_drivers(app: Router, month: u32, ids: &[&str]) -> (StatusCode, Vec<Value>, String) {
+    let body = json!({ "year": 2026, "month": month, "driver_ids": ids }).to_string();
+    let body = Some(("application/json", body.as_str()));
+    post_events(app, "/recalculate-drivers", body).await
+}
+
+/// 乗務員ごとの再計算の zip 2 本 (2026-03 の運行)。
+/// 1 本目 = [`recalc_zip`] の運行 (U-6001 = D-ONE・D-TWO の 2 人乗務、U-6002 = D-ONE) に、KUDGURI に無い運行NO の
+/// D-ONE の休息 (U-6099。03/05 = U-6002 の日に数える) を足したもの。
+/// 2 本目 = 別の乗務員 D-THREE の運行 (U-8001) と、1 本目と同じ KUDGIVT の行 (U-6001 の D-ONE の休息。重複)。
+fn driver_zips() -> (Vec<u8>, Vec<u8>) {
+    let first = upload_zip(
+        &[
+            kudguri_line("U-6001", 1, "D-ONE", 2, 6, 23),
+            kudguri_line("U-6001", 2, "D-TWO", 2, 6, 23),
+            kudguri_line("U-6002", 1, "D-ONE", 5, 9, 15),
+        ],
+        &driver_zip_kudgivt()[..7],
+    );
+    let second = upload_zip(
+        &[kudguri_line("U-8001", 1, "D-THREE", 10, 8, 17)],
+        &driver_zip_kudgivt()[7..],
+    );
+    (first, second)
+}
+
+/// [`driver_zips`] の KUDGIVT の行 (1 本目が先頭 7 行、2 本目が残り)。
+fn driver_zip_kudgivt() -> Vec<String> {
+    vec![
+        kudgivt_line("U-6001", 1, "D-ONE", 2, "06:15", "201", 240),
+        kudgivt_line("U-6001", 1, "D-ONE", 2, "10:15", "302", 300),
+        kudgivt_line("U-6001", 1, "D-ONE", 2, "15:15", "201", 420),
+        kudgivt_line("U-6001", 2, "D-TWO", 2, "06:15", "302", 360),
+        kudgivt_line("U-6001", 2, "D-TWO", 2, "12:15", "201", 600),
+        kudgivt_line("U-6002", 1, "D-ONE", 5, "09:15", "201", 360),
+        kudgivt_line("U-6099", 1, "D-ONE", 5, "20:15", "302", 30),
+        kudgivt_line("U-8001", 1, "D-THREE", 10, "08:15", "201", 300),
+        kudgivt_line("U-8001", 1, "D-THREE", 10, "13:15", "302", 120),
+        kudgivt_line("U-6001", 1, "D-ONE", 2, "10:15", "302", 300),
+    ]
+}
+
+impl Ctx {
+    /// 乗務員CD → 乗務員の id (文字列)。
+    async fn driver_id(&self, tenant_id: Uuid, driver_cd: &str) -> String {
+        let query = format!("SELECT id::text AS id FROM employees WHERE tenant_id = $1 AND driver_cd = '{driver_cd}'");
+        let rows = self.rows(tenant_id, &query).await;
+        rows[0]["id"].as_str().unwrap().to_owned()
+    }
+
+    /// 日別とセグメントを消す (`driver_cd` が `Some` なら、その乗務員の分だけ)。
+    async fn clear_days(&self, tenant_id: Uuid, driver_cd: Option<&str>) {
+        let only = driver_cd
+            .map(|cd| {
+                format!(" AND driver_id IN (SELECT id FROM employees WHERE driver_cd = '{cd}')")
+            })
+            .unwrap_or_default();
+        let mut c = self.pg.inner.lock().await;
+        for table in ["dtako_daily_work_segments", "dtako_daily_work_hours"] {
+            let sql = format!("DELETE FROM {table} WHERE tenant_id = $1{only}");
+            exec(&mut c, tenant_id, &sql).await;
+        }
+    }
+
+    /// テナントの zip の GET の回数 (key の順)。
+    fn zip_gets(&self, tenant_id: Uuid) -> Vec<u32> {
+        let calls = self
+            .store
+            .get_calls_containing(&format!("{tenant_id}/uploads/"));
+        calls.into_iter().map(|(_, n)| n).collect()
+    }
+}
+
+/// 日別の行を比べる形 (乗務員CD・日・開始時刻・分数・運行NO)。
+fn day_view(row: &Value) -> Value {
+    json!([
+        row["driver_cd"],
+        row["work_date"],
+        row["start_time"],
+        row["total_work_minutes"],
+        row["total_drive_minutes"],
+        row["total_rest_minutes"],
+        row["drive_minutes"],
+        row["cargo_minutes"],
+        row["unko_nos"],
+    ])
+}
+
+/// 乗務員 1 人の再計算は、アップロードの zip を 1 本ずつ読み直して KUDGIVT を集め、上げたときと同じ日別を作る。
+/// 計算に残す行 (その乗務員の運行の行と、その乗務員CD の行) で計算した結果は、全部の zip の全部の行 (重複を落としたもの)
+/// を渡して計算した結果と同じ。zip は 1 本につき 1 回だけ読む。ほかの乗務員の日別には触れない。
+#[tokio::test(flavor = "multi_thread")]
+async fn recalculate_driver_matches_the_upload_and_the_unfiltered_computation() {
+    let ctx = Ctx::start().await;
+    let t = ctx.tenant("Dtako Driver Recalc Tenant").await;
+    let (first, second) = driver_zips();
+    ctx.upload_ok(t, "first.zip", &first).await;
+    ctx.upload_ok(t, "second.zip", &second).await;
+    let days = ctx.rows(t, DAYS_QUERY).await;
+    let segments = ctx.rows(t, SEGMENTS_QUERY).await;
+    let views: Vec<Value> = days.iter().map(day_view).collect();
+    // D-ONE の 03/05 の休息 30 分は、KUDGURI に無い運行NO の行 (乗務員CD で当たる)
+    let rest: Vec<(&str, i64)> = days
+        .iter()
+        .map(|r| {
+            let cd = r["driver_cd"].as_str().unwrap();
+            (cd, r["total_rest_minutes"].as_i64().unwrap())
+        })
+        .collect();
+    let want_rest = [
+        ("D-ONE", 300),
+        ("D-ONE", 30),
+        ("D-THREE", 120),
+        ("D-TWO", 360),
+    ];
+    assert_eq!(rest, want_rest);
+
+    // D-ONE の日別を消してから再計算する → 同じ行が戻る。ほかの乗務員の行はそのまま
+    ctx.clear_days(t, Some("D-ONE")).await;
+    let gets_before = ctx.zip_gets(t);
+    let one = ctx.driver_id(t, "D-ONE").await;
+    let (status, events, body) = recalc_driver(ctx.app(t), 3, &one).await;
+    assert_eq!(status, StatusCode::OK);
+    // 運行の行は 2 (U-6001 の主・U-6002)、日エントリは 2
+    let want_events = [
+        json!({ "event": "progress", "current": 0, "total": 0, "step": "start" }),
+        json!({ "event": "progress", "current": 2, "total": 2, "step": "save" }),
+        json!({ "event": "done", "total": 2 }),
+    ];
+    assert_eq!(events, want_events);
+    assert_eq!(ctx.rows(t, DAYS_QUERY).await, days);
+    assert_eq!(ctx.rows(t, SEGMENTS_QUERY).await, segments);
+    // zip は 2 本とも 1 回ずつ読んだ (分割で 1 回ずつ読んだ後に、もう 1 回)
+    assert_eq!(gets_before, [1, 1]);
+    assert_eq!(ctx.zip_gets(t), [2, 2]);
+
+    // 絞らずに計算した結果: 全部の zip の全部の KUDGIVT の行 (重複を落とす) と D-ONE の運行で計算する
+    let text = sjis_csv(KUDGIVT_HEADER, &driver_zip_kudgivt());
+    let text = alc_csv_parser::decode_shift_jis(&text);
+    let all = alc_csv_parser::kudgivt::parse_kudgivt(&text).unwrap();
+    let all = alc_csv_parser::kudgivt::dedup_kudgivt_rows(all);
+    assert_eq!(all.len(), 9);
+    let ops = {
+        let mut c = ctx.pg.inner.lock().await;
+        let id = Uuid::parse_str(&one).unwrap();
+        let (start, end) = (
+            chrono::NaiveDate::from_ymd_opt(2026, 3, 1).unwrap(),
+            chrono::NaiveDate::from_ymd_opt(2026, 4, 1).unwrap(),
+        );
+        let ops = alc_dtako_upload::pg::driver_operations_for_recalc(&mut c, t, id, start, end);
+        ops.await.unwrap().unwrap().1
+    };
+    let rows: Vec<_> = ops
+        .into_iter()
+        .map(|op| alc_csv_parser::kudguri::RecalcOperation::from(op).into_kudguri_row())
+        .collect();
+    let classify = |e: &alc_csv_parser::kudgivt::KudgivtRow| {
+        let class = alc_csv_parser::work_segments::default_classification(&e.event_cd).1;
+        (e.event_cd.clone(), class)
+    };
+    let classifications = all.iter().map(classify).collect();
+    let ferry = std::collections::HashMap::new();
+    let unfiltered =
+        alc_compare::upload_daily::compute_daily_hours(&rows, &all, &classifications, &ferry);
+    let mut computed: Vec<Value> = unfiltered
+        .iter()
+        .map(|((cd, date, start), h)| {
+            json!([
+                cd,
+                date.to_string(),
+                start.format("%H:%M:%S").to_string(),
+                h.total_work_minutes,
+                h.saved_total_drive_minutes(),
+                h.rest_event_minutes,
+                h.drive_minutes,
+                h.cargo_minutes,
+                h.unko_nos,
+            ])
+        })
+        .collect();
+    computed.sort_by_key(|v| v.to_string());
+    let saved_one: Vec<Value> = views.iter().filter(|v| v[0] == "D-ONE").cloned().collect();
+    assert_eq!(computed, saved_one);
+    // 運行のない月は start → done (0 件)
+    let (_, events, _) = recalc_driver(ctx.app(t), 2, &one).await;
+    let empty = [
+        json!({ "event": "progress", "current": 0, "total": 0, "step": "start" }),
+        json!({ "event": "done", "total": 0 }),
+    ];
+    assert_eq!(events, empty);
+    // 分割の当たらない KUDGIVT (U-6099 と、2 本目の U-6001) の Warn だけで、再計算のログは無い
+    let recalc_logs: Vec<_> = ctx
+        .log_lines()
+        .into_iter()
+        .filter(|(_, m)| m.starts_with("recalculate"))
+        .collect();
+    assert_eq!(recalc_logs, []);
+    ctx.assert_no_identifiers(t, &[&body], &["U-6001", "U-6002", "D-ONE", &one]);
+    ctx.finish().await;
+}
+
+/// 一括は zip を 1 回だけ読み、乗務員ごとに計算して保存する (引き当てられない人・失敗した人は数えて続ける)。
+/// 失敗は固定の語: 月が不正・乗務員が居ない・query / body が読めない (4xx)・DB の失敗。読めない zip は飛ばして件数を Warn。
+/// 別テナントには触れない。本文とログに識別子が出ない。
+#[tokio::test(flavor = "multi_thread")]
+async fn recalculate_drivers_reads_zips_once_and_reports_fixed_words() {
+    let ctx = Ctx::start().await;
+    let t = ctx.tenant("Dtako Drivers Recalc Tenant").await;
+    let other = ctx.tenant("Dtako Drivers Recalc Other").await;
+    let (first, second) = driver_zips();
+    ctx.upload_ok(t, "first.zip", &first).await;
+    ctx.upload_ok(t, "second.zip", &second).await;
+    ctx.upload_ok(other, "other.zip", &first).await;
+    let days = ctx.rows(t, DAYS_QUERY).await;
+    let other_days = ctx.rows(other, DAYS_QUERY).await;
+    let error = |message: &str| json!({ "event": "error", "message": message });
+    let one = ctx.driver_id(t, "D-ONE").await;
+    let three = ctx.driver_id(t, "D-THREE").await;
+    let missing = Uuid::new_v4().to_string();
+    let other_one = ctx.driver_id(other, "D-ONE").await;
+
+    // 一括: 2 人 + 居ない 1 人 → 2 人の日別が戻る。zip は 1 本につき 1 回だけ読む
+    ctx.clear_days(t, None).await;
+    let gets_before = ctx.zip_gets(t);
+    let (status, events, batch_body) =
+        recalc_drivers(ctx.app(t), 3, &[&one, &three, &missing]).await;
+    assert_eq!(status, StatusCode::OK);
+    let want = [
+        json!({ "event": "batch_start", "total_drivers": 3 }),
+        json!({ "event": "progress", "current": 1, "total": 3 }),
+        json!({ "event": "progress", "current": 2, "total": 3 }),
+        json!({ "event": "progress", "current": 3, "total": 3 }),
+        json!({ "event": "batch_done", "total": 3, "done": 2, "errors": 1 }),
+    ];
+    assert_eq!(events, want);
+    let not_d_two: Vec<Value> = days
+        .iter()
+        .filter(|r| r["driver_cd"] != "D-TWO")
+        .cloned()
+        .collect();
+    assert_eq!(ctx.rows(t, DAYS_QUERY).await, not_d_two);
+    let after: Vec<u32> = gets_before.iter().map(|n| n + 1).collect();
+    assert_eq!(ctx.zip_gets(t), after);
+    let not_found = (
+        LogLevel::Warn,
+        "recalculate-drivers: driver not found".to_owned(),
+    );
+    let recalc_logs = |ctx: &Ctx| -> Vec<(LogLevel, String)> {
+        let lines = ctx.log_lines().into_iter();
+        lines
+            .filter(|(_, m)| m.starts_with("recalculate"))
+            .collect()
+    };
+    assert_eq!(recalc_logs(&ctx), std::slice::from_ref(&not_found));
+    // 空の一覧: batch_start → batch_done (0 人)
+    let (_, events, _) = recalc_drivers(ctx.app(t), 3, &[]).await;
+    let empty = [
+        json!({ "event": "batch_start", "total_drivers": 0 }),
+        json!({ "event": "batch_done", "total": 0, "done": 0, "errors": 0 }),
+    ];
+    assert_eq!(events, empty);
+    // 別テナントの乗務員は居ないのと同じ
+    let (_, events, _) = recalc_driver(ctx.app(t), 3, &other_one).await;
+    let start = json!({ "event": "progress", "current": 0, "total": 0, "step": "start" });
+    assert_eq!(events, [start.clone(), error("driver_not_found")]);
+
+    // 月が不正・乗務員が居ない (1 人の口)
+    let (_, events, invalid_body) = recalc_driver(ctx.app(t), 13, &one).await;
+    assert_eq!(events, [start.clone(), error("month_invalid")]);
+    let (_, events, missing_body) = recalc_driver(ctx.app(t), 3, &missing).await;
+    assert_eq!(events, [start.clone(), error("driver_not_found")]);
+    let (_, events, _) = recalc_drivers(ctx.app(t), 13, &[&one]).await;
+    let batch_start = json!({ "event": "batch_start", "total_drivers": 1 });
+    assert_eq!(events, [batch_start.clone(), error("month_invalid")]);
+    // query・body が読めない: 4xx と固定の語 (入力の値を返さない)
+    let bad_query = |q: &str| format!("/recalculate-driver?{q}");
+    for (q, want) in [
+        ("year=2026&month=3", StatusCode::BAD_REQUEST),
+        ("year=2026&month=3&driver_id=D-ONE", StatusCode::BAD_REQUEST),
+    ] {
+        let (status, _, body) = post_events(ctx.app(t), &bad_query(q), None).await;
+        assert_eq!(
+            (status, body.as_str()),
+            (want, r#"{"error":"invalid_query"}"#)
+        );
+    }
+    let json_type = "application/json";
+    for (body, content_type, want) in [
+        ("{", json_type, StatusCode::BAD_REQUEST),
+        (
+            r#"{"year":2026,"month":3,"driver_ids":["D-ONE"]}"#,
+            json_type,
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            r#"{"year":2026,"month":3,"driver_ids":[]}"#,
+            "text/plain",
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+        ),
+    ] {
+        let sent = Some((content_type, body));
+        let (status, _, body) = post_events(ctx.app(t), "/recalculate-drivers", sent).await;
+        assert_eq!(
+            (status, body.as_str()),
+            (want, r#"{"error":"invalid_body"}"#)
+        );
+    }
+
+    // 読めない zip は飛ばして件数を Warn に出す: 無い・読めない・zip でない・展開できない・KUDGIVT が parse できない
+    // (KUDGIVT の無い zip は読めたものとして数える)。日別は変わらない
+    let no_kudgivt = zip_of(&[("KUDGURI.csv", sjis_csv(KUDGURI_HEADER, &[]))]);
+    let bad_csv = zip_of(&[("KUDGIVT.csv", b"no,columns\r\n1,2\r\n".to_vec())]);
+    let mut bad_entry = recalc_zip();
+    declare_uncompressed_size(&mut bad_entry, 1);
+    let extra: [(&str, Option<Vec<u8>>); 6] = [
+        ("x-missing", None),
+        ("x-get-fails", Some(recalc_zip())),
+        ("x-not-zip", Some(b"not a zip".to_vec())),
+        ("x-bad-entry", Some(bad_entry)),
+        ("x-bad-csv", Some(bad_csv)),
+        ("x-no-kudgivt", Some(no_kudgivt)),
+    ];
+    for (name, bytes) in extra {
+        let key = format!("{t}/uploads/{name}/{name}.zip");
+        {
+            let mut c = ctx.pg.inner.lock().await;
+            upload(&mut c, t, "x.zip", "completed", Some(&key), 0.0).await;
+        }
+        if let Some(bytes) = bytes {
+            ctx.store.seed(&key, bytes, "application/zip");
+        }
+    }
+    ctx.store.fail_gets_containing("x-get-fails", 1);
+    let days_now = ctx.rows(t, DAYS_QUERY).await;
+    let (_, events, _) = recalc_driver(ctx.app(t), 3, &one).await;
+    let saved = json!({ "event": "progress", "current": 2, "total": 2, "step": "save" });
+    let done = json!({ "event": "done", "total": 2 });
+    assert_eq!(events, [start.clone(), saved.clone(), done.clone()]);
+    assert_eq!(ctx.rows(t, DAYS_QUERY).await, days_now);
+    let unreadable = (
+        LogLevel::Warn,
+        "recalculate-driver: zip unavailable for 5 upload(s)".to_owned(),
+    );
+    assert_eq!(recalc_logs(&ctx), [not_found.clone(), unreadable.clone()]);
+
+    // 検査用の制約を 2 つ足す: 未登録のイベントCD 999 の分類を足せない / U-8001 (D-THREE) のセグメントを入れられない
+    let ctx = ctx
+        .run_as_superuser(
+            "ALTER TABLE alc_api.dtako_event_classifications ADD CONSTRAINT test_reject_class CHECK (event_cd <> '999') NOT VALID; \
+             ALTER TABLE alc_api.dtako_daily_work_segments ADD CONSTRAINT test_reject_segment CHECK (unko_no <> 'U-8001') NOT VALID",
+        )
+        .await;
+    // 1 人の保存が失敗する → 1 人の口は internal_error、一括は数えて続ける
+    let (_, events, save_body) = recalc_driver(ctx.app(t), 3, &three).await;
+    assert_eq!(events, [start.clone(), error("internal_error")]);
+    let (_, events, _) = recalc_drivers(ctx.app(t), 3, &[&three, &one]).await;
+    let two = |done: i64, errors: i64| {
+        vec![
+            json!({ "event": "batch_start", "total_drivers": 2 }),
+            json!({ "event": "progress", "current": 1, "total": 2 }),
+            json!({ "event": "progress", "current": 2, "total": 2 }),
+            json!({ "event": "batch_done", "total": 2, "done": done, "errors": errors }),
+        ]
+    };
+    assert_eq!(events, two(1, 1));
+    assert_eq!(ctx.rows(t, DAYS_QUERY).await, days_now);
+    // 分類を足す段で失敗する (zip に未登録のイベントCD が在る)
+    let unknown_zip = upload_zip(
+        &[],
+        &[kudgivt_line("U-6001", 1, "D-ONE", 2, "22:15", "999", 10)],
+    );
+    let key = format!("{t}/uploads/x-no-kudgivt/x-no-kudgivt.zip");
+    let (kept_zip, _) = ctx.store.object(&key).unwrap();
+    ctx.store.seed(&key, unknown_zip, "application/zip");
+    let (_, events, class_body) = recalc_driver(ctx.app(t), 3, &one).await;
+    assert_eq!(events, [start.clone(), error("internal_error")]);
+    let (_, events, _) = recalc_drivers(ctx.app(t), 3, &[&one]).await;
+    let one_failed = vec![
+        batch_start.clone(),
+        json!({ "event": "progress", "current": 1, "total": 1 }),
+        json!({ "event": "batch_done", "total": 1, "done": 0, "errors": 1 }),
+    ];
+    assert_eq!(events, one_failed);
+    ctx.store.seed(&key, kept_zip, "application/zip");
+    let failed = |name: &str| (LogLevel::Error, format!("{name} failed: db (23514)"));
+    let driver_failed = |kind: &str| {
+        (
+            LogLevel::Warn,
+            format!("recalculate-drivers: driver failed: db ({kind})"),
+        )
+    };
+    // GET の失敗は 1 回だけなので、以後の読めない zip は 4 本
+    let four = |name: &str| {
+        (
+            LogLevel::Warn,
+            format!("{name}: zip unavailable for 4 upload(s)"),
+        )
+    };
+    let mut want_logs = vec![not_found.clone(), unreadable.clone()];
+    want_logs.extend([
+        four("recalculate-driver"),
+        failed("recalculate-driver"),
+        four("recalculate-drivers"),
+        driver_failed("23514"),
+        four("recalculate-driver"),
+        failed("recalculate-driver"),
+        four("recalculate-drivers"),
+        driver_failed("23514"),
+    ]);
+    assert_eq!(recalc_logs(&ctx), want_logs);
+
+    // 運行の表を読めない (42501): 1 人の口は internal_error、一括はその人を数えて続ける
+    let ctx = ctx
+        .run_as_superuser("REVOKE SELECT ON alc_api.dtako_operations FROM alc_api_app")
+        .await;
+    let (_, events, _) = recalc_driver(ctx.app(t), 3, &one).await;
+    assert_eq!(events, [start.clone(), error("internal_error")]);
+    let (_, events, _) = recalc_drivers(ctx.app(t), 3, &[&one, &three]).await;
+    assert_eq!(events, two(0, 2));
+    // 履歴の表を読めない (42501): 1 人の口は乗務員を引いた後に、一括は最初に internal_error
+    let ctx = ctx
+        .run_as_superuser(
+            "GRANT SELECT ON alc_api.dtako_operations TO alc_api_app; \
+             REVOKE SELECT ON alc_api.dtako_upload_history FROM alc_api_app",
+        )
+        .await;
+    let (_, events, _) = recalc_driver(ctx.app(t), 3, &one).await;
+    assert_eq!(events, [start.clone(), error("internal_error")]);
+    let (_, events, _) = recalc_drivers(ctx.app(t), 3, &[&one]).await;
+    assert_eq!(events, [batch_start, error("internal_error")]);
+    let tail: Vec<_> = recalc_logs(&ctx).split_off(want_logs.len());
+    let tail: Vec<_> = tail
+        .into_iter()
+        .filter(|(_, m)| !m.contains("zip unavailable"))
+        .collect();
+    let kinds: Vec<&str> = tail.iter().map(|(_, m)| m.as_str()).collect();
+    assert_eq!(
+        kinds,
+        [
+            "recalculate-driver failed: db (42501)",
+            "recalculate-drivers: driver failed: db (42501)",
+            "recalculate-drivers: driver failed: db (42501)",
+            "recalculate-driver failed: db (42501)",
+            "recalculate-drivers failed: db (42501)",
+        ]
+    );
+    // 別テナントの日別は、どれにも触れられていない
+    {
+        let ctx = ctx
+            .run_as_superuser("GRANT SELECT ON alc_api.dtako_upload_history TO alc_api_app")
+            .await;
+        assert_eq!(ctx.rows(other, DAYS_QUERY).await, other_days);
+
+        // tenant ヘッダーの layer を通すと、ヘッダー無しは 401
+        let guarded = tenant_router()
+            .layer(middleware::from_fn(alc_core_wasm::require_tenant_header))
+            .with_state(ctx.state());
+        let (status, _, _) = recalc_driver(guarded.clone(), 3, &one).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let (status, _, _) = recalc_drivers(guarded, 3, &[&one]).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        let bodies = [
+            &batch_body,
+            &invalid_body,
+            &missing_body,
+            &save_body,
+            &class_body,
+        ];
+        let bodies: Vec<&str> = bodies.iter().map(|b| b.as_str()).collect();
+        let needles = [
+            "U-6001", "U-6002", "U-8001", "D-ONE", "D-THREE", "x-", &one, &three, &missing,
+        ];
+        ctx.assert_no_identifiers(t, &bodies, &needles);
+        ctx.finish().await;
+    }
 }

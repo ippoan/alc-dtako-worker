@@ -1746,3 +1746,116 @@ async fn operations_for_recalc_pick_the_month_by_operation_or_reading_date() {
     drop(c);
     db.shutdown();
 }
+
+/// 乗務員ごとの再計算の文: zip の key (completed だけ・作成日が月初の 60 日前から・上の端なし・重複なし・key の順・NULL を除く・
+/// テナントごと) / 乗務員CD (テナントで絞る・NULL は無いのと同じ) / 乗務員 1 人の運行 (運行日か読取日が範囲に入る行・
+/// その乗務員だけ・同じ運行NO は 1 行・読取日と運行NO の順)。
+#[tokio::test(flavor = "multi_thread")]
+async fn driver_recalc_reads_zip_keys_driver_cd_and_the_drivers_operations() {
+    let db = Embedded::start().await;
+    let mut held = db.client(APP_ROLE).await;
+    let c = &mut held.inner;
+    let a = tenant(c, "Dtako Driver Recalc Tenant A").await;
+    let b = tenant(c, "Dtako Driver Recalc Tenant B").await;
+    let history =
+        "INSERT INTO dtako_upload_history (tenant_id, filename, status, r2_zip_key, created_at) \
+                   SELECT $1, 'x.zip', v.status, v.key, v.created_at::timestamptz FROM (VALUES \
+                   ('completed', 'a/z-edge.zip', '2026-01-01 00:00:00+00'), \
+                   ('completed', 'a/z-edge.zip', '2026-02-01 00:00:00+00'), \
+                   ('completed', 'a/z-before.zip', '2025-12-31 23:59:59+00'), \
+                   ('completed', 'a/z-late.zip', '2027-01-01 00:00:00+00'), \
+                   ('failed', 'a/z-failed.zip', '2026-02-01 00:00:00+00'), \
+                   ('completed', NULL, '2026-02-01 00:00:00+00'), \
+                   ('completed', 'a/a-first.zip', '2026-02-01 00:00:00+00') \
+                   ) v(status, key, created_at)";
+    assert_eq!(exec(c, a, history).await, 7);
+    let other = "INSERT INTO dtako_upload_history (tenant_id, filename, status, r2_zip_key) \
+                 VALUES ($1, 'x.zip', 'completed', 'b/z.zip')";
+    assert_eq!(exec(c, b, other).await, 1);
+    // 月初 2026-03-02 → 下の端は 2026-01-01 00:00
+    let d = |m, day| NaiveDate::from_ymd_opt(2026, m, day).unwrap();
+    let keys = pg::zip_keys_for_recalc(c, a, d(3, 2)).await.unwrap();
+    assert_eq!(keys, ["a/a-first.zip", "a/z-edge.zip", "a/z-late.zip"]);
+    assert_eq!(
+        pg::zip_keys_for_recalc(c, b, d(3, 2)).await.unwrap(),
+        ["b/z.zip"]
+    );
+
+    let one = employee(c, a, None, Some("D-ONE"), "TEST-ONE", false).await;
+    employee(c, a, None, Some("D-TWO"), "TEST-TWO", false).await;
+    let no_cd = employee(c, a, Some("E-NOCD"), None, "TEST-NOCD", false).await;
+    let other_one = employee(c, b, None, Some("D-ONE"), "TEST-OTHER", false).await;
+    let ops = "INSERT INTO dtako_operations (tenant_id, unko_no, crew_role, reading_date, operation_date, departure_at, return_at, \
+               driver_id, total_distance, drive_time_general, drive_time_highway, drive_time_bypass) \
+               SELECT $1, v.unko_no, v.crew_role, v.reading_date::date, v.operation_date::date, \
+               TIMESTAMPTZ '2026-03-02 08:15:00+00', TIMESTAMPTZ '2026-03-02 17:15:00+00', \
+               (SELECT id FROM employees WHERE tenant_id = $1 AND driver_cd = v.driver_cd), 12.5, 100, 20, 3 FROM (VALUES \
+               ('R-IN-OP', 1, '2026-04-05', '2026-03-15', 'D-ONE'), \
+               ('R-IN-READ', 1, '2026-03-01', '2026-02-27', 'D-ONE'), \
+               ('R-EDGE-END', 1, '2026-04-01', NULL, 'D-ONE'), \
+               ('R-OUT', 1, '2026-02-28', '2026-02-27', 'D-ONE'), \
+               ('R-OUT-LATE', 1, '2026-04-02', NULL, 'D-ONE'), \
+               ('R-TWO', 1, '2026-03-10', '2026-03-09', 'D-ONE'), \
+               ('R-TWO', 2, '2026-03-10', '2026-03-09', 'D-TWO'), \
+               ('R-DUP', 1, '2026-03-11', '2026-03-11', 'D-ONE'), \
+               ('R-DUP', 2, '2026-03-11', '2026-03-11', 'D-ONE') \
+               ) v(unko_no, crew_role, reading_date, operation_date, driver_cd)";
+    assert_eq!(exec(c, a, ops).await, 9);
+    let other_op = "INSERT INTO dtako_operations (tenant_id, unko_no, reading_date, driver_id) \
+                    SELECT $1, 'R-OTHER', DATE '2026-03-10', id FROM employees WHERE tenant_id = $1";
+    assert_eq!(exec(c, b, other_op).await, 1);
+
+    let (start, end) = (d(3, 1), d(4, 1));
+    let (driver_cd, rows) = pg::driver_operations_for_recalc(c, a, one, start, end)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(driver_cd, "D-ONE");
+    let got: Vec<(&str, NaiveDate, Option<&str>)> = rows
+        .iter()
+        .map(|r| (r.unko_no.as_str(), r.reading_date, r.driver_cd.as_deref()))
+        .collect();
+    let want = [
+        ("R-IN-READ", d(3, 1), Some("D-ONE")),
+        ("R-TWO", d(3, 10), Some("D-ONE")),
+        ("R-DUP", d(3, 11), Some("D-ONE")),
+        ("R-EDGE-END", d(4, 1), Some("D-ONE")),
+        ("R-IN-OP", d(4, 5), Some("D-ONE")),
+    ];
+    assert_eq!(got, want);
+    // 列の中身 (日時は UTC の値のまま)
+    let first = &rows[0];
+    let at = |h| Utc.with_ymd_and_hms(2026, 3, 2, h, 15, 0).unwrap();
+    assert_eq!(
+        (first.operation_date, first.departure_at, first.return_at),
+        (Some(d(2, 27)), Some(at(8)), Some(at(17)))
+    );
+    let numbers = (
+        first.total_distance,
+        first.drive_time_general,
+        first.drive_time_highway,
+        first.drive_time_bypass,
+    );
+    assert_eq!(numbers, (Some(12.5), Some(100), Some(20), Some(3)));
+    // 乗務員CD が NULL・別テナントの乗務員・居ない id は None
+    for id in [no_cd, other_one, Uuid::new_v4()] {
+        let none = pg::driver_operations_for_recalc(c, a, id, start, end).await;
+        assert_eq!(none.unwrap().map(|(cd, _)| cd), None);
+    }
+    // 別テナントには A の行が出ない
+    let (_, other_rows) = pg::driver_operations_for_recalc(c, b, other_one, start, end)
+        .await
+        .unwrap()
+        .unwrap();
+    let names: Vec<&str> = other_rows.iter().map(|r| r.unko_no.as_str()).collect();
+    assert_eq!(names, ["R-OTHER"]);
+    held.close().await;
+
+    let mut c = db.client(APP_ROLE).await.sever().await;
+    let keys = pg::zip_keys_for_recalc(&mut c, a, start).await;
+    assert!(keys.unwrap_err().is_closed());
+    let driver = pg::driver_operations_for_recalc(&mut c, a, one, start, end).await;
+    assert!(driver.unwrap_err().is_closed());
+    drop(c);
+    db.shutdown();
+}

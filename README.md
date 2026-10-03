@@ -4,10 +4,11 @@
 rust-alc-api を Cloudflare Workers へ段階移行する 2 本目 (Refs ippoan/rust-alc-api#725) で、型は 1 本目の
 ippoan/alc-vein-worker に合わせている。
 
-口は 8 本 (どれも `/api` 付きでも受ける): **`POST /upload`** (zip の取り込み)・**`POST /internal/rerun/{upload_id}`** (やり直し)・**`POST /split-csv/{upload_id}`** (アップロード 1 件の分割)・
-**`POST /split-csv-all`** (一括分割)・**`POST /recalculate`** (月の全員の再計算) と、履歴の読み取りの **`GET /uploads`**・**`GET /internal/pending`**・**`GET /internal/download/{upload_id}`**。それ以外の path は、
+口は 10 本 (どれも `/api` 付きでも受ける): **`POST /upload`** (zip の取り込み)・**`POST /internal/rerun/{upload_id}`** (やり直し)・**`POST /split-csv/{upload_id}`** (アップロード 1 件の分割)・
+**`POST /split-csv-all`** (一括分割)・**`POST /recalculate`** (月の全員の再計算)・**`POST /recalculate-driver`** (乗務員 1 人の再計算)・
+**`POST /recalculate-drivers`** (乗務員の一括の再計算) と、履歴の読み取りの **`GET /uploads`**・**`GET /internal/pending`**・**`GET /internal/download/{upload_id}`**。それ以外の path は、
 tenant ヘッダー無しが 401・有りが 404 (どのリクエストも、その前に DB へ繋ぐので、繋げなければ 503 / 500)。
-アップロード (`/upload`)・分割の 2 口・やり直しの口・履歴の読み取りの 3 口は、auth-worker の振り分けから呼ばれる。月の全員の再計算の口は、まだ振り分けに無い (呼ばれない)。
+アップロード (`/upload`)・分割の 2 口・やり直しの口・履歴の読み取りの 3 口は、auth-worker の振り分けから呼ばれる。再計算の 3 口は、まだ振り分けに無い (呼ばれない)。
 
 ## 配置
 
@@ -95,6 +96,8 @@ SQL は `src/repo.rs` の `sql` の 1 か所、流すのは `src/pg.rs` の 1 �
 | `list_pending_uploads(pg, tenant_id)` | `LIST_PENDING_UPLOADS` | テナントの、status が `pending_retry` か `failed` の履歴の一覧 (`Vec<PendingUploadRow>`。並びと件数は同じ) |
 | `upload_download(pg, tenant_id, upload_id)` | `SELECT_UPLOAD_DOWNLOAD` | 履歴 1 件の `(r2_zip_key, filename)` (行が無ければ `None`。key が NULL の行は `Some((None, _))`) |
 | `operations_for_recalc(pg, tenant_id, month_start, fetch_end)` | `LIST_OPERATIONS_FOR_RECALC` | 月の再計算の対象の運行 (`Vec<RecalcOperationRow>`。運行日か読取日が範囲に入る行と、その乗務員CD。読取日・運行NO の順。2 人乗務は乗務員ごとに 1 行) |
+| `zip_keys_for_recalc(pg, tenant_id, month_start)` | `LIST_ZIP_KEYS_FOR_RECALC` | 乗務員ごとの再計算が読み直す zip の key (`Vec<String>`。completed で、作成日が月初の 60 日前から (上の端なし)。重複なし・key の順。NULL は除く) |
+| `driver_operations_for_recalc(pg, tenant_id, driver_id, month_start, fetch_end)` | `SELECT_DRIVER_CD`・`LIST_DRIVER_OPERATIONS_FOR_RECALC` | 乗務員の乗務員CD と、その乗務員の月の運行 (`Option<(String, Vec<RecalcOperationRow>)>`。1 transaction。乗務員が無い・乗務員CD が NULL なら `None`。運行の並びと範囲は月の全員と同じ) |
 | `save_daily_hours_in_tx(pg, tenant_id, daily, all_unko_nos)` | (日別の保存の文) | 日別の保存を 1 transaction で (`save_daily_hours_with` = 消す対象の運行NO を外から渡す形。再計算が乗務員ごとに呼ぶ) |
 | `uploads_needing_split(pg, tenant_id)` | `LIST_UPLOADS_NEEDING_SPLIT` | 分割がまだの運行がテナントに 1 件でも在るとき、completed で key の在るアップロードの `(id, filename)` を新しい順に |
 
@@ -251,6 +254,36 @@ zip の取り込みのうち DB に書く部分。**SQL は backend (ippoan/rust
   もう一度呼べば揃う。
 - `error` の `message` は固定の語 (旧は理由の文)。
 
+## 乗務員ごとの再計算の口 `POST /recalculate-driver`・`POST /recalculate-drivers`
+
+乗務員 1 人 (`?year=&month=&driver_id=`) と、乗務員の一括 (JSON `{"year":…,"month":…,"driver_ids":[…]}`) の月の日別を計算し直して保存する。
+rust-alc-api の同じ口と同じ仕事。流れは `recalc.rs` (月の全員の口と、保存・分類・フェリーの読み・event の部品を共有する)。
+
+- 乗務員を id から引き (`SELECT_DRIVER_CD`。テナントで絞る)、その乗務員の月の運行を引く (`LIST_DRIVER_OPERATIONS_FOR_RECALC`)。運行の行の乗務員CD は引いた乗務員CD。
+- KUDGIVT は**アップロードの zip** を読み直して集める (`LIST_ZIP_KEYS_FOR_RECALC` = completed で、作成日が月初の 60 日前から)。**zip は 1 本ずつ読み**
+  (同時に持つのは 1 本)、その場で**対象の乗務員に関わる行だけ**を残す: 運行NO がその乗務員の運行に入る行と、乗務員CD がその乗務員の行。
+  重複 (運行NO・イベントCD・開始日時が同じ行) は、全部の zip を通して最初に出た行だけを数える (`dedup_kudgivt_rows` と同じ鍵。捨てた行の鍵も覚える)。
+  なので計算の結果は、全部の zip の全部の行を渡したときと同じ (テストで固定)。未登録のイベントCD の分類は、全部の行を渡したときと同じ順と名前で足す。
+  読めない・無い・展開や parse ができない zip は飛ばし、その数をログに出す。
+- フェリーは、運行ごとの分割の出力の `KUDGFRY.csv` (月の全員の口と同じ読み方)。
+- 一括は **zip を 1 回だけ**読み (対象の乗務員全員に関わる行を残す)、乗務員ごとに、その乗務員の行だけで計算する。
+- 保存は乗務員ごとの transaction (`save_daily_hours_in_tx`)。1 人の口は失敗で止まる。一括は 1 人の失敗 (引き当てられない・DB の失敗) を数えて続ける
+  (その人の transaction は戻る)。
+- 応答は `text/event-stream` (HTTP は 200)。1 人: `{"event":"progress","current":0,"total":0,"step":"start"}` → 保存の `progress` (`step: "save"`。
+  月の全員の口と同じ出し方) → `{"event":"done","total":<運行の行数>}`。一括: `{"event":"batch_start","total_drivers":<人数>}` → 1 人終えるごとに
+  `{"event":"progress","current":<終えた人数>,"total":<人数>}` → `{"event":"batch_done","total":<人数>,"done":<成功>,"errors":<失敗>}`。
+  失敗は `{"event":"error","message":"<固定の語>"}` で終わる (`month_invalid`・`driver_not_found`・`internal_error`)。
+- query が読めないときは 400 `{"error":"invalid_query"}`、body が読めないときは axum の JSON の拒否と同じ status (400・415・422) で
+  `{"error":"invalid_body"}` (入力の値を返さない)。
+- ログは段の名前・kind・件数だけ (`recalculate-driver failed: db (<kind>)`・`recalculate-drivers: driver failed: db (<kind>)`・
+  `recalculate-drivers: driver not found`・`<口>: zip unavailable for <n> upload(s)`)。
+
+### 旧 (backend) との違い
+
+- zip は 1 本ずつ読み、対象の乗務員に関わる行だけを残す。一括は zip を 1 回だけ読み、乗務員ごとに、その乗務員の行だけで計算する。
+- 保存は乗務員ごとの transaction。呼び手との接続が切れると、そこで止まる (もう一度呼べば揃う)。一括の乗務員は 1 人ずつ順に処理する。
+- `error` の `message` と、読めない query / body の本文は固定の語。
+
 ## 分割の口 `POST /split-csv/{upload_id}`
 
 アップロード済みの zip を R2 から読み、CSV を運行NO ごとに分けて R2 に置き、KUDGIVT を置けた運行に印 (`has_kudgivt`) を付ける。
@@ -380,7 +413,7 @@ cargo test -p alc-dtako-upload --test sql_db
 cargo llvm-cov --locked -p alc-dtako-upload --text > cov.txt && bash scripts/check_coverage_100.sh --use-cache cov.txt
 ```
 
-`tests/upload_flow.rs` (14 本。口から、組み込みの PostgreSQL と偽の保存先まで) はアップロードの口 (7 本)・やり直しの口 (2 本)・履歴の読み取り口 (3 本)・月の全員の再計算の口 (2 本) を確かめる。zip はテストの中で作る
+`tests/upload_flow.rs` (16 本。口から、組み込みの PostgreSQL と偽の保存先まで) はアップロードの口 (7 本)・やり直しの口 (2 本)・履歴の読み取り口 (3 本)・月の全員の再計算の口 (2 本)・乗務員ごとの再計算の口 (2 本) を確かめる。zip はテストの中で作る
 (`upload_zip`。KUDGURI・KUDGIVT は Shift_JIS・CRLF): 端から端 (応答の 8 field・履歴・運行・日別・セグメント・保存先の zip と分割の出力・分割済みの印) /
 上げ直し (同じ zip は記録なし・値が変われば before と after の分数・旧 KUDGIVT が無い / 読めないときの印) / リクエストの形の誤り (400 の語・
 tenant ヘッダー無しは 401・body は 2MB を超えても通り 20MB を超えると読めない) / zip の中身の誤り (語ごとに履歴の `error_message`・展開後の上限・
@@ -394,6 +427,11 @@ GET 以外は 405・切れた接続は 500 / ダウンロード (本文が保存
 エラーの本文とログに id と filename が出ない) / filename の残し方の規則だけを見る 1 本 (DB を使わない)。月の全員の再計算の口: アップロードしたときと同じ日別とセグメントを
 作り直す (休息の分数も同じ)・event の並び・もう一度呼んでも同じ・フェリーの記録の分数が入る / 運行が無い月 (12 月を含む)・月が不正・query の 400・KUDGIVT が無い・
 分類を読む段と 1 人の保存の DB の失敗 (先に保存した乗務員の分は残り、失敗した人の分は戻る)・別テナントに触れない・401・切れた接続・本文とログに識別子が出ない。
+乗務員ごとの再計算の口: zip 2 本 (別の乗務員の行・KUDGURI に無い運行NO のその乗務員の行・zip をまたぐ重複を混ぜる) を上げた後に、1 人の日別が
+上げたときと同じに戻る・**残した行で計算した結果が、全部の zip の全部の行 (重複を落とす) を渡して共有の `compute_daily_hours` で計算した結果と同じ**・
+zip は 1 本につき 1 回だけ読む・運行の無い月 / 一括 (2 人 + 居ない 1 人 → `batch_done{3,2,1}`・zip は 1 回だけ読む・空の一覧)・別テナントの乗務員・
+月が不正・居ない乗務員・query と body の 4xx・読めない zip 5 通りの件数・分類と保存の DB の失敗 (1 人は `error`・一括は数えて続ける)・
+運行の表と履歴の表を読めない (42501)・別テナントに触れない・401・本文とログに識別子が出ない。
 
 `tests/split_flow.rs` (20 本。口から、組み込みの PostgreSQL と偽の保存先まで) は 2 つの口を確かめる。一括分割 (6 本): 候補 0 件は `done` だけ /
 新しい順に 1 件ずつ `progress` → `done` / 1 件の失敗を数えて続ける / 上限 50 件と `skipped` / 候補の取得の失敗は固定の `error` / tenant ヘッダー無しは 401。
@@ -409,10 +447,12 @@ GET 以外は 405・切れた接続は 500 / ダウンロード (本文が保存
 同時に走る PUT は 6 本まで / 空の入力は何も呼ばない / `get` の 3 通り / `StoreError` の文に key が出ない /
 まとめて読む `get_all` (同時 6 本まで・結果は tag に結び付く・無い / 読めないは `None`・やり直さない・空の入力は何も呼ばない)。
 
-CI は target ごとに本数を固定で見る (`sql_db` は `17 passed`、`store` は `10 passed`、`split_flow` は `20 passed`、`upload_flow` は `14 passed`、どれも `0 failed; 0 ignored`)。減らすと落ちる。
+CI は target ごとに本数を固定で見る (`sql_db` は `18 passed`、`store` は `10 passed`、`split_flow` は `20 passed`、`upload_flow` は `16 passed`、どれも `0 failed; 0 ignored`)。減らすと落ちる。
 足したら `ci.yml` の数も上げる (テスト 1 本ごとに DB を起動して全 migration を流すので、本数を増やさず 1 本に筋書きを束ねる)。
-`sql_db` が確かめること (17 本)。再計算の対象の運行 (1 本): 月の範囲の境界 (月末の翌日を含む)・運行日と読取日のどちらかが入る行・
-2 人乗務は乗務員ごとに 1 行 (同じ乗務員CD なら 1 行)・別テナントが出ない・切れた接続。履歴の読み取り (1 本): 一覧 2 つが新しい順・同じ時刻は id の降順・51 行入れて 50 件・別テナントの行が出ない・
+`sql_db` が確かめること (18 本)。再計算の対象の運行 (1 本): 月の範囲の境界 (月末の翌日を含む)・運行日と読取日のどちらかが入る行・
+2 人乗務は乗務員ごとに 1 行 (同じ乗務員CD なら 1 行)・別テナントが出ない・切れた接続。乗務員ごとの再計算の文 (1 本): zip の key (completed だけ・
+作成日の下の端・上の端なし・重複なし・key の順・NULL を除く・別テナント) / 乗務員CD (NULL・別テナントの乗務員・居ない id は `None`) /
+乗務員 1 人の運行 (範囲・その乗務員だけ・同じ運行NO は 1 行・並び・列の中身・別テナント) / 切れた接続。履歴の読み取り (1 本): 一覧 2 つが新しい順・同じ時刻は id の降順・51 行入れて 50 件・別テナントの行が出ない・
 NULL の列・pending は `pending_retry` と `failed` だけ / ダウンロード用の行 (在る・無い・別テナントの id・key が NULL) / 切れた接続。取り込みの DB の層 (8 本):
 
 - 乗務員の解決: `code` の行を使って `driver_cd` を埋める / `driver_cd` の行へ落ちる / 新規 / 別の生存行が同じ driver_cd を持つときは埋めない /

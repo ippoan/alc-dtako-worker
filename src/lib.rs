@@ -3,8 +3,9 @@
 //! DB への経路 (staging = Workers VPC の先の PgBouncer、本番 = Hyperdrive) は [`db::connect`] の 1 か所で出し分ける。
 //! monolith と同じく `/api` 付きでも受ける。
 //!
-//! 口は 8 本: `POST /upload` (zip の取り込み)・`POST /internal/rerun/{upload_id}` (やり直し)・`POST /split-csv/{upload_id}` (分割 1 件)・
-//! `POST /split-csv-all` (一括分割)・`POST /recalculate` (月の全員の再計算) と、履歴の読み取りの `GET /uploads`・`GET /internal/pending`・
+//! 口は 10 本: `POST /upload` (zip の取り込み)・`POST /internal/rerun/{upload_id}` (やり直し)・`POST /split-csv/{upload_id}` (分割 1 件)・
+//! `POST /split-csv-all` (一括分割)・`POST /recalculate` (月の全員の再計算)・`POST /recalculate-driver`・`POST /recalculate-drivers`
+//! (乗務員ごとの再計算) と、履歴の読み取りの `GET /uploads`・`GET /internal/pending`・
 //! `GET /internal/download/{upload_id}`。
 //! 口と流れは crates/alc-dtako-upload に在り、
 //! ここが足すのは DB の接続・R2 の binding ([`r2`])・ログの出し先だけ。

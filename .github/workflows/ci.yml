@@ -80,7 +80,7 @@ jobs:
             name="${c%%:*}"; count="${c##*:}"
             cargo llvm-cov clean --workspace
             cargo llvm-cov --locked -p "$name" --no-report 2>&1 | tee "$RUNNER_TEMP/$name-test.txt"
-            awk '/Running unittests src\/lib\.rs \(/{f=1} f && /^test result:/{print; exit}' "$RUNNER_TEMP/$name-test.txt" \
+            awk '/Running.*unittests src\/lib\.rs \(/{f=1} f && /^test result:/{print; exit}' "$RUNNER_TEMP/$name-test.txt" \
               | grep -Eq "^test result: ok\. $count passed; 0 failed; 0 ignored"
             cargo llvm-cov report --locked -p "$name" --text > "$RUNNER_TEMP/$name-cov.txt"
           done

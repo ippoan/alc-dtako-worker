@@ -43,10 +43,11 @@ enabled = true
 binding = "DTAKO_HYPERDRIVE"
 id = "6bdf446634034f989d4e094d5510b162"
 
-# 本番の R2 (運行 CSV の置き場)。binding は env に継承されないので、staging は下で別の bucket を指す
+# 本番の R2 (運行 CSV の置き場)。binding は env に継承されないので、staging は下で別の bucket を指す。
+# APAC (2026-10-06 に移した。旧 ohishi-dtako は ENAM)
 [[r2_buckets]]
 binding = "DTAKO_R2"
-bucket_name = "ohishi-dtako"
+bucket_name = "ohishi-dtako-apac"
 
 # staging: DB は ippoan/alc-vein-worker の staging と同じもの (Workers VPC の binding DTAKO_DB_VPC から
 # 既存の Tunnel 経由で PgBouncer へ繋ぐ。src/db.rs)。Hyperdrive は通さない。

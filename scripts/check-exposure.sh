@@ -17,8 +17,8 @@
 #     (この worker は Durable Object も Container も持たない)
 #   - env 配下 (env.staging を含む) に hyperdrive が無い (ippoan/rust-alc-api#723)。Hyperdrive の binding は本番の DB へ
 #     届くので、トップレベル (本番) にだけ置く (workers.dev が開いている staging に置かない)
-#   - env 配下の r2_buckets に本番の bucket (bucket_name = "ohishi-dtako"、完全一致) が無い
-#     (staging が本番の bucket を指すと、本番の object を上書きする)
+#   - env 配下の r2_buckets に本番の bucket (bucket_name = "ohishi-dtako-apac" と、移行前の旧 "ohishi-dtako"
+#     (旧 bucket も残すので本番扱い)。どちらも完全一致) が無い (staging が本番の bucket を指すと、本番の object を上書きする)
 # 違えば exit 1。CI で毎回走らせる。陰性対照は scripts/check-exposure-test.sh。
 #
 #   bash scripts/check-exposure.sh [wrangler.toml]
@@ -82,8 +82,8 @@ for name, e in envs.items():
 # 本番の R2 の bucket を env 配下 (staging を含む) から指さない (本番の object を上書きする)
 for name, e in envs.items():
     for b in e.get("r2_buckets", []):
-        if b.get("bucket_name") == "ohishi-dtako":
-            err(f"env.{name} の r2_buckets が本番の bucket ohishi-dtako を指している (env 用の bucket を指すこと)")
+        if b.get("bucket_name") in ("ohishi-dtako-apac", "ohishi-dtako"):
+            err(f"env.{name} の r2_buckets が本番の bucket {b['bucket_name']} を指している (env 用の bucket を指すこと)")
 
 if errors:
     sys.exit(1)

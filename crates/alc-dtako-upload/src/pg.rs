@@ -152,26 +152,6 @@ pub async fn operations_for_recalc(
     .await
 }
 
-/// [`sql::LIST_ZIP_KEYS_FOR_RECALC`]。key が NULL の行は除く。
-pub async fn zip_keys_for_recalc(
-    pg: &mut PgClient,
-    tenant_id: Uuid,
-    month_start: NaiveDate,
-) -> Result<Vec<String>, tokio_postgres::Error> {
-    pg.tenant_tx(tenant_id, move |tx| {
-        Box::pin(async move {
-            let params: [(&(dyn tokio_postgres::types::ToSql + Sync), Type); 2] =
-                [(&tenant_id, Type::UUID), (&month_start, Type::DATE)];
-            let rows = tx
-                .query_typed(sql::LIST_ZIP_KEYS_FOR_RECALC, &params)
-                .await?;
-            let key = |r: tokio_postgres::Row| r.get::<_, Option<String>>(0);
-            Ok(rows.into_iter().filter_map(key).collect())
-        })
-    })
-    .await
-}
-
 /// 乗務員 1 人の乗務員CD ([`sql::SELECT_DRIVER_CD`]) と、月の再計算の対象の運行
 /// ([`sql::LIST_DRIVER_OPERATIONS_FOR_RECALC`]。`driver_cd` には引いた乗務員CD を入れる) を 1 transaction で。
 /// 乗務員が無い・乗務員CD が NULL なら `None` (運行を引かない)。`fetch_end` は月末の翌日。

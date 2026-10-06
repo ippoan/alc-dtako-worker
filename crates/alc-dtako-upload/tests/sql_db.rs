@@ -1747,39 +1747,16 @@ async fn operations_for_recalc_pick_the_month_by_operation_or_reading_date() {
     db.shutdown();
 }
 
-/// 乗務員ごとの再計算の文: zip の key (completed だけ・作成日が月初の 60 日前から・上の端なし・重複なし・key の順・NULL を除く・
-/// テナントごと) / 乗務員CD (テナントで絞る・NULL は無いのと同じ) / 乗務員 1 人の運行 (運行日か読取日が範囲に入る行・
+/// 乗務員ごとの再計算の文: 乗務員CD (テナントで絞る・NULL は無いのと同じ) / 乗務員 1 人の運行 (運行日か読取日が範囲に入る行・
 /// その乗務員だけ・同じ運行NO は 1 行・読取日と運行NO の順)。
 #[tokio::test(flavor = "multi_thread")]
-async fn driver_recalc_reads_zip_keys_driver_cd_and_the_drivers_operations() {
+async fn driver_recalc_reads_driver_cd_and_the_drivers_operations() {
     let db = Embedded::start().await;
     let mut held = db.client(APP_ROLE).await;
     let c = &mut held.inner;
     let a = tenant(c, "Dtako Driver Recalc Tenant A").await;
     let b = tenant(c, "Dtako Driver Recalc Tenant B").await;
-    let history =
-        "INSERT INTO dtako_upload_history (tenant_id, filename, status, r2_zip_key, created_at) \
-                   SELECT $1, 'x.zip', v.status, v.key, v.created_at::timestamptz FROM (VALUES \
-                   ('completed', 'a/z-edge.zip', '2026-01-01 00:00:00+00'), \
-                   ('completed', 'a/z-edge.zip', '2026-02-01 00:00:00+00'), \
-                   ('completed', 'a/z-before.zip', '2025-12-31 23:59:59+00'), \
-                   ('completed', 'a/z-late.zip', '2027-01-01 00:00:00+00'), \
-                   ('failed', 'a/z-failed.zip', '2026-02-01 00:00:00+00'), \
-                   ('completed', NULL, '2026-02-01 00:00:00+00'), \
-                   ('completed', 'a/a-first.zip', '2026-02-01 00:00:00+00') \
-                   ) v(status, key, created_at)";
-    assert_eq!(exec(c, a, history).await, 7);
-    let other = "INSERT INTO dtako_upload_history (tenant_id, filename, status, r2_zip_key) \
-                 VALUES ($1, 'x.zip', 'completed', 'b/z.zip')";
-    assert_eq!(exec(c, b, other).await, 1);
-    // 月初 2026-03-02 → 下の端は 2026-01-01 00:00
     let d = |m, day| NaiveDate::from_ymd_opt(2026, m, day).unwrap();
-    let keys = pg::zip_keys_for_recalc(c, a, d(3, 2)).await.unwrap();
-    assert_eq!(keys, ["a/a-first.zip", "a/z-edge.zip", "a/z-late.zip"]);
-    assert_eq!(
-        pg::zip_keys_for_recalc(c, b, d(3, 2)).await.unwrap(),
-        ["b/z.zip"]
-    );
 
     let one = employee(c, a, None, Some("D-ONE"), "TEST-ONE", false).await;
     employee(c, a, None, Some("D-TWO"), "TEST-TWO", false).await;
@@ -1852,8 +1829,6 @@ async fn driver_recalc_reads_zip_keys_driver_cd_and_the_drivers_operations() {
     held.close().await;
 
     let mut c = db.client(APP_ROLE).await.sever().await;
-    let keys = pg::zip_keys_for_recalc(&mut c, a, start).await;
-    assert!(keys.unwrap_err().is_closed());
     let driver = pg::driver_operations_for_recalc(&mut c, a, one, start, end).await;
     assert!(driver.unwrap_err().is_closed());
     drop(c);

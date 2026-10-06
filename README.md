@@ -370,7 +370,7 @@ backend (ippoan/rust-alc-api) の `POST /api/split-csv/{upload_id}` と同じ仕
 
 | env | binding | bucket |
 |---|---|---|
-| 本番 (トップレベル) | `DTAKO_R2` | `ohishi-dtako` |
+| 本番 (トップレベル) | `DTAKO_R2` | `ohishi-dtako-apac` (APAC。2026-10-06 に旧 `ohishi-dtako` (ENAM) から移した) |
 | staging | `DTAKO_R2` | `ohishi-dtako-staging` |
 
 **staging の R2 は staging 用の bucket。** `env.*` から本番の bucket を指さない (本番の object を上書きする。

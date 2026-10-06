@@ -56,7 +56,9 @@ mutate "staging に durable_objects を足す (この worker は DO も Containe
   's = s.replace("[env.staging.observability]", "[[env.staging.durable_objects.bindings]]\nname = \"DTAKO_DB\"\nclass_name = \"DtakoDb\"\n\n[env.staging.observability]", 1)'
 mutate "staging に hyperdrive (本番の DB へ届く binding) を足す" \
   's = s.replace("[env.staging.observability]", "[[env.staging.hyperdrive]]\nbinding = \"DTAKO_HYPERDRIVE\"\nid = \"x\"\n\n[env.staging.observability]", 1)'
-mutate "staging の r2_buckets が本番の bucket を指す" \
+mutate "staging の r2_buckets が本番の bucket ohishi-dtako-apac を指す" \
+  's = s.replace("bucket_name = \"ohishi-dtako-staging\"", "bucket_name = \"ohishi-dtako-apac\"", 1)'
+mutate "staging の r2_buckets が旧の本番の bucket ohishi-dtako を指す" \
   's = s.replace("bucket_name = \"ohishi-dtako-staging\"", "bucket_name = \"ohishi-dtako\"", 1)'
 
 exit "$fail"

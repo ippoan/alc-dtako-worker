@@ -424,7 +424,7 @@ done
 bash scripts/check_coverage_100.sh --use-cache cov-alc-dtako-upload.txt --use-cache cov-alc-compare.txt --use-cache cov-alc-csv-parser.txt
 ```
 
-`tests/upload_flow.rs` (17 本。口から、組み込みの PostgreSQL と偽の保存先まで) はアップロードの口 (7 本)・やり直しの口 (2 本)・履歴の読み取り口 (3 本)・月の全員の再計算の口 (2 本)・乗務員ごとの再計算の口 (3 本) を確かめる。zip はテストの中で作る
+`tests/upload_flow.rs` (18 本。口から、組み込みの PostgreSQL と偽の保存先まで) はアップロードの口 (7 本)・やり直しの口 (2 本)・履歴の読み取り口 (3 本)・月の全員の再計算の口 (2 本)・乗務員ごとの再計算の口 (3 本)・3 つの口で消す運行NO を月の運行に揃える 1 本 を確かめる。zip はテストの中で作る
 (`upload_zip`。KUDGURI・KUDGIVT は Shift_JIS・CRLF): 端から端 (応答の 8 field・履歴・運行・日別・セグメント・保存先の zip と分割の出力・分割済みの印) /
 上げ直し (同じ zip は記録なし・値が変われば before と after の分数・旧 KUDGIVT が無い / 読めないときの印) / リクエストの形の誤り (400 の語・
 tenant ヘッダー無しは 401・body は 2MB を超えても通り 20MB を超えると読めない) / zip の中身の誤り (語ごとに履歴の `error_message`・展開後の上限・
@@ -458,7 +458,7 @@ KUDGIVT が 0 件 → その人だけ errors・ほかは保存 (1 人の口は `
 同時に走る PUT は 6 本まで / 空の入力は何も呼ばない / `get` の 3 通り / `StoreError` の文に key が出ない /
 まとめて読む `get_all` (同時 6 本まで・結果は tag に結び付く・無い / 読めないは `None`・やり直さない・空の入力は何も呼ばない)。
 
-CI は target ごとに本数を固定で見る (`sql_db` は `18 passed`、`store` は `10 passed`、`split_flow` は `20 passed`、`upload_flow` は `17 passed`、どれも `0 failed; 0 ignored`)。減らすと落ちる。
+CI は target ごとに本数を固定で見る (`sql_db` は `18 passed`、`store` は `10 passed`、`split_flow` は `20 passed`、`upload_flow` は `18 passed`、どれも `0 failed; 0 ignored`)。減らすと落ちる。
 足したら `ci.yml` の数も上げる (テスト 1 本ごとに DB を起動して全 migration を流すので、本数を増やさず 1 本に筋書きを束ねる)。
 `sql_db` が確かめること (18 本)。再計算の対象の運行 (1 本): 月の範囲の境界 (月末の翌日を含む)・運行日と読取日のどちらかが入る行・
 2 人乗務は乗務員ごとに 1 行 (同じ乗務員CD なら 1 行)・別テナントが出ない・切れた接続。乗務員ごとの再計算の文 (1 本): 乗務員CD (NULL・別テナントの乗務員・居ない id は `None`) /

@@ -7,10 +7,11 @@
 //!
 //! - 月の全員: 月の運行を DB から読み、運行ごとの分割の出力 (`{テナント}/unko/{運行NO}/KUDGIVT.csv`・`KUDGFRY.csv`) を
 //!   **運行NO ごとに 1 回だけ**読む (同時 [`crate::store::GET_CONCURRENCY`] 本)。運行の行 (2 人乗務なら主と助手の 2 行) は
-//!   そのまま計算に渡す。消す対象の運行NO は月の全体のもの ([`pg::daily_unko_nos`]) を渡すので、まとめて保存したときと
-//!   同じ行が消える。1 人の保存が失敗したら、その人の分は戻り、そこで止まる
+//!   そのまま計算に渡す。消す対象の運行NO は、その月の再計算の対象の運行 (読んだ運行の行) のもの。今回の計算に日エントリが
+//!   出なかった運行の行も消える (3 口とも同じ)。1 人の保存が失敗したら、その人の分は戻り、そこで止まる
 //! - 乗務員ごと (1 人・一括): 乗務員の運行を DB から読み、月の全員と同じく運行ごとの分割の出力を読む (KUDGIVT・KUDGFRY)。
-//!   乗務員の運行の外にある運行NO の行は拾わない。一括は乗務員を 1 人ずつ読んで計算し、1 人の失敗 (KUDGIVT が 1 件も
+//!   乗務員の運行の外にある運行NO の行は拾わない。消す対象の運行NO は月の全員と同じ
+//!   (月の運行の一覧を 1 回引いて運行NO だけ使う。一括は 1 回引いて全員で使い回す)。一括は乗務員を 1 人ずつ読んで計算し、1 人の失敗 (KUDGIVT が 1 件も
 //!   無い場合を含む) を数えて続ける (その人の transaction は戻る)
 //! - 進み具合は event で返す ([`next_recalc_event`]。応答の stream の中で 1 歩ずつ進める)。呼び手が切れたら、そこで止まる
 //!   (保存の済んだ乗務員の分は残る。もう一度呼べば揃う)
@@ -108,6 +109,7 @@ enum Step {
     /// 一括: 乗務員を 1 人ずつ計算して保存している (引き当てられなかった人は `None`。値は月の運行の行)
     Batch {
         drivers: std::vec::IntoIter<Option<Vec<KudguriRow>>>,
+        all_unko_nos: Arc<Vec<String>>,
         current: usize,
         done: usize,
         errors: usize,
@@ -236,27 +238,16 @@ pub async fn next_recalc_event(mut run: RecalcRun) -> Option<(Value, RecalcRun)>
                     Ok(daily) => daily,
                     Err(e) => return run.fail("internal_error", db_stage(&e)),
                 };
-                run.step = save_step(daily);
+                run.step = save_step(daily, unko_nos_of(&rows));
             }
             Step::DriverLoad { driver_id } => {
                 let Some((month_start, month_end)) = month_range(run.year, run.month) else {
                     return run.fail("month_invalid", None);
                 };
                 let fetch_end = month_end + Duration::days(1);
-                let tenant_id = run.tenant_id;
-                let driver = {
-                    let mut client = run.pg.lock().await;
-                    pg::driver_operations_for_recalc(
-                        &mut client,
-                        tenant_id,
-                        driver_id,
-                        month_start,
-                        fetch_end,
-                    )
-                    .await
-                };
-                let ops = match driver {
-                    Ok(Some((_, ops))) => ops,
+                let driver = load_driver(&run, driver_id, month_start, fetch_end).await;
+                let (ops, all_unko_nos) = match driver {
+                    Ok(Some(loaded)) => loaded,
                     Ok(None) => return run.fail("driver_not_found", None),
                     Err(e) => return run.fail("internal_error", db_stage(&e)),
                 };
@@ -269,7 +260,7 @@ pub async fn next_recalc_event(mut run: RecalcRun) -> Option<(Value, RecalcRun)>
                 let samples = kudgivt_rows.clone();
                 let daily = compute(&run, &rows, &kudgivt_rows, samples, &ferry).await;
                 match daily {
-                    Ok(daily) => run.step = save_step(daily),
+                    Ok(daily) => run.step = save_step(daily, all_unko_nos),
                     Err(e) => return run.fail("internal_error", db_stage(&e)),
                 }
             }
@@ -277,9 +268,20 @@ pub async fn next_recalc_event(mut run: RecalcRun) -> Option<(Value, RecalcRun)>
                 let Some((month_start, month_end)) = month_range(run.year, run.month) else {
                     return run.fail("month_invalid", None);
                 };
+                let fetch_end = month_end + Duration::days(1);
                 let drivers = resolve_drivers(&run, &ids, month_start, month_end).await;
+                let all_unko_nos = {
+                    let mut client = run.pg.lock().await;
+                    let tenant_id = run.tenant_id;
+                    month_unko_nos(&mut client, tenant_id, month_start, fetch_end).await
+                };
+                let all_unko_nos = match all_unko_nos {
+                    Ok(unko_nos) => unko_nos,
+                    Err(e) => return run.fail("internal_error", db_stage(&e)),
+                };
                 run.step = Step::Batch {
                     drivers: drivers.into_iter(),
+                    all_unko_nos: Arc::new(all_unko_nos),
                     current: 0,
                     done: 0,
                     errors: 0,
@@ -319,6 +321,7 @@ pub async fn next_recalc_event(mut run: RecalcRun) -> Option<(Value, RecalcRun)>
             }
             Step::Batch {
                 mut drivers,
+                all_unko_nos,
                 current,
                 mut done,
                 mut errors,
@@ -328,7 +331,7 @@ pub async fn next_recalc_event(mut run: RecalcRun) -> Option<(Value, RecalcRun)>
                     continue;
                 };
                 let ok = match driver {
-                    Some(rows) => recalc_batch_driver(&run, rows).await,
+                    Some(rows) => recalc_batch_driver(&run, rows, &all_unko_nos).await,
                     None => false,
                 };
                 if ok {
@@ -339,6 +342,7 @@ pub async fn next_recalc_event(mut run: RecalcRun) -> Option<(Value, RecalcRun)>
                 let current = current + 1;
                 run.step = Step::Batch {
                     drivers,
+                    all_unko_nos,
                     current,
                     done,
                     errors,
@@ -383,9 +387,56 @@ async fn month_start(mut run: RecalcRun) -> Option<(Value, RecalcRun)> {
     Some((event, run))
 }
 
-/// 計算の出力を乗務員CD ごとに分けた保存の段 (消す対象の運行NO は全体のもの)。
-fn save_step(daily: HashMap<DayKey, DailyHours>) -> Step {
-    let all_unko_nos = Arc::new(pg::daily_unko_nos(&daily));
+/// 運行の行の運行NO を、重複なしで行の順に並べる (保存で消す対象)。
+fn unko_nos_of(rows: &[KudguriRow]) -> Vec<String> {
+    let mut unko_nos: Vec<String> = Vec::new();
+    for row in rows {
+        if !unko_nos.contains(&row.unko_no) {
+            unko_nos.push(row.unko_no.clone());
+        }
+    }
+    unko_nos
+}
+
+/// その月の再計算の対象の運行 ([`pg::operations_for_recalc`]) の運行NO (乗務員の口が、月の全員の口と同じ行を消すため)。
+async fn month_unko_nos(
+    client: &mut PgClient,
+    tenant_id: Uuid,
+    month_start: NaiveDate,
+    fetch_end: NaiveDate,
+) -> Result<Vec<String>, tokio_postgres::Error> {
+    let ops = pg::operations_for_recalc(client, tenant_id, month_start, fetch_end).await?;
+    let mut unko_nos: Vec<String> = Vec::new();
+    for op in ops {
+        if !unko_nos.contains(&op.unko_no) {
+            unko_nos.push(op.unko_no);
+        }
+    }
+    Ok(unko_nos)
+}
+
+/// 乗務員 1 人の運行と、消す対象の運行NO (月の運行のもの) を読む。乗務員が居なければ `None`。
+async fn load_driver(
+    run: &RecalcRun,
+    driver_id: Uuid,
+    month_start: NaiveDate,
+    fetch_end: NaiveDate,
+) -> Result<Option<(Vec<RecalcOperationRow>, Vec<String>)>, tokio_postgres::Error> {
+    let tenant_id = run.tenant_id;
+    let mut client = run.pg.lock().await;
+    let driver =
+        pg::driver_operations_for_recalc(&mut client, tenant_id, driver_id, month_start, fetch_end)
+            .await?;
+    let Some((_, ops)) = driver else {
+        return Ok(None);
+    };
+    let all_unko_nos = month_unko_nos(&mut client, tenant_id, month_start, fetch_end).await?;
+    Ok(Some((ops, all_unko_nos)))
+}
+
+/// 計算の出力を乗務員CD ごとに分けた保存の段 (`all_unko_nos` = 消す対象の運行NO。月の運行のもの)。
+fn save_step(daily: HashMap<DayKey, DailyHours>, all_unko_nos: Vec<String>) -> Step {
+    let all_unko_nos = Arc::new(all_unko_nos);
     let entries = daily.len();
     let mut by_driver: BTreeMap<String, HashMap<DayKey, DailyHours>> = BTreeMap::new();
     for (key, hours) in daily {
@@ -465,7 +516,11 @@ async fn resolve_drivers(
 
 /// 一括の乗務員 1 人を、その乗務員の運行の分割の出力で計算して保存する (1 transaction)。成功なら `true`。
 /// KUDGIVT が 1 件も無ければ、その人だけ失敗に数える。
-async fn recalc_batch_driver(run: &RecalcRun, rows: Vec<KudguriRow>) -> bool {
+async fn recalc_batch_driver(
+    run: &RecalcRun,
+    rows: Vec<KudguriRow>,
+    all_unko_nos: &Arc<Vec<String>>,
+) -> bool {
     let (kudgivt_rows, ferry) = read_split_outputs(run, &rows, true).await;
     if kudgivt_rows.is_empty() && !rows.is_empty() {
         run.warn("driver failed: kudgivt_not_found");
@@ -474,9 +529,9 @@ async fn recalc_batch_driver(run: &RecalcRun, rows: Vec<KudguriRow>) -> bool {
     let samples = kudgivt_rows.clone();
     let saved = match compute(run, &rows, &kudgivt_rows, samples, &ferry).await {
         Ok(daily) => {
-            let all_unko_nos = Arc::new(pg::daily_unko_nos(&daily));
             let mut client = run.pg.lock().await;
-            pg::save_daily_hours_in_tx(&mut client, run.tenant_id, daily, all_unko_nos).await
+            let unko_nos = all_unko_nos.clone();
+            pg::save_daily_hours_in_tx(&mut client, run.tenant_id, daily, unko_nos).await
         }
         Err(e) => Err(e),
     };

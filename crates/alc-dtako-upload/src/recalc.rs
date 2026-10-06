@@ -9,16 +9,15 @@
 //!   **運行NO ごとに 1 回だけ**読む (同時 [`crate::store::GET_CONCURRENCY`] 本)。運行の行 (2 人乗務なら主と助手の 2 行) は
 //!   そのまま計算に渡す。消す対象の運行NO は月の全体のもの ([`pg::daily_unko_nos`]) を渡すので、まとめて保存したときと
 //!   同じ行が消える。1 人の保存が失敗したら、その人の分は戻り、そこで止まる
-//! - 乗務員ごと (1 人・一括): 乗務員の運行を DB から読み、KUDGIVT は**アップロードの zip** (月初の 60 日前から) を
-//!   **1 本ずつ**読み直して集める。zip ごとに、その場で**対象の乗務員に関わる行だけ**を残し、zip と残りの行は捨てる
-//!   ([`read_zip_kudgivt`])。フェリーは運行ごとの分割の出力の KUDGFRY。一括は zip を 1 回だけ読み、乗務員ごとに、
-//!   その乗務員の行だけで計算する。一括は 1 人の失敗を数えて続ける (その人の transaction は戻る)
+//! - 乗務員ごと (1 人・一括): 乗務員の運行を DB から読み、月の全員と同じく運行ごとの分割の出力を読む (KUDGIVT・KUDGFRY)。
+//!   乗務員の運行の外にある運行NO の行は拾わない。一括は乗務員を 1 人ずつ読んで計算し、1 人の失敗 (KUDGIVT が 1 件も
+//!   無い場合を含む) を数えて続ける (その人の transaction は戻る)
 //! - 進み具合は event で返す ([`next_recalc_event`]。応答の stream の中で 1 歩ずつ進める)。呼び手が切れたら、そこで止まる
 //!   (保存の済んだ乗務員の分は残る。もう一度呼べば揃う)
 //!
 //! event の `message` とログは固定の語・段の名前・kind・件数だけ (テナント・運行NO・乗務員・入力の値・生のエラー文を出さない)。
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use alc_compare::upload_daily::{compute_daily_hours, ferry_data_from_text, DailyHours, FerryData};
@@ -27,12 +26,11 @@ use alc_csv_parser::kudgivt::{parse_kudgivt, KudgivtRow};
 use alc_csv_parser::kudguri::{KudguriRow, RecalcOperation};
 use alc_csv_parser::work_segments::EventClass;
 use alc_worker_db::PgClient;
-use chrono::{Duration, NaiveDate, NaiveDateTime};
+use chrono::{Duration, NaiveDate};
 use futures_util::lock::Mutex;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use crate::archive::{Archive, MAX_UNCOMPRESSED_BYTES};
 use crate::pg::{self, RecalcOperationRow};
 use crate::split::{LogLevel, LogSink};
 use crate::store::{get_all, ObjectStore};
@@ -87,12 +85,6 @@ enum Target {
     Drivers,
 }
 
-/// 一括の、引き当てた乗務員 1 人。
-struct BatchDriver {
-    driver_cd: String,
-    rows: Vec<KudguriRow>,
-}
-
 enum Step {
     /// 月の全員: まだ何もしていない
     Start,
@@ -102,9 +94,9 @@ enum Step {
     BatchStart { ids: Vec<Uuid> },
     /// 月の全員: 運行を読んだ。次は保存先を読んで計算する
     Compute { rows: Vec<KudguriRow> },
-    /// 乗務員 1 人: `start` を出した。次は運行と zip を読んで計算する
+    /// 乗務員 1 人: `start` を出した。次は運行と分割の出力を読んで計算する
     DriverLoad { driver_id: Uuid },
-    /// 一括: `batch_start` を出した。次は乗務員を引き当て、zip を読む
+    /// 一括: `batch_start` を出した。次は乗務員を引き当てる
     BatchLoad { ids: Vec<Uuid> },
     /// 乗務員ごとに保存している (月の全員・乗務員 1 人)
     Save {
@@ -113,10 +105,9 @@ enum Step {
         saved: usize,
         entries: usize,
     },
-    /// 一括: 乗務員を 1 人ずつ計算して保存している (引き当てられなかった人は `None`)
+    /// 一括: 乗務員を 1 人ずつ計算して保存している (引き当てられなかった人は `None`。値は月の運行の行)
     Batch {
-        drivers: std::vec::IntoIter<Option<BatchDriver>>,
-        kept: ZipKudgivt,
+        drivers: std::vec::IntoIter<Option<Vec<KudguriRow>>>,
         current: usize,
         done: usize,
         errors: usize,
@@ -264,28 +255,19 @@ pub async fn next_recalc_event(mut run: RecalcRun) -> Option<(Value, RecalcRun)>
                     )
                     .await
                 };
-                let (driver_cd, ops) = match driver {
-                    Ok(Some(driver)) => driver,
+                let ops = match driver {
+                    Ok(Some((_, ops))) => ops,
                     Ok(None) => return run.fail("driver_not_found", None),
-                    Err(e) => return run.fail("internal_error", db_stage(&e)),
-                };
-                let keys = {
-                    let mut client = run.pg.lock().await;
-                    pg::zip_keys_for_recalc(&mut client, tenant_id, month_start).await
-                };
-                let keys = match keys {
-                    Ok(keys) => keys,
                     Err(e) => return run.fail("internal_error", db_stage(&e)),
                 };
                 let rows = kudguri_rows(ops);
                 run.total = rows.len();
-                let unko_nos: HashSet<&str> = rows.iter().map(|r| r.unko_no.as_str()).collect();
-                let keep = |e: &KudgivtRow| {
-                    unko_nos.contains(e.unko_no.as_str()) || e.driver_cd == driver_cd
-                };
-                let kept = read_zip_kudgivt(&run, keys, keep).await;
-                let (_, ferry) = read_split_outputs(&run, &rows, false).await;
-                let daily = compute(&run, &rows, &kept.rows, kept.samples, &ferry).await;
+                let (kudgivt_rows, ferry) = read_split_outputs(&run, &rows, true).await;
+                if kudgivt_rows.is_empty() && !rows.is_empty() {
+                    return run.fail("kudgivt_not_found", None);
+                }
+                let samples = kudgivt_rows.clone();
+                let daily = compute(&run, &rows, &kudgivt_rows, samples, &ferry).await;
                 match daily {
                     Ok(daily) => run.step = save_step(daily),
                     Err(e) => return run.fail("internal_error", db_stage(&e)),
@@ -295,28 +277,9 @@ pub async fn next_recalc_event(mut run: RecalcRun) -> Option<(Value, RecalcRun)>
                 let Some((month_start, month_end)) = month_range(run.year, run.month) else {
                     return run.fail("month_invalid", None);
                 };
-                let keys = {
-                    let mut client = run.pg.lock().await;
-                    pg::zip_keys_for_recalc(&mut client, run.tenant_id, month_start).await
-                };
-                let keys = match keys {
-                    Ok(keys) => keys,
-                    Err(e) => return run.fail("internal_error", db_stage(&e)),
-                };
                 let drivers = resolve_drivers(&run, &ids, month_start, month_end).await;
-                let mut unko_nos: HashSet<String> = HashSet::new();
-                let mut driver_cds: HashSet<String> = HashSet::new();
-                for driver in drivers.iter().flatten() {
-                    unko_nos.extend(driver.rows.iter().map(|r| r.unko_no.clone()));
-                    driver_cds.insert(driver.driver_cd.clone());
-                }
-                let keep = |e: &KudgivtRow| {
-                    unko_nos.contains(&e.unko_no) || driver_cds.contains(&e.driver_cd)
-                };
-                let kept = read_zip_kudgivt(&run, keys, keep).await;
                 run.step = Step::Batch {
                     drivers: drivers.into_iter(),
-                    kept,
                     current: 0,
                     done: 0,
                     errors: 0,
@@ -356,7 +319,6 @@ pub async fn next_recalc_event(mut run: RecalcRun) -> Option<(Value, RecalcRun)>
             }
             Step::Batch {
                 mut drivers,
-                kept,
                 current,
                 mut done,
                 mut errors,
@@ -366,7 +328,7 @@ pub async fn next_recalc_event(mut run: RecalcRun) -> Option<(Value, RecalcRun)>
                     continue;
                 };
                 let ok = match driver {
-                    Some(driver) => recalc_batch_driver(&run, driver, &kept).await,
+                    Some(rows) => recalc_batch_driver(&run, rows).await,
                     None => false,
                 };
                 if ok {
@@ -377,7 +339,6 @@ pub async fn next_recalc_event(mut run: RecalcRun) -> Option<(Value, RecalcRun)>
                 let current = current + 1;
                 run.step = Step::Batch {
                     drivers,
-                    kept,
                     current,
                     done,
                     errors,
@@ -471,7 +432,7 @@ async fn resolve_drivers(
     ids: &[Uuid],
     month_start: NaiveDate,
     month_end: NaiveDate,
-) -> Vec<Option<BatchDriver>> {
+) -> Vec<Option<Vec<KudguriRow>>> {
     let fetch_end = month_end + Duration::days(1);
     let mut drivers = Vec::with_capacity(ids.len());
     for &driver_id in ids {
@@ -488,10 +449,7 @@ async fn resolve_drivers(
             .await
         };
         drivers.push(match loaded {
-            Ok(Some((driver_cd, ops))) => Some(BatchDriver {
-                driver_cd,
-                rows: kudguri_rows(ops),
-            }),
+            Ok(Some((_, ops))) => Some(kudguri_rows(ops)),
             Ok(None) => {
                 run.warn("driver not found");
                 None
@@ -505,15 +463,16 @@ async fn resolve_drivers(
     drivers
 }
 
-/// 一括の乗務員 1 人を、その乗務員に関わる行だけで計算して保存する (1 transaction)。成功なら `true`。
-async fn recalc_batch_driver(run: &RecalcRun, driver: BatchDriver, kept: &ZipKudgivt) -> bool {
-    let unko_nos: HashSet<&str> = driver.rows.iter().map(|r| r.unko_no.as_str()).collect();
-    let mine =
-        |e: &&KudgivtRow| unko_nos.contains(e.unko_no.as_str()) || e.driver_cd == driver.driver_cd;
-    let kudgivt_rows: Vec<KudgivtRow> = kept.rows.iter().filter(mine).cloned().collect();
-    let (_, ferry) = read_split_outputs(run, &driver.rows, false).await;
-    let samples = kept.samples.clone();
-    let saved = match compute(run, &driver.rows, &kudgivt_rows, samples, &ferry).await {
+/// 一括の乗務員 1 人を、その乗務員の運行の分割の出力で計算して保存する (1 transaction)。成功なら `true`。
+/// KUDGIVT が 1 件も無ければ、その人だけ失敗に数える。
+async fn recalc_batch_driver(run: &RecalcRun, rows: Vec<KudguriRow>) -> bool {
+    let (kudgivt_rows, ferry) = read_split_outputs(run, &rows, true).await;
+    if kudgivt_rows.is_empty() && !rows.is_empty() {
+        run.warn("driver failed: kudgivt_not_found");
+        return false;
+    }
+    let samples = kudgivt_rows.clone();
+    let saved = match compute(run, &rows, &kudgivt_rows, samples, &ferry).await {
         Ok(daily) => {
             let all_unko_nos = Arc::new(pg::daily_unko_nos(&daily));
             let mut client = run.pg.lock().await;
@@ -527,70 +486,6 @@ async fn recalc_batch_driver(run: &RecalcRun, driver: BatchDriver, kept: &ZipKud
             run.warn(&format!("driver failed: db ({})", alc_worker_db::kind(&e)));
             false
         }
-    }
-}
-
-/// zip から残した KUDGIVT の行。
-#[derive(Default)]
-struct ZipKudgivt {
-    /// 対象の乗務員に関わる行 (重複を落とした後。読んだ順)
-    rows: Vec<KudgivtRow>,
-    /// event CD ごとに最初に出た行 (未登録の分類を登録する元。登録の順と名前を、全部の行を渡したときと同じにする)
-    samples: Vec<KudgivtRow>,
-}
-
-/// アップロードの zip を **1 本ずつ**読み (同時に 1 本だけ持つ)、KUDGIVT の行のうち `keep` に当たるものだけを残す。
-///
-/// 重複は `alc_csv_parser::kudgivt::dedup_kudgivt_rows` と同じ鍵 (運行NO・event CD・開始日時) で、全部の zip を通して
-/// 最初に出た行だけを数える (鍵は捨てた行のぶんも覚える)。なので残る行は「全部の行の重複を落としてから `keep` で絞った
-/// もの」と同じになる。読めない・無い・展開や parse ができない zip は飛ばし、その数を Warn に出す。
-async fn read_zip_kudgivt(
-    run: &RecalcRun,
-    keys: Vec<String>,
-    keep: impl Fn(&KudgivtRow) -> bool,
-) -> ZipKudgivt {
-    let mut seen: HashSet<(String, String, NaiveDateTime)> = HashSet::new();
-    let mut seen_event_cds: HashSet<String> = HashSet::new();
-    let mut kept = ZipKudgivt::default();
-    let mut unreadable = 0usize;
-    for key in keys {
-        let bytes = run.store.get(&key).await.ok().flatten();
-        let Some(events) = bytes.and_then(|b| zip_kudgivt(&b)) else {
-            unreadable += 1;
-            continue;
-        };
-        for row in events {
-            if !seen.insert((row.unko_no.clone(), row.event_cd.clone(), row.start_at)) {
-                continue;
-            }
-            if seen_event_cds.insert(row.event_cd.clone()) {
-                kept.samples.push(row.clone());
-            }
-            if keep(&row) {
-                kept.rows.push(row);
-            }
-        }
-    }
-    if unreadable > 0 {
-        run.warn(&format!("zip unavailable for {unreadable} upload(s)"));
-    }
-    kept
-}
-
-/// zip 1 本の KUDGIVT の行 (全エントリを展開して確かめ、KUDGIVT の行だけを返す。KUDGIVT が無ければ空)。
-/// 開けない・展開できない・parse できないは `None`。
-fn zip_kudgivt(bytes: &[u8]) -> Option<Vec<KudgivtRow>> {
-    let mut archive = Archive::open(bytes, MAX_UNCOMPRESSED_BYTES).ok()?;
-    let mut files: Vec<(String, Vec<u8>)> = Vec::new();
-    for index in 0..archive.len() {
-        let (name, entry) = archive.read_entry(index).ok()?;
-        if files.is_empty() && name.to_uppercase().contains("KUDGIVT") {
-            files.push((name, entry));
-        }
-    }
-    match alc_csv_parser::kudgivt_rows_in(&files) {
-        None => Some(Vec::new()),
-        Some(parsed) => parsed.ok(),
     }
 }
 

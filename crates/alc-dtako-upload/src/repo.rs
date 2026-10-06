@@ -63,13 +63,6 @@ pub mod sql {
                       OR o.reading_date >= $2 AND o.reading_date <= $3)
                ORDER BY o.reading_date, o.unko_no"#;
 
-    /// 乗務員ごとの再計算が読み直す zip の key。$1 tenant_id / $2 月初 → r2_zip_key (NULL 可。重複なし・key の順)。
-    /// 範囲は月初の 60 日前から (上の端なし)。
-    pub const LIST_ZIP_KEYS_FOR_RECALC: &str = r#"SELECT DISTINCT r2_zip_key FROM alc_api.dtako_upload_history
-               WHERE tenant_id = $1 AND status = 'completed'
-                 AND created_at >= ($2::date - interval '60 days')
-               ORDER BY r2_zip_key"#;
-
     /// 乗務員の id → 乗務員CD。$1 id / $2 tenant_id → driver_cd (NULL 可)。
     pub const SELECT_DRIVER_CD: &str =
         "SELECT driver_cd FROM alc_api.employees WHERE id = $1 AND tenant_id = $2";

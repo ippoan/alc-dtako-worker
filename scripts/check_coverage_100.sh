@@ -6,8 +6,14 @@
 #     cargo llvm-cov --locked -p alc-dtako-upload --text > cov.txt
 #     bash scripts/check_coverage_100.sh --use-cache cov.txt
 #
+#   crate ごとに別の回で計測した結果は、`--use-cache` を繰り返して 1 回で渡す (各回の報告は `-p` の crate の
+#   ファイルだけを持つので重ならない。ci.yml は dtako-upload・alc-compare・alc-csv-parser の 3 つを渡す):
+#
+#     bash scripts/check_coverage_100.sh --use-cache a.txt --use-cache b.txt --use-cache c.txt
+#
 #   `--use-cache` 無し (script が自分で `cargo llvm-cov --text` を打つ形) は使わない — 直下の package は
-#   wasm 専用の worker で、計測の対象は crates/alc-dtako-upload だけ。
+#   wasm 専用の worker で、計測の対象は crates/ の 3 crate だけ。
+#   この枠の中の説明と、`--use-cache` を繰り返せること (EXTERNAL_CACHES) だけが元からの変更。
 #
 # coverage_100.toml に登録されたファイルが 100% 行カバレッジを維持しているか検証する。
 #
@@ -46,13 +52,13 @@ usage() {
   echo "usage: $0 [--config <registry toml>] [--use-cache <llvm-cov --text output>]" >&2
 }
 
-EXTERNAL_CACHE=""
+EXTERNAL_CACHES=()
 CONFIG="coverage_100.toml"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --use-cache)
       [[ $# -ge 2 ]] || { echo "ERROR: --use-cache requires a file argument" >&2; usage; exit 2; }
-      EXTERNAL_CACHE="$2"; shift 2 ;;
+      EXTERNAL_CACHES+=("$2"); shift 2 ;;
     --config)
       [[ $# -ge 2 ]] || { echo "ERROR: --config requires a file argument" >&2; usage; exit 2; }
       CONFIG="$2"; shift 2 ;;
@@ -69,13 +75,15 @@ fi
 # --- カバレッジデータの用意 ---
 # ci.yml の "Upload coverage text (artifact)" が /tmp/llvm-cov-cache/text-*.txt を
 # 拾うので、mktemp ではなく安定パスに置く (mktemp だと artifact が常に空になる)。
-if [[ -n "$EXTERNAL_CACHE" ]]; then
-  if [[ ! -f "$EXTERNAL_CACHE" ]]; then
-    echo "ERROR: --use-cache file not found: $EXTERNAL_CACHE" >&2
-    exit 1
-  fi
-  echo "Using pre-built coverage data: $EXTERNAL_CACHE"
-  CACHE_FILE="$EXTERNAL_CACHE"
+if [[ ${#EXTERNAL_CACHES[@]} -gt 0 ]]; then
+  for f in "${EXTERNAL_CACHES[@]}"; do
+    if [[ ! -f "$f" ]]; then
+      echo "ERROR: --use-cache file not found: $f" >&2
+      exit 1
+    fi
+    echo "Using pre-built coverage data: $f"
+  done
+  CACHE_FILES=("${EXTERNAL_CACHES[@]}")
 else
   CACHE_DIR="/tmp/llvm-cov-cache"
   mkdir -p "$CACHE_DIR"
@@ -87,14 +95,16 @@ else
     tail -50 "$CACHE_FILE.stderr" >&2
     exit 101
   fi
+  CACHE_FILES=("$CACHE_FILE")
 fi
 
-python3 - "$CONFIG" "$CACHE_FILE" <<'PYEOF'
+python3 - "$CONFIG" "${CACHE_FILES[@]}" <<'PYEOF'
 import re
 import sys
 import tomllib
 
-config_path, cov_path = sys.argv[1], sys.argv[2]
+config_path, cov_paths = sys.argv[1], sys.argv[2:]
+cov_path = " ".join(cov_paths)
 
 with open(config_path, "rb") as fh:
     registered = [f["path"] for f in tomllib.load(fh).get("files", [])]
@@ -113,22 +123,23 @@ SCALE = {"": 1, "k": 1e3, "K": 1e3, "m": 1e6, "M": 1e6, "g": 1e9, "G": 1e9}
 
 # path -> {line_no: hit}
 files = {}
-cur = None
-with open(cov_path, encoding="utf-8", errors="replace") as fh:
-    for raw in fh:
-        line = raw.rstrip("\n")
-        m = HEADER.match(line)
-        if m:
-            cur = files.setdefault(m.group(1), {})
-            continue
-        if cur is None or UNCOUNTED.match(line):
-            continue
-        m = COUNTED.match(line)
-        if m:
-            ln = int(m.group(1))
-            hit = float(m.group(2)) * SCALE[m.group(3)]
-            # 同一行が複数リージョンで出ることがある。最大ヒットを採る
-            cur[ln] = max(cur.get(ln, 0.0), hit)
+for one_path in cov_paths:
+    cur = None
+    with open(one_path, encoding="utf-8", errors="replace") as fh:
+        for raw in fh:
+            line = raw.rstrip("\n")
+            m = HEADER.match(line)
+            if m:
+                cur = files.setdefault(m.group(1), {})
+                continue
+            if cur is None or UNCOUNTED.match(line):
+                continue
+            m = COUNTED.match(line)
+            if m:
+                ln = int(m.group(1))
+                hit = float(m.group(2)) * SCALE[m.group(3)]
+                # 同一行が複数リージョンで出ることがある。最大ヒットを採る
+                cur[ln] = max(cur.get(ln, 0.0), hit)
 
 
 def lookup(path):

@@ -16,6 +16,7 @@ tenant ヘッダー無しが 401・有りが 404 (どのリクエストも、そ
 |---|---|
 | 直下 (`Cargo.toml`・`wrangler.toml`・`src/`) | Worker 本体 (package `alc-dtako-worker`、wasm32-unknown-unknown)。workspace の root で、`Cargo.lock` はここの 1 つだけ。`src/lib.rs` (workers-rs への載せ方)・`src/db.rs` (DB への経路)・`src/r2.rs` (R2 の binding と待ちを、保存先の層に載せる実装)・`src/tcp.rs` (VPC の binding の extern) |
 | `crates/alc-dtako-upload/` | route の crate (package `alc-dtako-upload`)。口 (`src/routes.rs`)・取り込みの流れ (`src/ingest.rs`)・分割の流れ (`src/split.rs`)・zip の展開 (`src/archive.rs`。私有)・段ごとの所要 (`src/timing.rs`)・SQL の定数 (`src/repo.rs` の `sql`)・それを流す tokio-postgres 実装 (`src/pg.rs`)・保存先の抽象と PUT のやり直し (`src/store.rs`)。接続も R2 の実装も持たない (張るのは Worker とテスト。テストの DB は process の中で起こす組み込みの PostgreSQL — 下の「DB の検査」) |
+| `crates/alc-csv-parser/`・`crates/alc-compare/` | backend (ippoan/rust-alc-api) と共有の計算 crate。**正本はこの repo** (ippoan/rust-alc-api の `crates/` の 79029aa から中身を変えずに写した。Refs ippoan/rust-alc-api#736)。`alc-csv-parser` = KUDGURI・KUDGIVT の parse・分割 (`split_csv_entry`)・変更記録の合成、`alc-compare` = 日別の集計 (`upload_daily::compute_daily_hours`)。compare は csv-parser を path で引く (`default-features = false`)。`BUILD.bazel` は写した元のまま (この repo では使わない) |
 | `scripts/` | 公開範囲の検査 (`check-exposure.sh` と陰性対照 `check-exposure-test.sh`)、`fetch-migrations.sh` (版は `ALC_MIGRATIONS_REV`)、coverage の gate (`check_coverage_100.sh`、登録簿は直下の `coverage_100.toml`) |
 | `.github/workflows/` | `ci.yml` (検査) / `deploy.yml` (デプロイ) / `tag-release.yml` (本番用のタグ) |
 
@@ -29,12 +30,16 @@ tenant ヘッダー無しが 401・有りが 404 (どのリクエストも、そ
   ```bash
   cargo tree -i alc-core-wasm --target wasm32-unknown-unknown   # 出どころが 1 つだけ
   ```
-- **`alc-csv-parser`** (分割の純粋な部分 `split_csv_entry`・`cap_sorted`。backend と同じ関数を呼ぶ) も ippoan/rust-alc-api の crate。
-  `alc-core-wasm` と**同じ rev** で、同じく `[workspace.dependencies]` の 1 か所に書く (`default-features = false` = zip の展開を引かない。
-  zip の既定 features は C の依存を連れてきて wasm32 に載らないので、展開は route の crate が `zip` を deflate だけで直接引く)。
-- **`alc-compare`** (日別の労働時間とセグメントの計算 `upload_daily::compute_daily_hours`。backend と同じ関数を呼ぶ) も ippoan/rust-alc-api の crate。
-  上の 2 つと**同じ rev** (3 行とも同じ値) で、同じく `[workspace.dependencies]` の 1 か所に書く。`alc-csv-parser` を中から引くので、
+- **`alc-csv-parser`** (分割の純粋な部分 `split_csv_entry`・`cap_sorted`。backend と同じ関数を呼ぶ) と **`alc-compare`** (日別の労働時間とセグメントの計算
+  `upload_daily::compute_daily_hours`) は、**正本がこの repo の `crates/`** (path 依存。Refs ippoan/rust-alc-api#736)。写した元は ippoan/rust-alc-api の
+  `crates/` の `79029aa733135f0c3c11e06556eeabd5403176a1` (中身は変えていない)。rust-alc-api は後の段でここから git 依存で引く。**それまで 2 crate を直すときは、
+  両方の repo に入れる** (片方だけだと Cloud Run と worker で計算が食い違う)。`[workspace.dependencies]` の 1 か所に path で書く
+  (csv-parser は `default-features = false` = zip の展開を引かない。zip の既定 features は C の依存を連れてきて wasm32 に載らないので、
+  展開は route の crate が `zip` を deflate だけで直接引く)。`alc-compare` は `alc-csv-parser` を中から引くので、
   `cargo tree -i alc-csv-parser --target wasm32-unknown-unknown` で出どころが 1 つだけ (直接と `alc-compare` 経由が同じもの) を確かめる。
+  2 crate のテストは CI で crate ごとに別の回で計測する (`cargo llvm-cov -p alc-compare` / `-p alc-csv-parser`。本数は `ci.yml` に固定)。
+  csv-parser を単独で build・clippy するときは既定の `zip-extract` が付くので、native では zip の C の依存 (bzip2・xz2 等) が `Cargo.lock` に在る
+  (wasm32 の検査は `--no-default-features`。本番の wasm には入らない)。
 - **`alc-worker-db`** (テナントの transaction の部品 `PgClient`・`TenantTx`・`TxOutput`) は ippoan/alc-worker-kit (public) に在る。
   同じく直下の `[workspace.dependencies]` に **git 依存・rev 固定で 1 か所だけ**書く (feature `chrono`。
   出どころが 2 つになると `PgClient` が別の型になる)。
@@ -289,7 +294,7 @@ rust-alc-api の同じ口と同じ仕事。流れは `recalc.rs` (月の全員�
 アップロード済みの zip を R2 から読み、CSV を運行NO ごとに分けて R2 に置き、KUDGIVT を置けた運行に印 (`has_kudgivt`) を付ける。
 backend (ippoan/rust-alc-api) の `POST /api/split-csv/{upload_id}` と同じ仕事で、**置く key (`{テナント}/unko/{運行NO}/{CSV名}`) と
 中身のバイト列は backend と同じ** (読む側が object の ETag を指紋に使う)。1 エントリを分ける本体は、backend と共有の
-`alc_csv_parser::split_csv_entry` を呼ぶ (写しを持たない。`alc-csv-parser` は ippoan/rust-alc-api の crate)。
+`alc_csv_parser::split_csv_entry` を呼ぶ (写しを持たない。`alc-csv-parser` の正本はこの repo の `crates/alc-csv-parser`。backend も同じ crate を使う)。
 
 - 流れ (`src/split.rs` の `split_upload`。axum に依らない): zip の key を引く → zip を読む → **全エントリが展開できることを先に確かめる**
   (ここまでは何も書かない) → エントリを 1 つずつ「展開 → 分ける → 置く (失敗したものだけやり直す)」→ KUDGIVT を置けた運行に印。
@@ -390,12 +395,17 @@ backend (ippoan/rust-alc-api) の `POST /api/split-csv/{upload_id}` と同じ仕
 bash scripts/check-exposure.sh && bash scripts/check-exposure-test.sh
 cargo fmt --check
 cargo clippy --locked --target wasm32-unknown-unknown --release -- -D warnings
+cargo clippy --locked -p alc-compare -p alc-csv-parser -- -D warnings
+cargo clippy --locked --target wasm32-unknown-unknown --release -p alc-compare -p alc-csv-parser --lib --no-default-features -- -D warnings
 cargo install worker-build@0.8.7 --locked
 worker-build --release
 npx wrangler@4.144.0 deploy --dry-run            # 配信しない
 npx wrangler@4.144.0 deploy --dry-run --env staging
 bash scripts/fetch-migrations.sh                 # 下の「DB の検査」
-cargo llvm-cov --locked -p alc-dtako-upload --text > cov.txt && bash scripts/check_coverage_100.sh --use-cache cov.txt
+for p in alc-dtako-upload alc-compare alc-csv-parser; do                # crate ごとに別の回で測る
+  cargo llvm-cov clean --workspace && cargo llvm-cov --locked -p $p --text > cov-$p.txt
+done
+bash scripts/check_coverage_100.sh --use-cache cov-alc-dtako-upload.txt --use-cache cov-alc-compare.txt --use-cache cov-alc-csv-parser.txt
 ```
 
 toolchain は CI の `dtolnay/rust-toolchain@1.92.0` (`rust-toolchain.toml` は置いていない)。
@@ -409,8 +419,11 @@ docker も外の DB も env も要らない。`#[ignore]` ではない。
 ```bash
 bash scripts/fetch-migrations.sh                                        # 先に要る (テストが .alc-migrations の SQL を流す)
 cargo test -p alc-dtako-upload --test sql_db
-# coverage の gate つき (CI はこの形の 1 回だけ。cargo-llvm-cov が要る)
-cargo llvm-cov --locked -p alc-dtako-upload --text > cov.txt && bash scripts/check_coverage_100.sh --use-cache cov.txt
+# coverage の gate つき (cargo-llvm-cov が要る。CI は dtako-upload を計測つきで 1 回だけ走らせ、共通の計算 crate 2 つは別の回で測る)
+for p in alc-dtako-upload alc-compare alc-csv-parser; do                # crate ごとに別の回で測る
+  cargo llvm-cov clean --workspace && cargo llvm-cov --locked -p $p --text > cov-$p.txt
+done
+bash scripts/check_coverage_100.sh --use-cache cov-alc-dtako-upload.txt --use-cache cov-alc-compare.txt --use-cache cov-alc-csv-parser.txt
 ```
 
 `tests/upload_flow.rs` (16 本。口から、組み込みの PostgreSQL と偽の保存先まで) はアップロードの口 (7 本)・やり直しの口 (2 本)・履歴の読み取り口 (3 本)・月の全員の再計算の口 (2 本)・乗務員ごとの再計算の口 (2 本) を確かめる。zip はテストの中で作る

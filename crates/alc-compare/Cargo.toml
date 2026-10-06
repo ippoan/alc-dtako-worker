@@ -1,0 +1,17 @@
+[package]
+name = "alc-compare"
+version = "0.1.0"
+edition = "2021"
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(coverage)'] }
+
+[dependencies]
+# zip の展開 (feature `zip-extract`) は使わない (wasm32 でも build できる形にしておく)
+alc-csv-parser = { path = "../alc-csv-parser", default-features = false }
+chrono = { version = "0.4", features = ["serde"] }
+encoding_rs = "0.8"
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1"

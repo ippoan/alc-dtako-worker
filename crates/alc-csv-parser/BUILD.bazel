@@ -1,0 +1,20 @@
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+load("@crates//:defs.bzl", "all_crate_deps")
+
+rust_library(
+    name = "alc-csv-parser",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "alc_csv_parser",
+    # Cargo の既定の features (Cargo.toml の `default`) を Bazel は自動では読まない
+    crate_features = ["zip-extract"],
+    deps = all_crate_deps(normal = True),
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    visibility = ["//visibility:public"],
+)
+
+rust_test(
+    name = "alc-csv-parser_test",
+    crate = ":alc-csv-parser",
+    # zip のテスト (`extract_zip`) が黙って外れないよう、test にも明示する
+    crate_features = ["zip-extract"],
+)

@@ -44,7 +44,7 @@ npx wrangler@4.144.0 deploy --dry-run [--env staging]                   # 配信
 
 ## rev を上げる手順
 - **`alc-csv-parser`・`alc-compare` の正本はこの repo の `crates/`** (path 依存。ippoan/rust-alc-api 79029aa から写した。Refs ippoan/rust-alc-api#736)。rust-alc-api が後の段でここから引くまでは、直すときは**両方の repo に入れる**。
-- **`alc-core-wasm`** (ippoan/rust-alc-api) と **`alc-worker-db`** (ippoan/alc-worker-kit): 直下の `Cargo.toml` の
-  `[workspace.dependencies]` の `rev` を変え (**書くのはここだけ**)、`cargo update -p <名前>` で `Cargo.lock` も更新する。その後
+- **`alc-core-wasm`** と **`alc-worker-db`** (どちらも ippoan/alc-worker-kit。**2 つは同じ rev で一緒に上げる**): 直下の `Cargo.toml` の
+  `[workspace.dependencies]` の `rev` を変え (**書くのはここだけ**)、`cargo update -p alc-core-wasm -p alc-worker-db` で `Cargo.lock` も更新する。その後
   `cargo tree -i <名前> --target wasm32-unknown-unknown` で出どころが 1 つだけ (`worker`・`tokio-postgres` も版が 1 つ) を確かめ、テストを通す (分割の出力の固定の期待値 `split_output_matches_hand_written_bytes` が上げる前後とも通ること)。
 - **alc-migrations** (テストが流す SQL): `scripts/ALC_MIGRATIONS_REV` の 1 行 (**rev を書くのはここだけ**。ippoan/rust-alc-api が固定している rev と揃える)。

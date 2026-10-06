@@ -22,7 +22,8 @@ tenant ヘッダー無しが 401・有りが 404 (どのリクエストも、そ
 
 ## 依存の取り方
 
-- **`alc-core-wasm`** は ippoan/rust-alc-api (public) に残る。直下の `Cargo.toml` の `[workspace.dependencies]` に
+- **`alc-core-wasm`** は ippoan/alc-worker-kit (public) から引く (正本を ippoan/rust-alc-api から kit へ移した。Refs ippoan/rust-alc-api#736。
+  中身は前に引いていた rust-alc-api e144318 のものと同じ)。**`alc-worker-db` と同じ kit の rev** で、直下の `Cargo.toml` の `[workspace.dependencies]` に
   **git 依存・rev 固定で 1 か所だけ**書き、Worker と `crates/alc-dtako-upload` は `workspace = true` で継承する。
   出どころが 2 つになると `TenantId` が別の型になり、**コンパイルは通るのに全リクエストが 500** になる
   (layer が入れる型と route が取り出す型が合わない)。確かめ方:
@@ -41,8 +42,8 @@ tenant ヘッダー無しが 401・有りが 404 (どのリクエストも、そ
   csv-parser を単独で build・clippy するときは既定の `zip-extract` が付くので、native では zip の C の依存 (bzip2・xz2 等) が `Cargo.lock` に在る
   (wasm32 の検査は `--no-default-features`。本番の wasm には入らない)。
 - **`alc-worker-db`** (テナントの transaction の部品 `PgClient`・`TenantTx`・`TxOutput`) は ippoan/alc-worker-kit (public) に在る。
-  同じく直下の `[workspace.dependencies]` に **git 依存・rev 固定で 1 か所だけ**書く (feature `chrono`。
-  出どころが 2 つになると `PgClient` が別の型になる)。
+  同じく直下の `[workspace.dependencies]` に **git 依存・rev 固定で 1 か所だけ**書く (feature `chrono`。`alc-core-wasm` と同じ rev。
+  出どころが 2 つになると `PgClient` が別の型になる。同じ git URL の 2 つの rev を混ぜない)。
 - テストが流す SQL (`init_local_db.sql`・`local_app_grants.sql`・`migrations/`) は、写しを置かず、正本の ippoan/alc-migrations (public) から
   **版を固定して**取る。版は `scripts/ALC_MIGRATIONS_REV` の 1 行 (**rev を書くのはこのファイルだけ**)。`bash scripts/fetch-migrations.sh` が
   repo 直下の `.alc-migrations/` (`.gitignore` 済み) に取り出す (同じ rev が在れば何もしない)。**テスト・coverage の計測の前に必ず通す。**

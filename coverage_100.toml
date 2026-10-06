@@ -1,10 +1,13 @@
 # 行カバレッジ 100% の登録簿 (ippoan/alc-vein-worker の同名のファイルの形。Refs ippoan/rust-alc-api#725)。
 #
 #   bash scripts/fetch-migrations.sh
-#   cargo llvm-cov --locked -p alc-dtako-upload --text > cov.txt
-#   bash scripts/check_coverage_100.sh --use-cache cov.txt
+#   for p in alc-dtako-upload alc-compare alc-csv-parser; do
+#     cargo llvm-cov clean --workspace && cargo llvm-cov --locked -p $p --text > cov-$p.txt
+#   done
+#   bash scripts/check_coverage_100.sh --use-cache cov-alc-dtako-upload.txt --use-cache cov-alc-compare.txt --use-cache cov-alc-csv-parser.txt
 #
-# 計測するのは `cargo test -p alc-dtako-upload` の全部 = tests/sql_db.rs (テストの中で起こす組み込みの PostgreSQL。
+# crate ごとに別の回で計測する (共通の計算 crate 2 つの分は末尾)。
+# dtako-upload の回で計測するのは `cargo test -p alc-dtako-upload` の全部 = tests/sql_db.rs (テストの中で起こす組み込みの PostgreSQL。
 # docker は要らないが、先に `bash scripts/fetch-migrations.sh` が要る — 無ければテストが落ちる)・tests/store.rs (偽の保存先)・
 # tests/split_flow.rs・tests/upload_flow.rs (口から DB・偽の保存先まで)。
 # 登録したファイルが計測に出ない・実行行が 0 のときも落ちる。
@@ -42,3 +45,32 @@ path = "crates/alc-dtako-upload/src/timing.rs"
 # 口 (同上。400 / 404 / 500 の本文とログまで)
 [[files]]
 path = "crates/alc-dtako-upload/src/routes.rs"
+
+# --- 共通の計算 crate 2 つ (正本はこの repo。ippoan/rust-alc-api 79029aa の coverage_100.toml から登録を写した。Refs ippoan/rust-alc-api#736) ---
+# 計測は crate ごとに別の回 (`cargo llvm-cov -p alc-compare` / `-p alc-csv-parser`。ci.yml)。crate 自身のテストだけで 100% にする。
+
+# --- alc-csv-parser ---
+
+[[files]]
+path = "crates/alc-csv-parser/src/lib.rs"
+
+[[files]]
+path = "crates/alc-csv-parser/src/kudgivt.rs"
+
+[[files]]
+path = "crates/alc-csv-parser/src/kudguri.rs"
+
+[[files]]
+path = "crates/alc-csv-parser/src/operation_changes.rs"
+
+[[files]]
+path = "crates/alc-csv-parser/src/work_segments.rs"
+
+# --- alc-compare ---
+
+# crates/alc-compare/src/lib.rs は元が type = "combined" (rust-alc-api では backend 側のテストも踏んでいた)。
+# crate 自身のテストだけでは 4022/4023 行 (`parse_restraint_csv` の空行の `continue` が未到達) なので、まだ登録しない。
+# 空行を含む CSV のテストを足したら登録する (写した中身を変えない今回とは別の変更)。
+
+[[files]]
+path = "crates/alc-compare/src/upload_daily.rs"

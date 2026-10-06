@@ -14,21 +14,23 @@ publish = false
 crate-type = ["cdylib"]
 
 [workspace]
-members = ["crates/alc-dtako-upload"]
+members = ["crates/alc-dtako-upload", "crates/alc-compare", "crates/alc-csv-parser"]
 
 # alc-core-wasm は ippoan/rust-alc-api に残る。git 依存・rev 固定で引き、**書くのはここ 1 か所だけ**
 # (worker と crates/alc-dtako-upload は `workspace = true` で継承する)。出どころが 2 つになると `TenantId` が
 # 別の型になり、コンパイルは通るのに全リクエストが 500 になる (layer が入れる型と route が取り出す型が合わない)。
 # rev を上げるときは Cargo.lock も一緒に更新する (CLAUDE.md)。
 # alc-worker-db (ippoan/alc-worker-kit) も同じ (出どころを 2 つにしない。`PgClient` が別の型になる)。
-# alc-csv-parser (ippoan/rust-alc-api) も同じ。alc-worker-db の rev は ippoan/alc-vein-worker と揃えている。
+# alc-worker-db の rev は ippoan/alc-vein-worker と揃えている。
+# alc-csv-parser・alc-compare の正本はこの repo の crates/ (ippoan/rust-alc-api の 79029aa から写した。Refs ippoan/rust-alc-api#736)。
+# path 依存で、書くのはここ 1 か所だけ (出どころを 2 つにしない)。
 [workspace.dependencies]
 alc-core-wasm = { git = "https://github.com/ippoan/rust-alc-api", rev = "e14431855deb4ac6d3937af3c7db86addc7db9e7" }
-# 分割の純粋な部分 (`split_csv_entry`・`cap_sorted`)。backend と同じ関数を呼ぶ (写さない)。alc-core-wasm と同じ repo なので rev を揃える。
+# 分割の純粋な部分 (`split_csv_entry`・`cap_sorted`)。backend と同じ関数を呼ぶ (写さない)。
 # zip の展開 (feature `zip-extract`) は引かない (zip の既定 features が C の依存を連れてきて wasm32 に載らない)
-alc-csv-parser = { git = "https://github.com/ippoan/rust-alc-api", rev = "e14431855deb4ac6d3937af3c7db86addc7db9e7", default-features = false }
-# 日別の集計の計算 (`upload_daily::compute_daily_hours`)。backend と同じ関数を呼ぶ。alc-core-wasm・alc-csv-parser と同じ rev
-alc-compare = { git = "https://github.com/ippoan/rust-alc-api", rev = "e14431855deb4ac6d3937af3c7db86addc7db9e7" }
+alc-csv-parser = { path = "crates/alc-csv-parser", default-features = false }
+# 日別の集計の計算 (`upload_daily::compute_daily_hours`)。backend と同じ関数を呼ぶ
+alc-compare = { path = "crates/alc-compare" }
 alc-worker-db = { git = "https://github.com/ippoan/alc-worker-kit", rev = "6e8b169846e068a93fa367f963a578b7422f5db8", features = ["chrono"] }
 
 # 使わない依存は入れない

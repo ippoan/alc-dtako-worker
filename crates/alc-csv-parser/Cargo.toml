@@ -1,0 +1,20 @@
+[package]
+name = "alc-csv-parser"
+version = "0.1.0"
+edition = "2021"
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(coverage)'] }
+
+# `zip-extract` (既定 on) = `extract_zip`。wasm32 (分割 worker) は `--no-default-features` で引く
+# (zip の既定 features が C の依存を連れてくるため。zip の features 自体は変えない = backend が開ける圧縮方式を変えない)
+[features]
+default = ["zip-extract"]
+zip-extract = ["dep:zip"]
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+encoding_rs = "0.8"
+serde_json = "1"
+zip = { version = "2", optional = true }

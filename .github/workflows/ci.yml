@@ -1,7 +1,7 @@
 name: CI
 
 # デジタコの運行 CSV の Worker alc-dtako の検査 (ippoan/alc-vein-worker の ci.yml の形。Refs ippoan/rust-alc-api#725)。
-# 公開範囲の検査・fmt・clippy・crates/alc-dtako-upload の DB のテストと coverage の gate・wasm のビルド。
+# 公開範囲の検査・fmt・clippy・crates/alc-dtako-upload の DB のテストと共通の計算 crate 2 つのテスト・coverage の gate・wasm のビルド。
 # デプロイは deploy.yml (別 workflow)。
 on:
   pull_request:
@@ -45,14 +45,21 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo fmt --check
       - run: cargo clippy --locked --target wasm32-unknown-unknown --release -- -D warnings
+      # 共通の計算 crate 2 つ (正本はこの repo。Refs ippoan/rust-alc-api#736)。native は rust-alc-api と同じ形 (`--tests` 無し)。
+      # wasm32 は alc-csv-parser の既定 feature `zip-extract` (zip の C の依存) を外す (worker が引く形と同じ)
+      - run: cargo clippy --locked -p alc-compare -p alc-csv-parser -- -D warnings
+      - run: cargo clippy --locked --target wasm32-unknown-unknown --release -p alc-compare -p alc-csv-parser --lib --no-default-features -- -D warnings
       # テスト (組み込みの PostgreSQL) が流す SQL を ippoan/alc-migrations から取る (版は scripts/ALC_MIGRATIONS_REV)
       - run: bash scripts/fetch-migrations.sh
       - uses: taiki-e/install-action@cargo-llvm-cov
       # crates/alc-dtako-upload の tests/sql_db.rs (組み込みの PostgreSQL。docker も env も要らない)・tests/store.rs
       # (偽の保存先)・tests/split_flow.rs・tests/upload_flow.rs (口から DB・偽の保存先まで) を、計測つきで 1 回だけ走らせる (素の cargo test と分けると、dev-dependency を 2 回 compile することになる)。
       # テストの target ごとに本数を固定する (減ったら落ちる。テストを足したらここの数も上げる)。
+      # 共通の計算 crate 2 つ (alc-compare・alc-csv-parser) は、dtako-upload とは別の回で計測する (feature をまとめない。
+      # 各回の前に clean するので、ほかの crate のテストが踏んだ行を数えない)。llvm-cov の下では `cfg_attr(not(coverage), ignore)` の
+      # テストも走るので、本数は ignored 0 で固定する。gate は 3 回の報告をまとめて 1 回で見る。
       # 行カバレッジ 100% の gate の登録簿は直下の coverage_100.toml
-      - name: sql_db・store・split_flow・upload_flow + Coverage 100% gate (crates/alc-dtako-upload)
+      - name: sql_db・store・split_flow・upload_flow・alc-compare・alc-csv-parser + Coverage 100% gate
         run: |
           set -o pipefail
           # 前の計測の残り (cache から戻った profraw) を数えない
@@ -67,10 +74,20 @@ jobs:
             | grep -Eq '^test result: ok\. 20 passed; 0 failed; 0 ignored'
           awk '/Running.*tests\/upload_flow\.rs \(/{f=1} f && /^test result:/{print; exit}' "$RUNNER_TEMP/alc-dtako-upload-test.txt" \
             | grep -Eq '^test result: ok\. 16 passed; 0 failed; 0 ignored'
-          cov="$RUNNER_TEMP/alc-dtako-upload-cov.txt"
           # -p を付けないと直下の package (worker) だけが対象になり、報告が空になる
-          cargo llvm-cov report --locked -p alc-dtako-upload --text > "$cov"
-          bash scripts/check_coverage_100.sh --use-cache "$cov"
+          cargo llvm-cov report --locked -p alc-dtako-upload --text > "$RUNNER_TEMP/alc-dtako-upload-cov.txt"
+          for c in alc-compare:128 alc-csv-parser:67; do
+            name="${c%%:*}"; count="${c##*:}"
+            cargo llvm-cov clean --workspace
+            cargo llvm-cov --locked -p "$name" --no-report 2>&1 | tee "$RUNNER_TEMP/$name-test.txt"
+            awk '/Running unittests src\/lib\.rs \(/{f=1} f && /^test result:/{print; exit}' "$RUNNER_TEMP/$name-test.txt" \
+              | grep -Eq "^test result: ok\. $count passed; 0 failed; 0 ignored"
+            cargo llvm-cov report --locked -p "$name" --text > "$RUNNER_TEMP/$name-cov.txt"
+          done
+          bash scripts/check_coverage_100.sh \
+            --use-cache "$RUNNER_TEMP/alc-dtako-upload-cov.txt" \
+            --use-cache "$RUNNER_TEMP/alc-compare-cov.txt" \
+            --use-cache "$RUNNER_TEMP/alc-csv-parser-cov.txt"
       # worker-build の版は wrangler.toml の [build] command と揃える
       - run: cargo install -q worker-build@0.8.7 --locked
       - run: worker-build --release

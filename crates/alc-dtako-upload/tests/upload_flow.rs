@@ -2208,8 +2208,10 @@ async fn recalculate_drivers_reads_split_outputs_and_reports_fixed_words() {
         .await;
     let (_, events, _) = recalc_driver(ctx.app(t), 3, &one).await;
     assert_eq!(events, [start.clone(), error("internal_error")]);
+    // 一括は、その人たちを引けず、消す対象の運行NO の一覧 (月の運行) も読めないので、全体を internal_error で終える
     let (_, events, _) = recalc_drivers(ctx.app(t), 3, &[&one, &three]).await;
-    assert_eq!(events, two(0, 2));
+    let both = json!({ "event": "batch_start", "total_drivers": 2 });
+    assert_eq!(events, [both, error("internal_error")]);
     let tail: Vec<_> = recalc_logs(&ctx).split_off(want_logs.len());
     let kinds: Vec<&str> = tail.iter().map(|(_, m)| m.as_str()).collect();
     assert_eq!(
@@ -2218,6 +2220,7 @@ async fn recalculate_drivers_reads_split_outputs_and_reports_fixed_words() {
             "recalculate-driver failed: db (42501)",
             "recalculate-drivers: driver failed: db (42501)",
             "recalculate-drivers: driver failed: db (42501)",
+            "recalculate-drivers failed: db (42501)",
         ]
     );
     // 別テナントの日別は、どれにも触れられていない
@@ -2307,5 +2310,104 @@ async fn recalculate_drivers_counts_only_the_driver_without_kudgivt() {
     let not_found = json!({ "event": "error", "message": "kudgivt_not_found" });
     assert_eq!(events, [start, not_found]);
     ctx.assert_no_identifiers(t, &[&body, &body_one], &["U-8001", "D-THREE", &three]);
+    ctx.finish().await;
+}
+
+impl Ctx {
+    /// 古い日別の行を足す (`driver_cd` の乗務員の 2026-03-`day`。`unko_no` を運行NO に持つ。今の計算には出ない)。
+    async fn stale_day(&self, tenant_id: Uuid, driver_cd: &str, day: u32, unko_no: &str) {
+        let sql = format!(
+            "INSERT INTO dtako_daily_work_hours (tenant_id, driver_id, work_date, start_time, total_work_minutes, \
+             total_drive_minutes, total_rest_minutes, late_night_minutes, drive_minutes, cargo_minutes, total_distance, \
+             operation_count, unko_nos) \
+             SELECT $1, id, DATE '2026-03-{day:02}', TIME '08:00', 1, 1, 0, 0, 1, 0, 0, 1, ARRAY['{unko_no}'] \
+             FROM employees WHERE tenant_id = $1 AND driver_cd = '{driver_cd}'"
+        );
+        let mut c = self.pg.inner.lock().await;
+        assert_eq!(exec(&mut c, tenant_id, &sql).await, 1);
+    }
+
+    /// 古い日別の行 (2026-03-20 より後の日) の `(乗務員CD, 日)`。
+    async fn stale_days(&self, tenant_id: Uuid) -> Vec<(String, String)> {
+        let query = "SELECT e.driver_cd, h.work_date FROM dtako_daily_work_hours h \
+                     JOIN employees e ON e.id = h.driver_id \
+                     WHERE h.tenant_id = $1 AND h.work_date > DATE '2026-03-20' ORDER BY e.driver_cd, h.work_date";
+        let rows = self.rows(tenant_id, query).await;
+        let pick = |r: &Value| {
+            let cd = r["driver_cd"].as_str().unwrap().to_owned();
+            (cd, r["work_date"].as_str().unwrap().to_owned())
+        };
+        rows.iter().map(pick).collect()
+    }
+
+    /// 古い行を 3 つ足す: D-ONE の、月の別の乗務員の運行 (U-8001) を持つ行 (3/25)・日エントリを保存しない運行 (U-6003。乗務員が無い) を持つ行 (3/26)・D-THREE の、U-6003 を持つ行 (3/27)。
+    async fn add_stale_days(&self, tenant_id: Uuid) {
+        self.stale_day(tenant_id, "D-ONE", 25, "U-8001").await;
+        self.stale_day(tenant_id, "D-ONE", 26, "U-6003").await;
+        self.stale_day(tenant_id, "D-THREE", 27, "U-6003").await;
+    }
+}
+
+/// 3 つの再計算の口は、消す対象の運行NO を、その月の再計算の対象の運行のものに揃える。今の計算に出ない運行NO を持つ古い行
+/// (別の乗務員の運行・日エントリを保存しない運行) は、月の全員・1 人・一括のどれでも消える。消すのは、
+/// 日エントリの在る乗務員の行だけ (1 人の口は、ほかの乗務員の同じ形の行を消さない)。結果は 3 口とも同じ。
+#[tokio::test(flavor = "multi_thread")]
+async fn recalculation_deletes_stale_days_of_the_months_operations_in_every_entry() {
+    let ctx = Ctx::start().await;
+    let t = ctx.tenant("Dtako Recalc Delete Scope Tenant").await;
+    let (first, second) = driver_zips();
+    ctx.upload_ok(t, "first.zip", &first).await;
+    ctx.upload_ok(t, "second.zip", &second).await;
+    // 乗務員の無い運行 (U-6003。日エントリを保存しない。月の運行には入るが、どの乗務員の運行にも入らない)
+    let no_entry = upload_zip(&[kudguri_line("U-6003", 1, "D-ONE", 20, 8, 17)], &[]);
+    ctx.upload_ok(t, "no-entry.zip", &no_entry).await;
+    {
+        let mut c = ctx.pg.inner.lock().await;
+        let unset = "UPDATE dtako_operations SET driver_id = NULL WHERE tenant_id = $1 AND unko_no = 'U-6003'";
+        assert_eq!(exec(&mut c, t, unset).await, 1);
+    }
+    let (status, _, _) = recalc(ctx.app(t), "year=2026&month=3").await;
+    assert_eq!(status, StatusCode::OK);
+    let baseline = ctx.rows(t, DAYS_QUERY).await;
+    let one_of = |rows: &[Value]| -> Vec<Value> {
+        let one = |r: &&Value| r["driver_cd"] == "D-ONE";
+        rows.iter().filter(one).cloned().collect()
+    };
+    let baseline_one = one_of(&baseline);
+    assert_eq!(baseline_one.len(), 2);
+    assert_eq!(ctx.stale_days(t).await, []);
+    let one = ctx.driver_id(t, "D-ONE").await;
+    let only_three = [("D-THREE".to_owned(), "2026-03-27".to_owned())];
+
+    // 1 人の口: D-ONE の古い 2 行は消え、D-THREE の同じ形の行は残る。D-ONE の結果は月の全員の口と同じ
+    ctx.add_stale_days(t).await;
+    assert_eq!(ctx.stale_days(t).await.len(), 3);
+    let (status, events, _) = recalc_driver(ctx.app(t), 3, &one).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        events.last().unwrap(),
+        &json!({ "event": "done", "total": 2 })
+    );
+    assert_eq!(ctx.stale_days(t).await, only_three);
+    assert_eq!(one_of(&ctx.rows(t, DAYS_QUERY).await), baseline_one);
+
+    // 一括の口: 同じ
+    ctx.stale_day(t, "D-ONE", 25, "U-8001").await;
+    ctx.stale_day(t, "D-ONE", 26, "U-6003").await;
+    assert_eq!(ctx.stale_days(t).await.len(), 3);
+    let (status, events, _) = recalc_drivers(ctx.app(t), 3, &[&one]).await;
+    assert_eq!(status, StatusCode::OK);
+    let done = json!({ "event": "batch_done", "total": 1, "done": 1, "errors": 0 });
+    assert_eq!(events.last().unwrap(), &done);
+    assert_eq!(ctx.stale_days(t).await, only_three);
+    assert_eq!(one_of(&ctx.rows(t, DAYS_QUERY).await), baseline_one);
+
+    // 月の全員の口: 3 行とも消える (D-THREE も日エントリが在る)。結果は同じ
+    ctx.stale_day(t, "D-ONE", 25, "U-8001").await;
+    ctx.stale_day(t, "D-ONE", 26, "U-6003").await;
+    let (status, _, _) = recalc(ctx.app(t), "year=2026&month=3").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(ctx.stale_days(t).await, []);
+    assert_eq!(ctx.rows(t, DAYS_QUERY).await, baseline);
     ctx.finish().await;
 }

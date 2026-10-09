@@ -2728,3 +2728,527 @@ async fn upload_skips_the_daily_recalc_over_the_get_limit() {
     ctx.assert_no_identifiers(t, &[], &["U-8001", "U-9001", "D-THREE", "D-FOUR"]);
     ctx.finish().await;
 }
+
+// ---- 取り込みの後の計算し直しを束ねの範囲に縮める (Refs ippoan/alc-dtako-worker#23) ----
+
+/// `"MM/DD hh:mm"` (2026 年) → CSV の日時。
+fn csv_at(at: &str) -> String {
+    format!("2026/{at}:00")
+}
+
+/// `"MM/DD hh:mm"` (2026 年) → CSV の日付。
+fn csv_day(at: &str) -> String {
+    format!("2026/{}", &at[..5])
+}
+
+/// 運行 1 つ: 運行NO・出発・帰着 (`"MM/DD hh:mm"`。出発が空なら日時の無い運行で、帰着に `"MM/DD"` の日を入れる)・
+/// KUDGIVT (開始・イベントCD・分)。
+type Op = (
+    &'static str,
+    &'static str,
+    &'static str,
+    Vec<(&'static str, &'static str, i32)>,
+);
+
+/// 出発から帰着まで運転するだけの運行 (`minutes` = 運転の分)。
+fn drive(unko_no: &'static str, dep: &'static str, ret: &'static str, minutes: i32) -> Op {
+    (unko_no, dep, ret, vec![(dep, "201", minutes)])
+}
+
+/// [`Op`] の KUDGURI の 1 行 (主乗務)。運行日 = 出発の日、読取日 = 帰着の日。
+fn op_line(driver_cd: &str, op: &Op) -> String {
+    let (unko_no, dep, ret, _) = op;
+    let (operation_day, reading_day, times) = if dep.is_empty() {
+        (csv_day(ret), csv_day(ret), ",".to_owned())
+    } else {
+        (
+            csv_day(dep),
+            csv_day(ret),
+            format!("{},{}", csv_at(dep), csv_at(ret)),
+        )
+    };
+    format!(
+        "{unko_no},{reading_day},{operation_day},OF1,TEST-OFFICE,VH1,TEST-VEHICLE,{driver_cd},TEST-DRIVER {driver_cd},1,{times},80.0"
+    )
+}
+
+/// [`Op`] の KUDGIVT の行。
+fn op_events(driver_cd: &str, op: &Op) -> Vec<String> {
+    let (unko_no, _, ret, events) = op;
+    let line = |(start, event_cd, minutes): &(&str, &str, i32)| {
+        format!(
+            "{unko_no},{},{driver_cd},TEST-DRIVER {driver_cd},1,{},{event_cd},TEST-EVENT,{minutes}",
+            csv_day(ret),
+            csv_at(start)
+        )
+    };
+    events.iter().map(line).collect()
+}
+
+/// 乗務員 `driver_cd` の運行 `ops` の (KUDGURI の行, KUDGIVT の行)。
+fn op_lines(driver_cd: &str, ops: &[&Op]) -> (Vec<String>, Vec<String>) {
+    let kudguri = ops.iter().map(|op| op_line(driver_cd, op)).collect();
+    let kudgivt = ops.iter().flat_map(|op| op_events(driver_cd, op)).collect();
+    (kudguri, kudgivt)
+}
+
+/// 乗務員 `driver_cd` の運行 `ops` の zip。
+fn ops_zip(driver_cd: &str, ops: &[&Op]) -> Vec<u8> {
+    let (kudguri, kudgivt) = op_lines(driver_cd, ops);
+    upload_zip(&kudguri, &kudgivt)
+}
+
+/// `ops` のうち `index` を除いたもの。
+fn except(ops: &[Op], index: usize) -> Vec<&Op> {
+    let mut kept: Vec<&Op> = ops.iter().collect();
+    kept.remove(index);
+    kept
+}
+
+/// `ops` の行だけを共有の `compute_daily_hours` に渡した日別の、日 → (拘束, overlap の拘束) (既定の分類・フェリーなし)。
+fn computed_overlaps(driver_cd: &str, ops: &[&Op]) -> std::collections::BTreeMap<String, Value> {
+    let (kudguri, kudgivt) = op_lines(driver_cd, ops);
+    let files = [
+        ("KUDGURI.csv".to_owned(), sjis_csv(KUDGURI_HEADER, &kudguri)),
+        ("KUDGIVT.csv".to_owned(), sjis_csv(KUDGIVT_HEADER, &kudgivt)),
+    ];
+    let rows = alc_csv_parser::kudguri_rows_in(&files).unwrap().unwrap();
+    let events = alc_csv_parser::kudgivt_rows_in(&files).unwrap().unwrap();
+    let classify = |e: &alc_csv_parser::kudgivt::KudgivtRow| {
+        let class = alc_csv_parser::work_segments::default_classification(&e.event_cd).1;
+        (e.event_cd.clone(), class)
+    };
+    let classifications = events.iter().map(classify).collect();
+    let ferry = std::collections::HashMap::new();
+    let daily =
+        alc_compare::upload_daily::compute_daily_hours(&rows, &events, &classifications, &ferry);
+    let view =
+        |((_, date, _), h): (&alc_compare::DayKey, &alc_compare::upload_daily::DailyHours)| {
+            let value = json!([h.total_work_minutes, h.overlap_restraint_minutes]);
+            (date.to_string(), value)
+        };
+    daily.iter().map(view).collect()
+}
+
+/// DB の日別の、日 → (拘束, overlap の拘束)。
+fn stored_overlaps(days: &[Value]) -> std::collections::BTreeMap<String, Value> {
+    let view = |row: &Value| {
+        let date = row["work_date"].as_str().unwrap().to_owned();
+        let value = json!([row["total_work_minutes"], row["overlap_restraint_minutes"]]);
+        (date, value)
+    };
+    days.iter().map(view).collect()
+}
+
+impl Ctx {
+    /// 取り込み直後の日別・セグメント (全列) が、乗務員 `driver_cd` の再計算の口 (2026 年 `month` 月) を打った後と同じ。
+    /// 取り込み直後の日別を返す。
+    async fn assert_matches_driver_recalc(
+        &self,
+        t: Uuid,
+        driver_cd: &str,
+        month: u32,
+    ) -> Vec<Value> {
+        let days = self.rows(t, DAYS_QUERY).await;
+        let segments = self.rows(t, SEGMENTS_QUERY).await;
+        assert!(!days.is_empty());
+        let id = self.driver_id(t, driver_cd).await;
+        let (status, events, _) = recalc_driver(self.app(t), month, &id).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(events.last().unwrap()["event"], "done");
+        assert_eq!(self.rows(t, DAYS_QUERY).await, days);
+        assert_eq!(self.rows(t, SEGMENTS_QUERY).await, segments);
+        days
+    }
+
+    /// 新しいテナントに `base` を取り込み、続けて `added` を取り込む。`added` の取り込みの GET の数 (運行ごとの分割の出力) と、
+    /// 取り込み直後の日別を返す (日別・セグメントが乗務員の再計算の口 (`month` 月) の後と全列で同じことを確かめる)。
+    async fn added_gets(
+        &self,
+        name: &str,
+        driver_cd: &str,
+        month: u32,
+        base: &[u8],
+        added: &[u8],
+    ) -> (u32, Vec<Value>) {
+        let t = self.tenant(name).await;
+        self.upload_ok(t, "base.zip", base).await;
+        let before = self.unko_gets(t);
+        self.upload_ok(t, "added.zip", added).await;
+        let gets = self.unko_gets(t) - before;
+        let days = self.assert_matches_driver_recalc(t, driver_cd, month).await;
+        (gets, days)
+    }
+}
+
+/// 月の 9 日の 1 日 1 運行 (08:00〜17:00)。束ねは 1 日 1 つ。
+fn daily_ops() -> Vec<Op> {
+    let days = [
+        ("U-A02", "03/02 08:00", "03/02 17:00"),
+        ("U-A03", "03/03 08:00", "03/03 17:00"),
+        ("U-A04", "03/04 08:00", "03/04 17:00"),
+        ("U-A05", "03/05 08:00", "03/05 17:00"),
+        ("U-A06", "03/06 08:00", "03/06 17:00"),
+        ("U-A07", "03/07 08:00", "03/07 17:00"),
+        ("U-A08", "03/08 08:00", "03/08 17:00"),
+        ("U-A09", "03/09 08:00", "03/09 17:00"),
+        ("U-A10", "03/10 08:00", "03/10 17:00"),
+    ];
+    days.iter()
+        .map(|(u, dep, ret)| drive(u, dep, ret, 540))
+        .collect()
+}
+
+/// 毎日 2 時間ずつ早く出る運行 (前の運行の始業から 22 時間で次が出る = 前の日の overlap の列に次の日の 2 時間が入る)。
+/// 帰着から次の出発までは 14 時間以上 (束ねは 1 日 1 つ)。
+fn overlapping_ops() -> Vec<Op> {
+    vec![
+        drive("U-B1", "03/03 12:00", "03/03 20:00", 480),
+        drive("U-B2", "03/04 10:00", "03/04 18:00", 480),
+        drive("U-B3", "03/05 08:00", "03/05 16:00", 480),
+        drive("U-B4", "03/06 06:00", "03/06 14:00", 480),
+        drive("U-B5", "03/07 06:00", "03/07 14:00", 480),
+    ]
+}
+
+/// (i) 月の真ん中の運行を後から新しく取り込む (前後に束ねが在る) → 計算に渡すのは前・対象・次の束ねの 3 運行だけ
+/// (GET 6。月全体なら 18)。取り込み直後の日別・セグメントは、乗務員の再計算の口の後と全列で同じ。
+/// (ii) 次の束ねが前の束ねの始業 + 24h 以内に始まる (overlap の列が効く) 並びでも同じ (GET 6。月全体なら 10)。
+/// 陽性対照: 前の束ねを計算し直さない値 (= 今回の運行の無い計算の前の日) と、次の束ねを計算に入れない値 (= 今回の運行の日) は、
+/// どちらも再計算の口の値と違う。
+#[tokio::test(flavor = "multi_thread")]
+async fn upload_recalculates_only_the_neighbouring_chains() {
+    let ctx = Ctx::start().await;
+    // (i)
+    let ops = daily_ops();
+    let (base, added) = (ops_zip("D-A", &except(&ops, 4)), ops_zip("D-A", &[&ops[4]]));
+    let (gets, days) = ctx
+        .added_gets("Dtako Narrow Middle", "D-A", 3, &base, &added)
+        .await;
+    assert_eq!(gets, 2 * 3);
+    assert!(gets < 2 * ops.len() as u32);
+    assert_eq!(days.len(), ops.len());
+
+    // (ii)
+    let ops = overlapping_ops();
+    let (base, added) = (ops_zip("D-B", &except(&ops, 2)), ops_zip("D-B", &[&ops[2]]));
+    let (gets, days) = ctx
+        .added_gets("Dtako Narrow Overlap", "D-B", 3, &base, &added)
+        .await;
+    assert_eq!(gets, 2 * 3);
+    assert!(gets < 2 * ops.len() as u32);
+    let stored = stored_overlaps(&days);
+    // 前の束ね (03/04) と今回 (03/05) の overlap の列に、次の日の始業前の 2 時間が入っている
+    assert_eq!(stored["2026-03-04"][1], 120);
+    assert_eq!(stored["2026-03-05"][1], 120);
+    // 陽性対照 1: 前の束ねを計算し直さないと、03/04 は今回の運行の無い計算の値 (overlap が 0) のまま
+    let without_added = computed_overlaps("D-B", &except(&ops, 2));
+    assert_ne!(without_added["2026-03-04"], stored["2026-03-04"]);
+    // 陽性対照 2: 次の束ねを計算に入れないと、03/05 の overlap は 0
+    let without_next = computed_overlaps("D-B", &[&ops[1], &ops[2]]);
+    assert_ne!(without_next["2026-03-05"], stored["2026-03-05"]);
+    // 縮めた範囲で計算すれば同じ値になる (前・今回・次)
+    let window = computed_overlaps("D-B", &[&ops[1], &ops[2], &ops[3]]);
+    assert_eq!(window["2026-03-04"], stored["2026-03-04"]);
+    assert_eq!(window["2026-03-05"], stored["2026-03-05"]);
+    assert_eq!(ctx.daily_logs(), []);
+    ctx.finish().await;
+}
+
+/// 縮めた計算が月全体の計算と同じと言えない並びは、月全体で計算する (どれも取り込み直後 = 乗務員の再計算の口の後):
+/// (iii) 同じ日に束ねが 2 つ (06:00〜08:00 の後、空き 9 時間で 17:00) で、今回が先の方 → 保存する束ねと次の束ねの日が重なる (GET = 月全体の 8)
+/// (v) 日時の無い運行が月に在る (GET = 月全体の 8)
+/// 計算の後の確かめ: 運転が帰着を越えて翌日へ続く (セグメントが束ねの日付の外) → 縮めた計算 (6) の後に月全体 (6) を計算し直す (GET 12)
+#[tokio::test(flavor = "multi_thread")]
+async fn upload_recalculates_the_whole_month_when_the_chains_cannot_be_separated() {
+    let ctx = Ctx::start().await;
+    // (iii)
+    let ops = vec![
+        drive("U-C1", "03/08 08:00", "03/08 17:00", 540),
+        drive("U-C2", "03/10 06:00", "03/10 08:00", 120),
+        drive("U-C3", "03/10 17:00", "03/10 20:00", 180),
+        drive("U-C4", "03/12 08:00", "03/12 17:00", 540),
+    ];
+    let (base, added) = (ops_zip("D-C", &except(&ops, 1)), ops_zip("D-C", &[&ops[1]]));
+    let (gets, days) = ctx
+        .added_gets("Dtako Narrow Same Day", "D-C", 3, &base, &added)
+        .await;
+    assert_eq!(gets, 2 * 4);
+    assert_eq!(stored_overlaps(&days).len(), 3);
+
+    // (v)
+    let ops = vec![
+        drive("U-E1", "03/02 08:00", "03/02 17:00", 540),
+        drive("U-E2", "03/04 08:00", "03/04 17:00", 540),
+        drive("U-E3", "03/06 08:00", "03/06 17:00", 540),
+        ("U-E4", "", "03/15", vec![("03/15 09:00", "201", 60)]),
+    ];
+    let (base, added) = (ops_zip("D-E", &except(&ops, 1)), ops_zip("D-E", &[&ops[1]]));
+    let (gets, _) = ctx
+        .added_gets("Dtako Narrow Timeless", "D-E", 3, &base, &added)
+        .await;
+    assert_eq!(gets, 2 * 4);
+
+    // 計算の後の確かめ
+    let ops = vec![
+        drive("U-F1", "03/02 08:00", "03/02 17:00", 540),
+        drive("U-F2", "03/04 14:00", "03/04 23:00", 660),
+        drive("U-F3", "03/07 08:00", "03/07 17:00", 540),
+    ];
+    let (base, added) = (ops_zip("D-F", &except(&ops, 1)), ops_zip("D-F", &[&ops[1]]));
+    let (gets, _) = ctx
+        .added_gets("Dtako Narrow Late Events", "D-F", 3, &base, &added)
+        .await;
+    assert_eq!(gets, 2 * 3 + 2 * 3);
+    assert_eq!(ctx.daily_logs(), []);
+    ctx.finish().await;
+}
+
+/// (iv) 前の月の末から続く運行を後から取り込む → 2 か月 (運行日の 2 月・読取日の 3 月) とも縮める
+/// (2 月 = 前の束ね + 今回、3 月 = 今回 + 次の束ね。GET 4 + 4。月全体なら 4 + 6)。3 月の再計算の口の後と同じ。
+/// (vi) 鎖の切れ目の reset の前提: 前の束ねの中で、分割休息 (300 + 300 = 600) で overlap が切れる並び・
+/// 1 運行の中の分割休息 (180 + 420) で勤務日が 2 つになり overlap が強制で切れる並び。どちらも縮めて (GET 10・6) 同じ。
+#[tokio::test(flavor = "multi_thread")]
+async fn upload_recalculates_chains_across_the_month_start_and_rest_resets() {
+    let ctx = Ctx::start().await;
+    // (iv)
+    let ops = vec![
+        drive("U-G1", "02/26 08:00", "02/26 17:00", 540),
+        drive("U-G2", "02/28 22:00", "03/01 06:00", 480),
+        drive("U-G3", "03/02 08:00", "03/02 17:00", 540),
+        drive("U-G4", "03/03 08:00", "03/03 17:00", 540),
+    ];
+    let (base, added) = (ops_zip("D-G", &except(&ops, 1)), ops_zip("D-G", &[&ops[1]]));
+    let (gets, days) = ctx
+        .added_gets("Dtako Narrow Month Start", "D-G", 3, &base, &added)
+        .await;
+    assert_eq!(gets, 4 + 4);
+    assert_eq!(days.len(), 4);
+
+    // (vi) 分割休息
+    let ops = vec![
+        drive("U-H1", "03/14 08:00", "03/14 17:00", 540),
+        drive("U-H2", "03/16 06:00", "03/16 10:00", 240),
+        drive("U-H3", "03/16 15:00", "03/16 19:00", 240),
+        drive("U-H4", "03/17 00:00", "03/17 04:00", 240),
+        drive("U-H5", "03/17 14:00", "03/17 20:00", 360),
+        drive("U-H6", "03/19 08:00", "03/19 17:00", 540),
+    ];
+    let (base, added) = (ops_zip("D-H", &except(&ops, 4)), ops_zip("D-H", &[&ops[4]]));
+    let (gets, _) = ctx
+        .added_gets("Dtako Narrow Split Rest", "D-H", 3, &base, &added)
+        .await;
+    assert_eq!(gets, 2 * 5);
+
+    // (vi) 1 運行の中の 2 つの勤務日
+    let split_events = vec![
+        ("03/22 06:00", "201", 240),
+        ("03/22 10:00", "302", 180),
+        ("03/22 13:00", "201", 240),
+        ("03/22 17:00", "302", 420),
+        ("03/23 00:00", "201", 240),
+    ];
+    let ops = vec![
+        drive("U-K1", "03/20 08:00", "03/20 17:00", 540),
+        ("U-K2", "03/22 06:00", "03/23 04:00", split_events),
+        drive("U-K3", "03/24 08:00", "03/24 17:00", 540),
+        drive("U-K4", "03/26 08:00", "03/26 17:00", 540),
+    ];
+    let (base, added) = (ops_zip("D-K", &except(&ops, 2)), ops_zip("D-K", &[&ops[2]]));
+    let (gets, days) = ctx
+        .added_gets("Dtako Narrow Workdays", "D-K", 3, &base, &added)
+        .await;
+    assert_eq!(gets, 2 * 3);
+    // 03/22 の運行は勤務日 2 つ (03/22 と、休息の後の 03/23)
+    let k2_days = days.iter().filter(|d| d["unko_nos"] == json!(["U-K2"]));
+    assert_eq!(k2_days.count(), 2);
+    assert_eq!(ctx.daily_logs(), []);
+    ctx.finish().await;
+}
+
+/// (vii) 同じ運行を時刻を変えて取り込み直す (取り込みの前から在る運行) → 月全体 (GET = 前回の KUDGIVT 1 + 月全体 14)。
+/// 運行は次の日の運行の 9 時間前まで動く (束ねも overlap も変わる) が、取り込み直後は乗務員の再計算の口の後と全列で同じ。
+/// (viii) やり直しの口は、いつも月全体 (取り込みの本体で落ちた新しい運行のやり直し。GET = 月全体 14)。
+#[tokio::test(flavor = "multi_thread")]
+async fn reupload_and_rerun_recalculate_the_whole_month() {
+    let ctx = Ctx::start().await;
+    // (vii)
+    let ops: Vec<Op> = daily_ops().into_iter().take(7).collect();
+    let moved = drive("U-A05", "03/05 20:00", "03/06 02:00", 360);
+    let (base, added) = (
+        ops_zip("D-A", &ops.iter().collect::<Vec<_>>()),
+        ops_zip("D-A", &[&moved]),
+    );
+    let (gets, days) = ctx
+        .added_gets("Dtako Narrow Reupload", "D-A", 3, &base, &added)
+        .await;
+    assert_eq!(gets, 1 + 2 * 7);
+    // 移した運行は 03/05 20:00 に始まり、03/06 の運行はその 24 時間に入る (03/06 の日の overlap の列に移る)
+    let moved_day = days
+        .iter()
+        .find(|d| d["unko_nos"] == json!(["U-A05"]))
+        .unwrap();
+    assert_eq!(moved_day["start_time"], "20:00:00");
+    let next_day = days
+        .iter()
+        .find(|d| d["unko_nos"] == json!(["U-A06"]))
+        .unwrap();
+    assert_eq!(next_day["overlap_restraint_minutes"], 540);
+
+    // (viii)
+    let ctx = ctx.run_as_superuser(REJECT_NEW).await;
+    let t = ctx.tenant("Dtako Narrow Rerun").await;
+    let mut ops: Vec<Op> = daily_ops().into_iter().take(7).collect();
+    ops[3].0 = "U-REJECT";
+    ops[3].3 = vec![(ops[3].1, "201", 540)];
+    ctx.upload_ok(t, "base.zip", &ops_zip("D-A", &except(&ops, 3)))
+        .await;
+    let (status, _) = ctx
+        .upload(t, "added.zip", &ops_zip("D-A", &[&ops[3]]))
+        .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    let ctx = ctx.run_as_superuser(ACCEPT).await;
+    let failed = "SELECT id::text AS id FROM dtako_upload_history WHERE tenant_id = $1 AND status = 'failed'";
+    let upload_id = ctx.rows(t, failed).await[0]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let before = ctx.unko_gets(t);
+    let (status, body) = ctx.rerun(t, &upload_id).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(ctx.unko_gets(t) - before, 2 * 7);
+    ctx.assert_matches_driver_recalc(t, "D-A", 3).await;
+    assert_eq!(ctx.daily_logs(), []);
+    ctx.finish().await;
+}
+
+/// 縮める範囲の選び方 (DB なし): 縮められない形は `None`、選んだ範囲の日エントリから保存するものだけを残す。
+#[test]
+fn narrow_keeps_only_windows_that_match_the_month() {
+    use alc_compare::upload_daily::{DailyHours, DailySegment};
+    use alc_dtako_upload::narrow::narrow;
+    use std::collections::{BTreeSet, HashMap};
+
+    let rows_of = |ops: &[&Op]| {
+        let (kudguri, _) = op_lines("D-N", ops);
+        let files = [("KUDGURI.csv".to_owned(), sjis_csv(KUDGURI_HEADER, &kudguri))];
+        alc_csv_parser::kudguri_rows_in(&files).unwrap().unwrap()
+    };
+    let new = |unko_no: &str| BTreeSet::from([unko_no.to_owned()]);
+    let date = |at: &str| chrono::NaiveDate::parse_from_str(&csv_day(at), "%Y/%m/%d").unwrap();
+    let ops = daily_ops();
+    let all: Vec<&Op> = ops.iter().collect();
+    let rows = rows_of(&all);
+
+    // 選べる: 前・対象・次の束ね。保存するのは前と対象の運行
+    let window = narrow(&rows, &new("U-A06"), "D-N", &[]).unwrap();
+    let picked: Vec<&str> = window.rows.iter().map(|r| r.unko_no.as_str()).collect();
+    assert_eq!(picked, ["U-A05", "U-A06", "U-A07"]);
+    assert_eq!(window.saved_unko_nos, ["U-A05", "U-A06"]);
+    // 月の端の束ねなら前 (次) が無い
+    let first = narrow(&rows, &new("U-A02"), "D-N", &[]).unwrap();
+    assert_eq!(first.saved_unko_nos, ["U-A02"]);
+    assert_eq!(first.rows.len(), 2);
+    let last = narrow(&rows, &new("U-A10"), "D-N", &[]).unwrap();
+    assert_eq!(last.saved_unko_nos, ["U-A09", "U-A10"]);
+
+    // 縮めない: 今回の運行が月の行に無い / 帰着が出発より前
+    assert!(narrow(&rows, &new("U-OTHER"), "D-N", &[]).is_none());
+    let reversed = drive("U-R1", "03/20 17:00", "03/20 08:00", 60);
+    let rows_reversed = rows_of(&[&ops[0], &reversed]);
+    assert!(narrow(&rows_reversed, &new("U-A02"), "D-N", &[]).is_none());
+
+    // 縮めない: 境目の空きが 540 分未満 (日跨ぎ運行なので 480 分で束ねは切れる)
+    let a = drive("U-S1", "03/02 08:00", "03/02 17:00", 540);
+    let b = drive("U-S2", "03/03 01:30", "03/04 01:00", 540);
+    let c = drive("U-S3", "03/05 08:00", "03/05 17:00", 540);
+    let rows_short_before = rows_of(&[&a, &b, &c]);
+    assert!(narrow(&rows_short_before, &new("U-S3"), "D-N", &[]).is_none());
+    let e = drive("U-S5", "03/04 08:00", "03/04 16:00", 480);
+    let f = drive("U-S6", "03/05 00:30", "03/06 00:00", 540);
+    let rows_short_next = rows_of(&[&e, &f]);
+    assert!(narrow(&rows_short_next, &new("U-S5"), "D-N", &[]).is_none());
+
+    // 段 7 が書いた日エントリ: 月の運行のものは、この乗務員CD で保存する束ねの日でないと縮めない (月の外の運行のものは見ない)
+    let written =
+        |cd: &str, at: &str, unko_no: &str| (cd.to_owned(), date(at), vec![unko_no.to_owned()]);
+    let ok = [
+        written("D-N", "03/06", "U-A06"),
+        written("D-X", "03/09", "U-OUT"),
+    ];
+    assert!(narrow(&rows, &new("U-A06"), "D-N", &ok).is_some());
+    let other_cd = [written("D-X", "03/06", "U-A06")];
+    assert!(narrow(&rows, &new("U-A06"), "D-N", &other_cd).is_none());
+    let next_day = [written("D-N", "03/07", "U-A06")];
+    assert!(narrow(&rows, &new("U-A06"), "D-N", &next_day).is_none());
+
+    // 計算の後: 保存するものだけを残す / 前提から外れたら `None`
+    let at =
+        |s: &str| chrono::NaiveDateTime::parse_from_str(&csv_at(s), "%Y/%m/%d %H:%M:%S").unwrap();
+    let hours = |unko_nos: &[&str], start: &str, end: &str| DailyHours {
+        total_work_minutes: 1,
+        total_labor_minutes: 1,
+        late_night_minutes: 0,
+        drive_minutes: 1,
+        cargo_minutes: 0,
+        total_distance: 0.0,
+        operation_count: unko_nos.len() as i32,
+        unko_nos: unko_nos.iter().map(|u| u.to_string()).collect(),
+        segments: vec![DailySegment {
+            unko_no: unko_nos[0].to_owned(),
+            segment_index: 0,
+            start_at: at(start),
+            end_at: at(end),
+            work_minutes: 1,
+            labor_minutes: 1,
+            late_night_minutes: 0,
+            drive_minutes: 1,
+            cargo_minutes: 0,
+        }],
+        rest_event_minutes: 0,
+        overlap_drive_minutes: 0,
+        overlap_cargo_minutes: 0,
+        overlap_break_minutes: 0,
+        overlap_restraint_minutes: 0,
+        ot_late_night_minutes: 0,
+    };
+    let key = |at_day: &str| ("D-N".to_owned(), date(at_day), chrono::NaiveTime::MIN);
+    let entry = |day: &str, unko_nos: &[&str]| {
+        let (start, end) = (format!("{day} 08:00"), format!("{day} 17:00"));
+        (key(day), hours(unko_nos, &start, &end))
+    };
+    let daily = |entries: Vec<(alc_compare::DayKey, DailyHours)>| -> HashMap<_, _> {
+        entries.into_iter().collect()
+    };
+    let good = daily(vec![
+        entry("03/05", &["U-A05"]),
+        entry("03/06", &["U-A06"]),
+        entry("03/07", &["U-A07"]),
+    ]);
+    let kept = window.saved_days(good).unwrap();
+    let mut kept_days: Vec<_> = kept.keys().map(|k| k.1.to_string()).collect();
+    kept_days.sort();
+    assert_eq!(kept_days, ["2026-03-05", "2026-03-06"]);
+    // 保存する側と次の束ねの運行が 1 つのエントリに混ざる
+    let mixed = daily(vec![
+        entry("03/05", &["U-A05"]),
+        entry("03/06", &["U-A06", "U-A07"]),
+    ]);
+    assert!(window.saved_days(mixed).is_none());
+    // 次の束ねのエントリが次の束ねの日付の外
+    let outside = daily(vec![
+        entry("03/05", &["U-A05"]),
+        entry("03/06", &["U-A06"]),
+        entry("03/08", &["U-A07"]),
+    ]);
+    assert!(window.saved_days(outside).is_none());
+    let mut late = daily(vec![entry("03/05", &["U-A05"]), entry("03/07", &["U-A07"])]);
+    late.insert(
+        key("03/06"),
+        hours(&["U-A06"], "03/06 20:00", "03/07 01:00"),
+    );
+    assert!(window.saved_days(late).is_none());
+    // 計算に渡した運行 (U-A07) がどのエントリにも出ない
+    let unseen = daily(vec![entry("03/05", &["U-A05"]), entry("03/06", &["U-A06"])]);
+    assert!(window.saved_days(unseen).is_none());
+}

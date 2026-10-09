@@ -3,7 +3,7 @@
 デジタコの運行 CSV のアップロード・分割の Cloudflare Worker `alc-dtako` と、その route の crate `alc-dtako-upload`。
 rust-alc-api を Cloudflare Workers へ分ける 2 本目 (Refs ippoan/rust-alc-api#725)。型は 1 本目の ippoan/alc-vein-worker と同じ。
 口は 10 本: `POST /upload` (zip の取り込み)・`POST /internal/rerun/{upload_id}` (やり直し)・`POST /split-csv/{upload_id}` (分割 1 件)・`POST /split-csv-all` (一括分割)・`POST /recalculate` (月の全員)・`POST /recalculate-driver` (乗務員 1 人)・`POST /recalculate-drivers` (乗務員の一括) の再計算 (この 4 つは応答が event-stream)・履歴の読み取り `GET /uploads`・`GET /internal/pending`・`GET /internal/download/{upload_id}`。構造は `.claude/skills/alc-dtako-worker-map`、詳細は `README.md`。
-直下 = Worker 本体 (workspace の root)。`crates/alc-dtako-upload/` = route の crate (口 `routes`・取り込みの流れ `ingest`・再計算の流れ `recalc`・分割の流れ `split`・zip の展開 `archive`・段の所要 `timing`・SQL の定数 `repo::sql`・それを流す `pg`・保存先の層 `store`。接続も R2 の実装も持たない)。`crates/alc-compare/`・`crates/alc-csv-parser/` = backend と共有の計算 crate (正本はこの repo。下の「rev を上げる手順」)。
+直下 = Worker 本体 (workspace の root)。`crates/alc-dtako-upload/` = route の crate (口 `routes`・取り込みの流れ `ingest`・取り込みの後の計算し直しで計算に渡す運行を束ねの範囲に縮める `narrow`・再計算の流れ `recalc`・分割の流れ `split`・zip の展開 `archive`・段の所要 `timing`・SQL の定数 `repo::sql`・それを流す `pg`・保存先の層 `store`。接続も R2 の実装も持たない)。`crates/alc-compare/`・`crates/alc-csv-parser/` = backend と共有の計算 crate (正本はこの repo。下の「rev を上げる手順」)。
 
 ## コマンド
 
@@ -37,7 +37,7 @@ npx wrangler@4.144.0 deploy --dry-run [--env staging]                   # 配信
 - **分割の出力 (R2 の key と中身のバイト列) を backend と変えない** — 分ける本体は `alc_csv_parser::split_csv_entry` を呼ぶ (写さない・整えない)。
   ログ (`split::LogSink`)・応答の本文・履歴の `error_message` に key・運行NO・upload_id・テナント ID・入力の値・エラーの生の文を出さない (固定の語だけ。一覧 2 口の**成功の本文**だけは、ヘッダーのテナント自身の履歴の列をそのまま返す)。`unsafe` を書かない (`Send` は `worker::send` の型で)。
 - **DB の検査と coverage の gate を弱めない。** `tests/sql_db.rs` は migration が未取得なら失敗する作り (skip・`#[ignore]` にしない)。
-  CI は本数を target ごとに固定して回す (`ci.yml` の `sql_db` 18・`store` 10・`split_flow` 20・`upload_flow` 21・共通の crate は別の回で `alc-compare` 128・`alc-csv-parser` 67。足したら数も上げる)。`coverage_100.toml` の登録を外さない。
+  CI は本数を target ごとに固定して回す (`ci.yml` の `sql_db` 18・`store` 10・`split_flow` 20・`upload_flow` 26・共通の crate は別の回で `alc-compare` 131・`alc-csv-parser` 67。足したら数も上げる)。`coverage_100.toml` の登録を外さない。
   route の crate の通常の依存に `tokio` を入れない (待ちは `store::Sleeper` 越し。R2 の読み書きは `store::ObjectStore` 越し)。
 - **`pglite-oxide` は `=0.5.0` に固定**、wasmer 系 13 crate は `Cargo.lock` で alpha 版に pin (Rust 1.92.0 で通る版。toolchain は上げない)。
   lock を作り直したら pin し直す (README の「lock の pin」)。本番の wasm に pglite / wasmer を入れない。

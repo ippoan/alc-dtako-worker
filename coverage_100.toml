@@ -30,6 +30,10 @@ path = "crates/alc-dtako-upload/src/split.rs"
 [[files]]
 path = "crates/alc-dtako-upload/src/ingest.rs"
 
+# 取り込みの後の日別の計算し直しで、計算に渡す運行を束ねの範囲に縮める (tests/upload_flow.rs が口から通し、選び方の分岐は DB なしの 1 本で通す)
+[[files]]
+path = "crates/alc-dtako-upload/src/narrow.rs"
+
 # zip の展開と、展開後の大きさの上限 (tests/split_flow.rs と tests/upload_flow.rs が通す)
 [[files]]
 path = "crates/alc-dtako-upload/src/archive.rs"

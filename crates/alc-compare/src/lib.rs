@@ -747,8 +747,21 @@ pub fn calc_ot_late_night_from_events(events: &[(NaiveDateTime, NaiveDateTime)])
     ot_night
 }
 
-pub fn group_operations_into_work_days(rows: &[KudguriRow]) -> HashMap<String, NaiveDate> {
+/// 運行 (出発 `dep`・帰着 `ret`) が、それまでの運行の帰着の最大 `last_end` から休息を取って始まるか
+/// (= [`group_operations_into_work_days`] で新しい束ねになるか。束ねの中の 1440 分での勤務日の切り替えは含まない)。
+/// 空きが 540 分 (日跨ぎ運行 (`dep` と `ret` の日付が違う) は 480 分) 以上なら `true`。分は `num_minutes` の切り捨て。
+pub fn starts_new_chain(dep: NaiveDateTime, ret: NaiveDateTime, last_end: NaiveDateTime) -> bool {
     const REST_THRESHOLD_MINUTES: i64 = 540;
+    // 長距離判定: 日跨ぎ運行は480分（例外基準）
+    let threshold = if dep.date() != ret.date() {
+        480
+    } else {
+        REST_THRESHOLD_MINUTES
+    };
+    (dep - last_end).num_minutes() >= threshold
+}
+
+pub fn group_operations_into_work_days(rows: &[KudguriRow]) -> HashMap<String, NaiveDate> {
     const MAX_WORK_DAY_MINUTES: i64 = 1440;
 
     let mut unko_work_date: HashMap<String, NaiveDate> = HashMap::new();
@@ -785,16 +798,8 @@ pub fn group_operations_into_work_days(rows: &[KudguriRow]) -> HashMap<String, N
             let ret = row.return_at.or(row.garage_in_at).unwrap_or(dep);
 
             let new_day = if let (Some(shigyo), Some(prev_end)) = (current_shigyo, last_end) {
-                let gap_minutes = (dep - prev_end).num_minutes();
                 let since_shigyo_minutes = (dep - shigyo).num_minutes();
-                // 長距離判定: 日跨ぎ運行は480分（例外基準）
-                let is_long_distance = dep.date() != ret.date();
-                let threshold = if is_long_distance {
-                    480
-                } else {
-                    REST_THRESHOLD_MINUTES
-                };
-                gap_minutes >= threshold || since_shigyo_minutes >= MAX_WORK_DAY_MINUTES
+                starts_new_chain(dep, ret, prev_end) || since_shigyo_minutes >= MAX_WORK_DAY_MINUTES
             } else {
                 true
             };
@@ -2575,6 +2580,86 @@ mod tests {
             let result = work_segments::split_segments_at_24h_with_workdays(vec![seg], &[]);
             assert_eq!(result.len(), 1);
         });
+    }
+
+    // ---- starts_new_chain ----
+    #[test]
+    fn test_starts_new_chain_threshold_540() {
+        test_group!("比較ロジック");
+        test_case!(
+            "starts_new_chain: 日を跨がない運行は 540 分の境",
+            {
+                let last_end = dt(2026, 2, 1, 17, 0, 0);
+                // 539 分 59 秒は切り捨てで 539 分 → 切れない
+                let dep = dt(2026, 2, 2, 1, 59, 59);
+                let ret = dt(2026, 2, 2, 10, 0, 0);
+                assert!(!starts_new_chain(dep, ret, last_end));
+                // ちょうど 540 分 → 切れる
+                let dep = dt(2026, 2, 2, 2, 0, 0);
+                assert!(starts_new_chain(dep, ret, last_end));
+                // 540 分より長い・帰着より前に出発 (負の空き) は、それぞれ切れる・切れない
+                assert!(starts_new_chain(dt(2026, 2, 2, 8, 0, 0), ret, last_end));
+                let early = dt(2026, 2, 1, 16, 0, 0);
+                assert!(!starts_new_chain(early, dt(2026, 2, 1, 20, 0, 0), last_end));
+            }
+        );
+    }
+    #[test]
+    fn test_starts_new_chain_threshold_480_overnight() {
+        test_group!("比較ロジック");
+        test_case!("starts_new_chain: 日跨ぎ運行は 480 分の境", {
+            let last_end = dt(2026, 2, 1, 8, 0, 0);
+            let overnight_ret = dt(2026, 2, 2, 6, 0, 0);
+            // 479 分 → 切れない、480 分 → 切れる
+            assert!(!starts_new_chain(
+                dt(2026, 2, 1, 15, 59, 0),
+                overnight_ret,
+                last_end
+            ));
+            assert!(starts_new_chain(
+                dt(2026, 2, 1, 16, 0, 0),
+                overnight_ret,
+                last_end
+            ));
+            // 同じ 480 分でも、日を跨がない運行なら切れない (540 分の境)
+            let same_day_ret = dt(2026, 2, 1, 23, 0, 0);
+            assert!(!starts_new_chain(
+                dt(2026, 2, 1, 16, 0, 0),
+                same_day_ret,
+                last_end
+            ));
+        });
+    }
+    #[test]
+    fn test_starts_new_chain_matches_grouping() {
+        test_group!("比較ロジック");
+        test_case!(
+            "starts_new_chain: 束ねの判定と同じ境で勤務日が分かれる",
+            {
+                // 1 本目の帰着 17:00 から 2 本目の出発まで 540 分 (翌 02:00) → 別の勤務日
+                let rows = vec![
+                    make_kudguri(
+                        "U001",
+                        "1001",
+                        dt(2026, 2, 1, 8, 0, 0),
+                        dt(2026, 2, 1, 17, 0, 0),
+                    ),
+                    make_kudguri(
+                        "U002",
+                        "1001",
+                        dt(2026, 2, 2, 2, 0, 0),
+                        dt(2026, 2, 2, 7, 0, 0),
+                    ),
+                ];
+                assert!(starts_new_chain(
+                    dt(2026, 2, 2, 2, 0, 0),
+                    dt(2026, 2, 2, 7, 0, 0),
+                    dt(2026, 2, 1, 17, 0, 0)
+                ));
+                let result = group_operations_into_work_days(&rows);
+                assert_ne!(result["U001"], result["U002"]);
+            }
+        );
     }
 
     // ---- group_operations_into_work_days ----

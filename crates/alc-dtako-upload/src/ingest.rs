@@ -15,6 +15,8 @@
 //! 8. 分割 ([`split_upload`])。丸ごと失敗したら待って、全体を最大 [`PUT_RETRY_ATTEMPTS`] 回。尽きても取り込みは成功のまま
 //! 9. 日別の計算し直し (`recalc_daily`。分割が成功したときだけ)。今回の行の乗務員 × その行の運行日・読取日の月ごとに、
 //!    乗務員の再計算の口と同じ数え方 (乗務員の月の運行をまとめ、運行ごとの分割の出力で計算する) で 7 の日別を上書きする。
+//!    計算に渡す運行は、今回の運行を含む束ねとその前後の束ねに縮める ([`crate::narrow`]。縮めた計算が月全体の計算と同じになると
+//!    言える形だけ。今回の行に取り込みの前から在った運行が在るとき・やり直しは、いつも月全体)。
 //!    失敗しても取り込みは成功のまま (7 の値が残る。ログは件数だけ)。保存先の GET は [`IngestLimits::max_daily_recalc_gets`] まで
 //!
 //! やり直し ([`rerun_upload`]) は、既に保存先に在る zip をもう一度取り込む: 履歴の zip の key を引く → zip を保存先から読む →
@@ -33,7 +35,8 @@ use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::sync::Arc;
 
-use alc_compare::upload_daily::compute_daily_hours;
+use alc_compare::upload_daily::{compute_daily_hours, DailyHours};
+use alc_compare::DayKey;
 use alc_csv_parser::kudgivt::{parse_kudgivt_for_crew, KudgivtRow};
 use alc_csv_parser::kudguri::KudguriRow;
 use alc_csv_parser::operation_changes::{minutes_for, minutes_from_events, OperationMinutes};
@@ -44,6 +47,7 @@ use futures_util::lock::Mutex;
 use uuid::Uuid;
 
 use crate::archive::{Archive, ArchiveError, MAX_UNCOMPRESSED_BYTES};
+use crate::narrow::{narrow, Window, Written};
 use crate::pg::{self, CreateUploadError, OperationInput, PreparedRow};
 use crate::recalc::{
     compute_split_daily, kudguri_rows, month_range, month_unko_nos, unko_nos_of, SplitDaily,
@@ -73,8 +77,25 @@ impl Default for IngestLimits {
     }
 }
 
-/// 日別を計算し直す対象 (年, 月, 乗務員)。月ごと・乗務員ごとの順に並ぶ。
-type DailyTargets = BTreeSet<(i32, u32, Uuid)>;
+/// 段 9 の対象と、計算に渡す運行を縮める材料。
+struct DailyPlan {
+    /// 日別を計算し直す対象 (年, 月, 乗務員)。月ごと・乗務員ごとの順に並ぶ
+    targets: BTreeSet<(i32, u32, Uuid)>,
+    /// 乗務員ごとの今回の運行NO
+    new_unko_nos: HashMap<Uuid, BTreeSet<String>>,
+    /// 段 7 が書いた日エントリ
+    written: Vec<Written>,
+    /// 縮めてよいか (今回の行に、取り込みの前から在った運行が無い。やり直しでは `false`)
+    narrow: bool,
+}
+
+impl DailyPlan {
+    /// 乗務員 (`driver_id`・乗務員CD `driver_cd`) の月の行 `rows` のうち、計算に渡す範囲。縮めないなら `None`。
+    fn window(&self, driver_id: Uuid, driver_cd: &str, rows: &[KudguriRow]) -> Option<Window> {
+        let new_unko_nos = self.new_unko_nos.get(&driver_id).filter(|_| self.narrow)?;
+        narrow(rows, new_unko_nos, driver_cd, &self.written)
+    }
+}
 
 /// 月の運行の運行NO (日別の保存で消す対象。月ごとに 1 回引いて乗務員で使い回す)。
 type MonthUnkoNos = Arc<Vec<String>>;
@@ -233,9 +254,10 @@ pub async fn rerun_upload(
     finish(pg, store, sleeper, log, timer, ctx, applied).await
 }
 
-/// [`finish`] が使う値 (`what` = ログの頭)。
+/// [`finish`] が使う値 (`what` = ログの頭。やり直し (`rerun`) は段 9 で計算に渡す運行を縮めない)。
 struct Finish {
     what: &'static str,
+    narrow: bool,
     max_gets: usize,
     tenant_id: Uuid,
     upload_id: Uuid,
@@ -246,6 +268,7 @@ impl Finish {
         let max_gets = limits.max_daily_recalc_gets;
         Self {
             what,
+            narrow: what != "rerun",
             max_gets,
             tenant_id,
             upload_id,
@@ -261,10 +284,10 @@ async fn finish(
     log: &LogSink,
     timer: &mut StageTimer<'_>,
     ctx: Finish,
-    applied: Result<(i32, DailyTargets), IngestError>,
+    applied: Result<(i32, DailyPlan), IngestError>,
 ) -> Result<IngestOutcome, IngestError> {
     let (tenant_id, upload_id) = (ctx.tenant_id, ctx.upload_id);
-    let (operations_count, targets) = match applied {
+    let (operations_count, mut plan) = match applied {
         Ok(applied) => applied,
         Err(e) => {
             // 印を付けること自体の失敗は握る (返すのは元の失敗)
@@ -278,7 +301,8 @@ async fn finish(
     let split = split_with_retry(pg, store, sleeper, log, tenant_id, upload_id).await;
     timer.lap("split");
     if split.put_failed == 0 {
-        recalc_daily(pg, store, log, &ctx, targets).await;
+        plan.narrow &= ctx.narrow;
+        recalc_daily(pg, store, log, &ctx, plan).await;
     } else {
         log(
             LogLevel::Warn,
@@ -313,7 +337,7 @@ async fn store_zip(
     Ok(())
 }
 
-/// 段 4〜7 (アップロードとやり直しで同じ)。返すのは流した行数と、段 9 で日別を計算し直す対象。
+/// 段 4〜7 (アップロードとやり直しで同じ)。返すのは流した行数と、段 9 で日別を計算し直す対象 (と縮める材料)。
 #[allow(clippy::too_many_arguments)]
 async fn import_zip(
     pg: &Mutex<PgClient>,
@@ -324,7 +348,7 @@ async fn import_zip(
     tenant_id: Uuid,
     upload_id: Uuid,
     zip_bytes: Bytes,
-) -> Result<(i32, DailyTargets), IngestError> {
+) -> Result<(i32, DailyPlan), IngestError> {
     // 4: 読み終えたら zip を手放す
     let (rows, kudgivt_rows) = read_rows(&zip_bytes, limits)?;
     drop(zip_bytes);
@@ -338,7 +362,7 @@ async fn import_zip(
     };
     let prepared = prepared.map_err(db_error)?;
     timer.lap("prepare");
-    let targets = daily_targets(&rows, &prepared.rows);
+    let mut plan = daily_plan(&rows, &prepared.rows);
 
     // 6
     let before = before_minutes(store, log, tenant_id, &rows, &prepared.rows).await;
@@ -357,6 +381,10 @@ async fn import_zip(
     // フェリーは空 (アップロードの時点では、まだ保存先に分割されていない。backend と同じ)
     let classifications = prepared.classification_map();
     let daily = compute_daily_hours(&rows, &kudgivt_rows, &classifications, &HashMap::new());
+    let written = daily
+        .iter()
+        .map(|((cd, date, _), h)| (cd.clone(), *date, h.unko_nos.clone()));
+    plan.written = written.collect();
     drop(kudgivt_rows);
     timer.lap("old_kudgivt");
 
@@ -367,12 +395,14 @@ async fn import_zip(
     };
     let count = applied.map_err(|e| IngestError::Db(e.kind()))?;
     timer.lap("apply");
-    Ok((count, targets))
+    Ok((count, plan))
 }
 
-/// 今回の行の乗務員 (引き当てられたもの) × その行の運行日・読取日の (年, 月)。月末の運行なら 2 か月になる。
-fn daily_targets(rows: &[KudguriRow], prepared: &[PreparedRow]) -> DailyTargets {
-    let mut targets = DailyTargets::new();
+/// 今回の行の乗務員 (引き当てられたもの) × その行の運行日・読取日の (年, 月) (月末の運行なら 2 か月になる) と、
+/// 乗務員ごとの今回の運行NO。段 7 が書いた日エントリは、計算した後で呼び手が入れる。
+fn daily_plan(rows: &[KudguriRow], prepared: &[PreparedRow]) -> DailyPlan {
+    let mut targets = BTreeSet::new();
+    let mut new_unko_nos: HashMap<Uuid, BTreeSet<String>> = HashMap::new();
     let drivers = prepared.iter().map(|p| p.driver_id);
     for (row, driver_id) in rows.iter().zip(drivers).filter_map(|(r, d)| Some((r, d?))) {
         for date in [Some(row.reading_date), row.operation_date]
@@ -381,12 +411,20 @@ fn daily_targets(rows: &[KudguriRow], prepared: &[PreparedRow]) -> DailyTargets 
         {
             targets.insert((date.year(), date.month(), driver_id));
         }
+        let unko_no = row.unko_no.clone();
+        new_unko_nos.entry(driver_id).or_default().insert(unko_no);
     }
-    targets
+    DailyPlan {
+        targets,
+        new_unko_nos,
+        written: Vec::new(),
+        narrow: !prepared.iter().any(|p| p.exists),
+    }
 }
 
 /// 段 9: 乗務員 × 月ごとに、乗務員の一括の再計算の口の 1 人ぶんと同じ処理 (乗務員の月の運行 → 分割の出力で計算 →
-/// 1 transaction で保存。消す対象の運行NO は月の運行のもの = 月ごとに 1 回引く) で日別を上書きする。
+/// 1 transaction で保存。消す対象の運行NO は月の運行のもの = 月ごとに 1 回引く) で日別を上書きする
+/// (縮められる乗務員 × 月は、縮めた運行で計算し、保存する鎖の日エントリだけを、その鎖の運行NO を消す対象にして保存する)。
 /// 失敗 (乗務員が無い・KUDGIVT が 1 件も無い・DB) は数えて続け、終わりに件数だけ Warn。
 /// 保存先の GET (運行NO の数の 2 倍) が上限を越える対象から先は飛ばし、件数だけ Warn。
 async fn recalc_daily(
@@ -394,13 +432,13 @@ async fn recalc_daily(
     store: &dyn ObjectStore,
     log: &LogSink,
     ctx: &Finish,
-    targets: DailyTargets,
+    plan: DailyPlan,
 ) {
     let what = ctx.what;
     let (mut gets, mut failed, mut skipped) = (0usize, 0usize, 0usize);
     // いま見ている月と、その月の運行の運行NO (引けなければ `None`)
     let mut month: Option<((i32, u32), Option<MonthUnkoNos>)> = None;
-    for (year, month_no, driver_id) in targets {
+    for &(year, month_no, driver_id) in &plan.targets {
         if skipped > 0 {
             skipped += 1;
             continue;
@@ -421,7 +459,7 @@ async fn recalc_daily(
             all_unko_nos,
         };
         let budget = ctx.max_gets - gets;
-        match recalc_target(pg, store, log, ctx, target, budget).await {
+        match recalc_target(pg, store, log, ctx, &plan, target, budget).await {
             Ok(Some(used)) => gets += used,
             Ok(None) => skipped += 1,
             Err(()) => failed += 1,
@@ -446,40 +484,75 @@ struct DailyTarget {
     all_unko_nos: Option<MonthUnkoNos>,
 }
 
-/// 乗務員 × 月 1 つを計算し直して保存する。使った GET の数を返す。GET が `budget` を越えるなら何もせず `None`。
+/// 乗務員 × 月 1 つを計算し直して保存する。使った GET の数を返す。GET が `budget` を越えるなら (そこから先を) 何もせず `None`。
+/// 縮められれば縮めた運行で計算し、計算の結果が縮めた前提から外れたら月全体で計算し直す (GET は両方を足す)。
 /// 失敗 (月の運行・乗務員が引けない・KUDGIVT が 1 件も無い・DB) は `Err`。
 async fn recalc_target(
     pg: &Mutex<PgClient>,
     store: &dyn ObjectStore,
     log: &LogSink,
     ctx: &Finish,
+    plan: &DailyPlan,
     target: DailyTarget,
     budget: usize,
 ) -> Result<Option<usize>, ()> {
     let tenant_id = ctx.tenant_id;
     let all_unko_nos = target.all_unko_nos.ok_or(())?;
     let (start, fetch_end) = target.range;
+    let driver_id = target.driver_id;
     let loaded = {
         let mut client = pg.lock().await;
-        let driver_id = target.driver_id;
         pg::driver_operations_for_recalc(&mut client, tenant_id, driver_id, start, fetch_end).await
     };
-    let (_, ops) = loaded.ok().flatten().ok_or(())?;
+    let (driver_cd, ops) = loaded.ok().flatten().ok_or(())?;
     let rows = kudguri_rows(ops);
-    let gets = 2 * unko_nos_of(&rows).len();
+    let mut used = 0;
+    if let Some(window) = plan.window(driver_id, &driver_cd, &rows) {
+        used = 2 * unko_nos_of(&window.rows).len();
+        if used > budget {
+            return Ok(None);
+        }
+        let daily = split_daily(pg, store, log, ctx, &window.rows).await?;
+        if let Some(kept) = window.saved_days(daily) {
+            let unko_nos = Arc::new(window.saved_unko_nos);
+            save_daily(pg, tenant_id, kept, unko_nos).await?;
+            return Ok(Some(used));
+        }
+    }
+    let gets = used + 2 * unko_nos_of(&rows).len();
     if gets > budget {
         return Ok(None);
     }
-    let computed = compute_split_daily(pg, store, log, ctx.what, tenant_id, &rows).await;
-    let SplitDaily::Daily(daily) = computed.map_err(drop)? else {
-        return Err(());
-    };
-    let saved = {
-        let mut client = pg.lock().await;
-        pg::save_daily_hours_in_tx(&mut client, tenant_id, daily, all_unko_nos).await
-    };
-    saved.map_err(drop)?;
+    let daily = split_daily(pg, store, log, ctx, &rows).await?;
+    save_daily(pg, tenant_id, daily, all_unko_nos).await?;
     Ok(Some(gets))
+}
+
+/// 運行の行を分割の出力で計算する。失敗 (KUDGIVT が 1 件も無い・DB) は `Err`。
+async fn split_daily(
+    pg: &Mutex<PgClient>,
+    store: &dyn ObjectStore,
+    log: &LogSink,
+    ctx: &Finish,
+    rows: &[KudguriRow],
+) -> Result<HashMap<DayKey, DailyHours>, ()> {
+    let computed = compute_split_daily(pg, store, log, ctx.what, ctx.tenant_id, rows).await;
+    match computed.map_err(drop)? {
+        SplitDaily::Daily(daily) => Ok(daily),
+        SplitDaily::KudgivtNotFound => Err(()),
+    }
+}
+
+/// 日エントリを 1 transaction で保存する (`unko_nos` = 消す対象の運行NO)。
+async fn save_daily(
+    pg: &Mutex<PgClient>,
+    tenant_id: Uuid,
+    daily: HashMap<DayKey, DailyHours>,
+    unko_nos: MonthUnkoNos,
+) -> Result<(), ()> {
+    let mut client = pg.lock().await;
+    let saved = pg::save_daily_hours_in_tx(&mut client, tenant_id, daily, unko_nos).await;
+    saved.map_err(drop)
 }
 
 /// zip を展開して KUDGURI と KUDGIVT の行を読む。全エントリを展開できることも確かめる (展開できないエントリが在れば失敗)。

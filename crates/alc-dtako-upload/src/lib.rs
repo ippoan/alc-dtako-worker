@@ -2,6 +2,7 @@
 //!
 //! - [`routes`]: 口 (`POST /upload`・`POST /internal/rerun/{upload_id}`・`POST /split-csv/{upload_id}`・`POST /split-csv-all`・`POST /recalculate`・`POST /recalculate-driver`・`POST /recalculate-drivers`・履歴の読み取りの GET 3 つ) と、その State
 //! - [`ingest`]: アップロードの取り込みの流れ。zip を保存先に置き、運行と日別を DB に入れ、分割する (axum に依るのは `Bytes` の型だけ)
+//! - [`narrow`]: 取り込みの後の日別の計算し直しで、計算に渡す運行を束ね (鎖) の範囲に縮める (選ぶだけ。DB と保存先に触れない)
 //! - [`split`]: 分割の流れ (axum に依らない) と、ログの差し込み口
 //! - [`repo`] / [`pg`]: SQL の定数と、それを流す tokio-postgres 実装 (接続は持たない)
 //! - [`recalc`]: 再計算の流れ (月の全員・乗務員ごと)。分割の出力やアップロードの zip を読み、日別を計算し直して乗務員ごとに保存する (axum に依らない) と、その event
@@ -12,6 +13,7 @@
 
 mod archive;
 pub mod ingest;
+pub mod narrow;
 pub mod pg;
 pub mod recalc;
 pub mod repo;

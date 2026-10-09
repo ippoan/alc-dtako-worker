@@ -354,7 +354,8 @@ fn sample_zip(break_minutes: i32) -> Vec<u8> {
     upload_zip(&kudguri, &kudgivt)
 }
 
-/// 端から端 (初回): 応答・履歴・運行・日別・セグメント・保存先 (zip と分割の出力)・分割済みの印。
+/// 端から端 (初回): 応答・履歴・運行・日別の要再計算の印・保存先 (zip と分割の出力)・分割済みの印。取り込みは日別を書かず、
+/// 印の口 (`POST /recalculate-pending`) が日別とセグメントを作る。
 #[tokio::test(flavor = "multi_thread")]
 async fn upload_imports_operations_daily_hours_and_splits() {
     let ctx = Ctx::start().await;
@@ -401,7 +402,15 @@ async fn upload_imports_operations_daily_hours_and_splits() {
     let want_masters = json!({ "office": "TEST-OFFICE", "vehicle": "TEST-VEHICLE", "employees": 2, "classifications": 3 });
     assert_eq!(ctx.rows(t, masters).await, [want_masters]);
 
-    // 日別とセグメント (値は backend と共有の `compute_daily_hours` の出力。フェリーは無し)
+    // 取り込みは日別を書かない。新しい運行の 乗務員 × 月 に印が付く
+    assert_eq!(ctx.count(t, "dtako_daily_work_hours").await, 0);
+    assert_eq!(ctx.count(t, "dtako_daily_work_segments").await, 0);
+    let march = |cd: &str| json!({ "driver_cd": cd, "month": "2026-03-01" });
+    assert_eq!(ctx.marks(t).await, [march("D-ONE"), march("D-TWO")]);
+    // 印の口が日別とセグメントを作り、印を消す (値は backend と共有の `compute_daily_hours` の出力。フェリーは無し)
+    let processed = json!({ "processed": 2, "failed": 0, "remaining": 0 });
+    assert_eq!(ctx.pending(t).await, processed);
+    assert_eq!(ctx.marks(t).await, Vec::<Value>::new());
     let days = "SELECT e.driver_cd, h.work_date, h.start_time, h.total_work_minutes, h.total_drive_minutes, h.total_rest_minutes, \
                 h.drive_minutes, h.cargo_minutes, h.total_distance, h.operation_count, h.unko_nos \
                 FROM dtako_daily_work_hours h JOIN employees e ON e.id = h.driver_id \
@@ -489,7 +498,7 @@ async fn upload_imports_operations_daily_hours_and_splits() {
     assert!(text.len() > 300 && text.starts_with(r#"{"upload_id":""#));
 
     // 応答の `Server-Timing` に、段ごとの所要が終えた順に載る (名前と数字だけ。偽の時計は読むたびに 7 進む)
-    let stages = "history;dur=7, put_zip;dur=7, parse;dur=7, prepare;dur=7, old_kudgivt;dur=7, apply;dur=7, split;dur=7, daily;dur=7";
+    let stages = "history;dur=7, put_zip;dur=7, parse;dur=7, prepare;dur=7, old_kudgivt;dur=7, apply;dur=7, split;dur=7";
     let timed = ctx.upload_timing(t, &sample_zip(60)).await;
     assert_eq!(timed, (StatusCode::OK, Some(stages.to_owned())));
     ctx.finish().await;
@@ -593,34 +602,23 @@ async fn previous_kudgivt_is_read_concurrently_and_bound_to_its_operation() {
         let kudgivt: Vec<String> = (1..=8).map(line).collect();
         upload_zip(&kudguri, &kudgivt)
     };
-    // 取り込みの後の日別の計算し直し (分割の出力を同時に読む) は外す (上限 0)。ここで見る GET を前回の KUDGIVT の読み込みだけにする
-    let app = || ctx.limited_app(t, 0);
-    // 計算し直しを飛ばした Warn を除いたログ
-    let import_logs = |ctx: &Ctx| -> Vec<(LogLevel, String)> {
-        let lines = ctx.log_lines().into_iter();
-        lines.filter(|(_, m)| !m.contains("daily recalc")).collect()
-    };
 
     // 初回: 既に在る運行が無いので、前回の KUDGIVT は読まない (GET は分割の zip の読み直しの 1 本だけ)
-    ctx.upload_via(app(), "first.zip", &zip_of_minutes(100))
-        .await;
+    ctx.upload_ok(t, "first.zip", &zip_of_minutes(100)).await;
     assert_eq!(ctx.store.max_get_running(), 1);
 
     // 同じ zip の上げ直し: 8 運行ぶんを同時に読む (上限まで)。全部読めて値が同じなので、変更記録は付かない
-    let body = ctx
-        .upload_via(app(), "same.zip", &zip_of_minutes(100))
-        .await;
-    assert_eq!(json_of(&body)["operations_count"], 8);
+    let body = ctx.upload_ok(t, "same.zip", &zip_of_minutes(100)).await;
+    assert_eq!(body["operations_count"], 8);
     assert_eq!(ctx.store.max_get_running(), GET_CONCURRENCY);
     assert_eq!(ctx.changes(t).await, Vec::<Value>::new());
-    assert_eq!(import_logs(&ctx), []);
+    assert_eq!(ctx.log_lines(), []);
 
     // 全運行の運転の分数を変えた上げ直しで、1 本 (U-9005) の読み込みだけ失敗させる:
     // ほかの 7 運行は、その運行の前回の分数 (100 + 番号) と今回の分数 (200 + 番号) で記録が付く。
     // U-9005 は前回の分数が取れないので、分数だけの違いでは記録しない
     ctx.store.fail_gets_containing("/unko/U-9005/", 1);
-    ctx.upload_via(app(), "changed.zip", &zip_of_minutes(200))
-        .await;
+    ctx.upload_ok(t, "changed.zip", &zip_of_minutes(200)).await;
     let snapshot = |drive_minutes: i32| {
         json!({
             "driver_cd": "D-ONE", "departure_at": "2026-03-02T08:15:00Z", "return_at": "2026-03-02T17:15:00Z",
@@ -631,17 +629,8 @@ async fn previous_kudgivt_is_read_concurrently_and_bound_to_its_operation() {
     let want_changes: Vec<Value> = [1, 2, 3, 4, 6, 7, 8].into_iter().map(change).collect();
     assert_eq!(ctx.changes(t).await, want_changes);
     let warn = "upload: previous KUDGIVT unavailable for 1 row(s)".to_owned();
-    assert_eq!(import_logs(&ctx), [(LogLevel::Warn, warn)]);
+    assert_eq!(ctx.log_lines(), [(LogLevel::Warn, warn)]);
     assert_eq!(ctx.store.max_get_running(), GET_CONCURRENCY);
-    // 3 回とも計算し直しは飛んでいる (分割の出力の KUDGIVT は、前回の分数の読み込みの 2 回だけ読まれた)
-    let skipped = (
-        LogLevel::Warn,
-        "upload: daily recalc skipped over the GET limit: 1".to_owned(),
-    );
-    assert_eq!(ctx.log_lines().iter().filter(|l| **l == skipped).count(), 3);
-    let kudgivt_gets = ctx.store.get_calls_containing("/KUDGIVT.csv");
-    assert_eq!(kudgivt_gets.len(), 8);
-    assert!(kudgivt_gets.iter().all(|(_, n)| *n == 2));
 
     ctx.assert_no_identifiers(t, &[], &["U-90", "D-ONE", ".zip"]);
     ctx.finish().await;
@@ -863,7 +852,8 @@ async fn invalid_zip_contents_are_400_and_mark_the_history_failed() {
     let body = ctx.upload_ok(t, "10-streamed.zip", &streamed).await;
     assert_eq!(body["operations_count"], 1);
     assert_eq!(body["split_unko_nos"], json!(["U-2001"]));
-    assert_eq!(ctx.count(t, "dtako_daily_work_hours").await, 1);
+    assert_eq!(ctx.count(t, "dtako_daily_recalc_pending").await, 1);
+    assert_eq!(ctx.count(t, "dtako_daily_work_hours").await, 0);
     ctx.finish().await;
 }
 
@@ -910,6 +900,7 @@ async fn storage_and_db_failures_are_500() {
     assert_eq!(ctx.count(t, "dtako_operations").await, 0);
     assert_eq!(ctx.count(t, "dtako_daily_work_hours").await, 0);
     assert_eq!(ctx.count(t, "dtako_daily_work_segments").await, 0);
+    assert_eq!(ctx.count(t, "dtako_daily_recalc_pending").await, 0);
     assert_eq!(ctx.count(t, "employees").await, 2);
     assert_eq!(ctx.count(t, "dtako_offices").await, 1);
     // 分割は走っていない (保存先に在るのは zip だけ)
@@ -981,7 +972,7 @@ async fn split_is_retried_as_a_whole_and_does_not_fail_the_upload() {
     };
     assert_eq!(flags(ctx.operations(t).await), [true, true, true]);
 
-    // 3 回とも失敗 → 200 のまま `split_failed = 1` (運行NO の一覧は空)。運行と日別は入っていて、分割済みの印は付かない。
+    // 3 回とも失敗 → 200 のまま `split_failed = 1` (運行NO の一覧は空)。運行と日別の要再計算の印は入っていて、分割済みの印は付かない。
     // 3 回目の後は待たない
     let kudguri = [kudguri_line("U-4001", 1, "D-ONE", 6, 8, 17)];
     let kudgivt = [kudgivt_line("U-4001", 1, "D-ONE", 6, "08:15", "201", 540)];
@@ -1002,17 +993,14 @@ async fn split_is_retried_as_a_whole_and_does_not_fail_the_upload() {
     });
     assert_eq!(body, want);
     assert_eq!(ctx.sleeper.slept(), [300, 800, 300, 800]);
-    // 分割が尽きたので、日別の計算し直しはしない (取り込み時の日別が残る。Refs ippoan/alc-dtako-worker#23)
-    let skipped = (
-        LogLevel::Warn,
-        "upload: daily recalc skipped: split failed".to_owned(),
-    );
     assert_eq!(
         ctx.log_lines(),
-        [warn(1), warn(2), warn(1), warn(2), warn(3), skipped]
+        [warn(1), warn(2), warn(1), warn(2), warn(3)]
     );
     assert_eq!(flags(ctx.operations(t).await), [true, true, true, false]);
-    assert_eq!(ctx.count(t, "dtako_daily_work_hours").await, 4);
+    // 印は取り込みの本体の transaction で付いているので、分割が尽きても残る (D-ONE・D-TWO の 3 月。Refs ippoan/alc-dtako-worker#23)
+    assert_eq!(ctx.count(t, "dtako_daily_recalc_pending").await, 2);
+    assert_eq!(ctx.count(t, "dtako_daily_work_hours").await, 0);
     let completed = json!({ "filename": "exhausted.zip", "status": "completed", "error_message": null, "operations_count": 1, "has_key": true });
     assert_eq!(ctx.history(t).await[1], completed);
     assert!(!ctx.keys(t).iter().any(|k| k.contains("U-4001")));
@@ -1088,8 +1076,9 @@ async fn rerun_recovers_a_failed_upload_from_the_stored_zip() {
         ctx.operations(t).await,
         [op("U-5001", "D-ONE"), op("U-REJECT", "D-TWO")]
     );
-    assert_eq!(ctx.count(t, "dtako_daily_work_hours").await, 2);
-    assert_eq!(ctx.count(t, "dtako_daily_work_segments").await, 2);
+    let march = |cd: &str| json!({ "driver_cd": cd, "month": "2026-03-01" });
+    assert_eq!(ctx.marks(t).await, [march("D-ONE"), march("D-TWO")]);
+    assert_eq!(ctx.count(t, "dtako_daily_work_hours").await, 0);
     let want_keys = [
         "T/unko/U-5001/KUDGIVT.csv".to_owned(),
         "T/unko/U-5001/KUDGURI.csv".to_owned(),
@@ -1099,7 +1088,14 @@ async fn rerun_recovers_a_failed_upload_from_the_stored_zip() {
     ];
     assert_eq!(ctx.keys(t), want_keys);
 
-    // もう一度やり直す → 200。同じ中身なので変更記録は増えない。zip は置き直されていない (PUT は最初のアップロードの 1 回だけ)
+    // 印の口で計算し直して印を消す
+    let processed = json!({ "processed": 2, "failed": 0, "remaining": 0 });
+    assert_eq!(ctx.pending(t).await, processed);
+    assert_eq!(ctx.count(t, "dtako_daily_work_hours").await, 2);
+    assert_eq!(ctx.marks(t).await, Vec::<Value>::new());
+
+    // もう一度やり直す → 200。同じ中身なので変更記録は増えない。zip は置き直されていない (PUT は最初のアップロードの 1 回だけ)。
+    // 何も変わっていなくても、明示のやり直しなので全部の行の 乗務員 × 月 に印が付く
     let (status, again) = ctx.rerun(t, &upload_id).await;
     assert_eq!(status, StatusCode::OK, "{again}");
     assert_eq!(json_of(&again), want);
@@ -1110,8 +1106,9 @@ async fn rerun_recovers_a_failed_upload_from_the_stored_zip() {
     assert_eq!(again, want_text);
     assert_eq!(ctx.changes(t).await, Vec::<Value>::new());
     assert_eq!(ctx.history(t).await, [completed]);
+    assert_eq!(ctx.marks(t).await, [march("D-ONE"), march("D-TWO")]);
     // やり直しの `Server-Timing` は、頭の 2 段が違う (失敗した応答には、終えた段までが載る)
-    let stages = "zip_key;dur=7, get_zip;dur=7, parse;dur=7, prepare;dur=7, old_kudgivt;dur=7, apply;dur=7, split;dur=7, daily;dur=7";
+    let stages = "zip_key;dur=7, get_zip;dur=7, parse;dur=7, prepare;dur=7, old_kudgivt;dur=7, apply;dur=7, split;dur=7";
     let timed = ctx.rerun_timing(t, &upload_id).await;
     assert_eq!(timed, (StatusCode::OK, Some(stages.to_owned())));
     let ctx = ctx.run_as_superuser(REJECT_NEW).await;
@@ -1551,12 +1548,18 @@ async fn recalc(app: Router, query: &str) -> (StatusCode, Vec<Value>, String) {
 
 /// 2 人乗務の運行 (休息つき) と 1 人の運行の zip。2026-03 の運行。
 fn recalc_zip() -> Vec<u8> {
-    let kudguri = [
+    let (kudguri, kudgivt) = recalc_lines();
+    upload_zip(&kudguri, &kudgivt)
+}
+
+/// [`recalc_zip`] の KUDGURI と KUDGIVT の行。
+fn recalc_lines() -> (Vec<String>, Vec<String>) {
+    let kudguri = vec![
         kudguri_line("U-6001", 1, "D-ONE", 2, 6, 23),
         kudguri_line("U-6001", 2, "D-TWO", 2, 6, 23),
         kudguri_line("U-6002", 1, "D-ONE", 5, 9, 15),
     ];
-    let kudgivt = [
+    let kudgivt = vec![
         kudgivt_line("U-6001", 1, "D-ONE", 2, "06:15", "201", 240),
         kudgivt_line("U-6001", 1, "D-ONE", 2, "10:15", "302", 300),
         kudgivt_line("U-6001", 1, "D-ONE", 2, "15:15", "201", 420),
@@ -1564,7 +1567,7 @@ fn recalc_zip() -> Vec<u8> {
         kudgivt_line("U-6001", 2, "D-TWO", 2, "12:15", "201", 600),
         kudgivt_line("U-6002", 1, "D-ONE", 5, "09:15", "201", 360),
     ];
-    upload_zip(&kudguri, &kudgivt)
+    (kudguri, kudgivt)
 }
 
 const DAYS_QUERY: &str = "SELECT e.driver_cd, h.work_date, h.start_time, h.total_work_minutes, h.total_drive_minutes, h.total_rest_minutes, \
@@ -1578,13 +1581,20 @@ const SEGMENTS_QUERY: &str = "SELECT e.driver_cd, s.work_date, s.unko_no, s.segm
      FROM dtako_daily_work_segments s JOIN employees e ON e.id = s.driver_id \
      WHERE s.tenant_id = $1 ORDER BY e.driver_cd, s.work_date, s.start_at";
 
-/// 再計算は、アップロードしたときと同じ日別とセグメントを作り直す (分割の出力は運行NO ごとに 1 回だけ読む。2 人乗務の
-/// 運行も、休息の分数はアップロードしたときと同じ)。event の並び。フェリーの記録 (KUDGFRY) が在れば、それも計算に入る。
+/// 再計算は、zip の行をそのまま共有の `compute_daily_hours` に渡したのと同じ日別を作る (分割の出力は運行NO ごとに 1 回だけ
+/// 読む。2 人乗務の運行も、休息の分数は同じ)。日別を消してから再計算すれば同じ行が戻る。event の並び。
+/// フェリーの記録 (KUDGFRY) が在れば、それも計算に入る。
 #[tokio::test(flavor = "multi_thread")]
 async fn recalculate_rebuilds_the_same_daily_hours_as_the_upload() {
     let ctx = Ctx::start().await;
     let t = ctx.tenant("Dtako Recalc Route Tenant").await;
     ctx.upload_ok(t, "recalc.zip", &recalc_zip()).await;
+    // 取り込みは日別を書かない
+    assert_eq!(ctx.count(t, "dtako_daily_work_hours").await, 0);
+    let (status, _, _) = recalc(ctx.app(t), "year=2026&month=3").await;
+    assert_eq!(status, StatusCode::OK);
+    let (kudguri, kudgivt) = recalc_lines();
+    assert_eq!(ctx.day_views(t).await, computed_days(&kudguri, &kudgivt));
     let days = ctx.rows(t, DAYS_QUERY).await;
     let segments = ctx.rows(t, SEGMENTS_QUERY).await;
     let rest = |rows: &[Value]| -> Vec<(String, i64)> {
@@ -1701,7 +1711,13 @@ async fn recalculate_reports_fixed_words_and_saves_per_driver() {
     let zip = upload_zip(&kudguri, &kudgivt);
     ctx.upload_ok(t, "two.zip", &zip).await;
     ctx.upload_ok(other, "other.zip", &zip).await;
+    // 取り込みは日別を書かないので、先に再計算して日別を作っておく
+    for tenant_id in [t, other] {
+        let (_, events, _) = recalc(ctx.app(tenant_id), "year=2026&month=3").await;
+        assert_eq!(events.last().unwrap()["event"], "done");
+    }
     let other_days = ctx.rows(other, DAYS_QUERY).await;
+    assert_eq!(other_days.len(), 2);
 
     // KUDGIVT が保存先に無い (運行は在る) → kudgivt_not_found。日別は変わらない
     let mut kudgivt_keys: Vec<String> = Vec::new();
@@ -1957,18 +1973,10 @@ async fn recalculate_driver_reads_the_split_outputs_like_the_month_recalculation
     let rest_of = |list: [(&str, i64); 4]| -> Vec<(String, i64)> {
         list.into_iter().map(|(cd, m)| (cd.to_owned(), m)).collect()
     };
-    // 取り込みの後の計算し直し (乗務員の再計算の口と同じ数え方) で、D-ONE の 03/05 の休息 30 分 (KUDGURI に無い運行NO の行) は
-    // 数えない (取り込み時の計算は zip の全行を渡すので数えるが、計算し直しが上書きする。Refs ippoan/alc-dtako-worker#23)
-    let uploaded = [
-        ("D-ONE", 300),
-        ("D-ONE", 0),
-        ("D-THREE", 120),
-        ("D-TWO", 360),
-    ];
-    assert_eq!(rest(&days), rest_of(uploaded));
+    // 取り込みは日別を書かない (Refs ippoan/alc-dtako-worker#23)
+    assert_eq!(days, Vec::<Value>::new());
 
-    // 月の全員の再計算 (その休息は数えない)
-    ctx.clear_days(t, None).await;
+    // 月の全員の再計算 (D-ONE の 03/05 の休息 30 分 = KUDGURI に無い運行NO の行は数えない)
     let (status, _, _) = recalc(ctx.app(t), "year=2026&month=3").await;
     assert_eq!(status, StatusCode::OK);
     let month_days = ctx.rows(t, DAYS_QUERY).await;
@@ -2077,7 +2085,11 @@ async fn recalculate_drivers_reads_split_outputs_and_reports_fixed_words() {
     ctx.upload_ok(t, "first.zip", &first).await;
     ctx.upload_ok(t, "second.zip", &second).await;
     ctx.upload_ok(other, "other.zip", &first).await;
+    // 取り込みは日別を書かないので、別テナントは先に再計算して日別を作っておく
+    let (_, events, _) = recalc(ctx.app(other), "year=2026&month=3").await;
+    assert_eq!(events.last().unwrap()["event"], "done");
     let other_days = ctx.rows(other, DAYS_QUERY).await;
+    assert_eq!(other_days.len(), 3);
     let error = |message: &str| json!({ "event": "error", "message": message });
     let one = ctx.driver_id(t, "D-ONE").await;
     let three = ctx.driver_id(t, "D-THREE").await;
@@ -2439,7 +2451,7 @@ async fn recalculation_deletes_stale_days_of_the_months_operations_in_every_entr
     ctx.finish().await;
 }
 
-// ---- 取り込みの後の日別の計算し直し (Refs ippoan/alc-dtako-worker#23) ----
+// ---- 日別の要再計算の印と印の口 (Refs ippoan/alc-dtako-worker#23) ----
 
 /// 同じ乗務員 (D-ONE) の 2 運行の KUDGURI。1 本目 (U-7001) の帰着 03/02 21:15 から 7 時間で 2 本目 (U-7002) が 03/03 04:15 に出る
 /// (日跨ぎの 480 分未満) ので、乗務員の月をまとめて計算すると 1 つの勤務日に束ねられる。
@@ -2503,7 +2515,7 @@ fn computed_days(kudguri: &[String], kudgivt: &[String]) -> Vec<Value> {
 }
 
 impl Ctx {
-    /// 日別の計算し直しの GET の上限を `max_gets` にした口。
+    /// 印の口の GET の上限を `max_gets` にした口。
     fn limited_app(&self, tenant_id: Uuid, max_gets: usize) -> Router {
         let limits = IngestLimits {
             max_daily_recalc_gets: max_gets,
@@ -2514,12 +2526,27 @@ impl Ctx {
             .layer(Extension(TenantId(tenant_id)))
     }
 
-    /// `app` に zip を送り、200 を確かめて本文を返す。
-    async fn upload_via(&self, app: Router, filename: &str, zip: &[u8]) -> String {
-        let body = multipart_body("file", Some(filename), zip);
-        let (status, body) = send(app, &multipart_type(), body).await;
+    /// `app` で `POST /recalculate-pending` を叩く → (status, 本文)。
+    async fn pending_via(&self, app: Router) -> (StatusCode, String) {
+        let req = Request::builder()
+            .method("POST")
+            .uri("/recalculate-pending");
+        let (status, _, body) = call(app, req.body(Body::empty()).unwrap()).await;
+        (status, body)
+    }
+
+    /// 既定の上限で印の口を叩き、200 を確かめて本文を JSON で返す。
+    async fn pending(&self, tenant_id: Uuid) -> Value {
+        let (status, body) = self.pending_via(self.app(tenant_id)).await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        body
+        json_of(&body)
+    }
+
+    /// 印の `(乗務員CD, 月)` (月・乗務員CD の順)。
+    async fn marks(&self, tenant_id: Uuid) -> Vec<Value> {
+        let query = "SELECT e.driver_cd, p.month FROM dtako_daily_recalc_pending p \
+                     JOIN employees e ON e.id = p.driver_id WHERE p.tenant_id = $1 ORDER BY p.month, e.driver_cd";
+        self.rows(tenant_id, query).await
     }
 
     /// 運行ごとの分割の出力 (`{テナント}/unko/`) への GET が呼ばれた回数の合計。
@@ -2530,13 +2557,11 @@ impl Ctx {
         calls.iter().map(|(_, n)| n).sum()
     }
 
-    /// 日別の計算し直しのログ (計算し直しの Warn と、読めない KUDGIVT の Warn)。
-    fn daily_logs(&self) -> Vec<(LogLevel, String)> {
+    /// 印の口のログ (件数の Warn と、読めない KUDGIVT の Warn)。
+    fn pending_logs(&self) -> Vec<(LogLevel, String)> {
         let lines = self.log_lines().into_iter();
-        let daily = |(_, m): &(LogLevel, String)| {
-            m.contains("daily recalc") || m.contains("KUDGIVT unavailable for")
-        };
-        lines.filter(daily).collect()
+        let pending = |(_, m): &(LogLevel, String)| m.starts_with("recalculate-pending");
+        lines.filter(pending).collect()
     }
 
     /// 日別を [`day_view`] の形で (乗務員CD・日・開始時刻の順)。
@@ -2553,29 +2578,51 @@ fn warn(message: &str) -> (LogLevel, String) {
     (LogLevel::Warn, message.to_owned())
 }
 
-/// 取り込み (アップロード・やり直し) の後、今回の乗務員 × 月を、乗務員の再計算の口と同じ数え方で計算し直す。別々の zip で
-/// 取り込んだ同じ乗務員の 2 運行は、2 本目の取り込み直後に、再計算の口を打った後と同じ日別・セグメントになる。
-/// 陽性対照: 計算し直しを通さない値 (上限 0 で飛ばした取り込み = 2 本目の zip だけで計算した値) とは違う。
-/// やり直しの口も計算し直す。
+/// 3 月の印 1 つ (`marks` の形)。
+fn march(driver_cd: &str) -> Value {
+    json!({ "driver_cd": driver_cd, "month": "2026-03-01" })
+}
+
+fn counts(processed: usize, failed: usize, remaining: usize) -> Value {
+    json!({ "processed": processed, "failed": failed, "remaining": remaining })
+}
+
+/// #23 の完了条件: 同じ乗務員の 2 運行 (1 本目の帰着から 7 時間で 2 本目が出る) を別々の zip で取り込む → 取り込みは日別を書かず
+/// 印だけ付ける (保存先の分割の出力も読まない) → 印の口が、乗務員の再計算の口と 1 列も違わない日別・セグメントを作り、印を消す。
+/// 陽性対照: 印の口の前は日別が無い・2 本目だけで計算した値は束ねた値と違う。
 #[tokio::test(flavor = "multi_thread")]
-async fn upload_recalculates_the_drivers_month_like_the_driver_recalculation() {
+async fn pending_recalculates_the_marked_month_like_the_driver_recalculation() {
     let ctx = Ctx::start().await;
-    let t = ctx.tenant("Dtako Daily Recalc Tenant").await;
+    let t = ctx.tenant("Dtako Pending Tenant").await;
     let (first, second) = bundled_zips();
     ctx.upload_ok(t, "first.zip", &first).await;
-    let gets_before = ctx.unko_gets(t);
-    let (status, body) = ctx.upload(t, "second.zip", &second).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    // 2 本目の計算し直しの GET = 乗務員の月の運行 2 つ × (KUDGIVT・KUDGFRY)
-    assert_eq!(ctx.unko_gets(t) - gets_before, 4);
+    ctx.upload_ok(t, "second.zip", &second).await;
+    // 取り込みは日別を書かない・分割の出力を読まない (どちらも新しい運行なので前回の KUDGIVT も読まない)。印は 1 つ
+    assert_eq!(ctx.rows(t, DAYS_QUERY).await, Vec::<Value>::new());
+    assert_eq!(ctx.rows(t, SEGMENTS_QUERY).await, Vec::<Value>::new());
+    assert_eq!(ctx.unko_gets(t), 0);
+    assert_eq!(ctx.marks(t).await, [march("D-ONE")]);
+
+    // 印の口: 乗務員の月の運行 2 つ × (KUDGIVT・KUDGFRY) を読み、束ねた日別を作って印を消す
+    let (status, body) = ctx.pending_via(ctx.app(t)).await;
+    assert_eq!((status, json_of(&body)), (StatusCode::OK, counts(1, 0, 0)));
+    assert_eq!(body, r#"{"processed":1,"failed":0,"remaining":0}"#);
+    assert_eq!(ctx.unko_gets(t), 4);
+    assert_eq!(ctx.marks(t).await, Vec::<Value>::new());
     let days = ctx.rows(t, DAYS_QUERY).await;
     let segments = ctx.rows(t, SEGMENTS_QUERY).await;
     let views = ctx.day_views(t).await;
-    // 03/02 に始まる勤務日に 2 運行が束ねられている
     assert_eq!(views[0][1], "2026-03-02");
     assert_eq!(views[0][8], json!(["U-7001", "U-7002"]));
+    // 陽性対照: 2 本目の zip だけで計算した日 (取り込みの時点の計算の値) は、束ねた日別に無い
+    let (kudguri, kudgivt) = (bundled_kudguri(), bundled_kudgivt());
+    let only_second = computed_days(&kudguri[1..], &kudgivt[1..]);
+    assert!(!views.contains(&only_second[0]));
+    // 印が無ければ何もしない (読まない)
+    assert_eq!(ctx.pending(t).await, counts(0, 0, 0));
+    assert_eq!(ctx.unko_gets(t), 4);
 
-    // 乗務員の再計算の口を打っても、日別もセグメントも変わらない
+    // 乗務員の再計算の口を打っても、日別もセグメントも 1 列も変わらない
     let one = ctx.driver_id(t, "D-ONE").await;
     let (status, events, _) = recalc_driver(ctx.app(t), 3, &one).await;
     assert_eq!(status, StatusCode::OK);
@@ -2585,121 +2632,87 @@ async fn upload_recalculates_the_drivers_month_like_the_driver_recalculation() {
     );
     assert_eq!(ctx.rows(t, DAYS_QUERY).await, days);
     assert_eq!(ctx.rows(t, SEGMENTS_QUERY).await, segments);
-    assert_eq!(ctx.daily_logs(), []);
 
-    // 陽性対照: 計算し直しを飛ばす (上限 0) と、2 本目の日別は 2 本目の zip だけで計算した値のまま。それは束ねた値と違う
-    let raw = ctx.tenant("Dtako Daily Recalc Raw").await;
-    ctx.upload_via(ctx.limited_app(raw, 0), "first.zip", &first)
-        .await;
-    let raw_body = ctx
-        .upload_via(ctx.limited_app(raw, 0), "second.zip", &second)
-        .await;
-    let (kudguri, kudgivt) = (bundled_kudguri(), bundled_kudgivt());
-    let only_first = computed_days(&kudguri[..1], &kudgivt[..1]);
-    let only_second = computed_days(&kudguri[1..], &kudgivt[1..]);
-    let raw_views = ctx.day_views(raw).await;
-    assert_eq!(raw_views, [only_first, only_second.clone()].concat());
-    assert_ne!(raw_views, views);
-    assert!(!views.contains(&only_second[0]));
-    let skipped = warn("upload: daily recalc skipped over the GET limit: 1");
-    assert_eq!(ctx.daily_logs(), [skipped.clone(), skipped]);
+    // 別テナントで同じ 2 つを取り込み、印の口を通さず乗務員の再計算の口だけを打つ → 同じ日別・セグメント。その口も印を消す
+    let u = ctx.tenant("Dtako Pending Driver Only").await;
+    ctx.upload_ok(u, "first.zip", &first).await;
+    ctx.upload_ok(u, "second.zip", &second).await;
+    assert_eq!(ctx.marks(u).await, [march("D-ONE")]);
+    let u_one = ctx.driver_id(u, "D-ONE").await;
+    recalc_driver(ctx.app(u), 3, &u_one).await;
+    assert_eq!(ctx.rows(u, DAYS_QUERY).await, days);
+    assert_eq!(ctx.rows(u, SEGMENTS_QUERY).await, segments);
+    assert_eq!(ctx.marks(u).await, Vec::<Value>::new());
+    assert_eq!(ctx.pending(u).await, counts(0, 0, 0));
 
-    // やり直しの口 (上限は既定) は計算し直す → 束ねた値になる
-    let raw_id = json_of(&raw_body)["upload_id"].as_str().unwrap().to_owned();
-    let (status, again) = ctx.rerun(raw, &raw_id).await;
-    assert_eq!(status, StatusCode::OK, "{again}");
-    assert_eq!(ctx.day_views(raw).await, views);
-    assert_eq!(ctx.rows(raw, SEGMENTS_QUERY).await, segments);
-    assert_eq!(ctx.daily_logs().len(), 2);
-    let needles = ["U-7001", "U-7002", "D-ONE", &one, &raw_id];
-    ctx.assert_no_identifiers(t, &[], &needles);
-    ctx.assert_no_identifiers(raw, &[], &needles);
+    assert_eq!(ctx.pending_logs(), []);
+    let needles = ["U-7001", "U-7002", "D-ONE", &one, &u_one];
+    ctx.assert_no_identifiers(t, &[&body], &needles);
     ctx.finish().await;
 }
 
-/// 計算し直しができないとき、取り込みは成功のまま (200・本文の形は同じ) で、日別は取り込み時の値が残る。ログは固定の語と件数だけ。
-/// - 分割が尽きた (PUT が全部失敗): 計算し直さない
-/// - 分割の出力の KUDGIVT を読めない (GET の失敗): その乗務員 × 月を失敗に数える
-/// - 保存が落ちる (検査用の制約): 同じ
+/// 取り込みが印を付けるのは、日別が変わりうる運行だけ: 同じ zip の取り込み直しは付けない (日別も変わらない)・KUDGIVT だけを
+/// 変えた zip は付ける・乗務員を変えた zip は前の乗務員にも付ける・前回の KUDGIVT が保存先に無い / 読めないなら付ける。
 #[tokio::test(flavor = "multi_thread")]
-async fn upload_keeps_the_upload_time_days_when_the_daily_recalc_fails() {
+async fn upload_marks_only_the_operations_that_may_change_the_days() {
     let ctx = Ctx::start().await;
-    let (first, second) = bundled_zips();
-    // 取り込み時の値 (計算し直しを飛ばした取り込み)
-    let raw = ctx.tenant("Dtako Daily Keep Raw").await;
-    ctx.upload_via(ctx.limited_app(raw, 0), "first.zip", &first)
-        .await;
-    ctx.upload_via(ctx.limited_app(raw, 0), "second.zip", &second)
-        .await;
-    let raw_days = ctx.rows(raw, DAYS_QUERY).await;
-    let raw_segments = ctx.rows(raw, SEGMENTS_QUERY).await;
-    let skipped = warn("upload: daily recalc skipped over the GET limit: 1");
-    assert_eq!(ctx.daily_logs(), [skipped.clone(), skipped.clone()]);
+    let t = ctx.tenant("Dtako Pending Marks Tenant").await;
+    let kudguri = [kudguri_line("U-7101", 1, "D-ONE", 2, 8, 17)];
+    let kudgivt = |start: &str| [kudgivt_line("U-7101", 1, "D-ONE", 2, start, "201", 480)];
+    let zip = upload_zip(&kudguri, &kudgivt("08:15"));
+    ctx.upload_ok(t, "first.zip", &zip).await;
+    assert_eq!(ctx.pending(t).await, counts(1, 0, 0));
+    let days = ctx.rows(t, DAYS_QUERY).await;
+    assert_eq!(days.len(), 1);
 
-    // 分割の PUT が全部失敗する (2 エントリ) → 200・split_failed = 2・取り込み時の値のまま
-    let s = ctx.tenant("Dtako Daily Keep Split").await;
-    ctx.upload_ok(s, "first.zip", &first).await;
-    ctx.store.fail_puts_containing(&format!("{s}/unko/"), 100);
-    let (status, split_body) = ctx.upload(s, "second.zip", &second).await;
-    assert_eq!(status, StatusCode::OK, "{split_body}");
-    assert_eq!(json_of(&split_body)["split_failed"], 2);
-    assert_eq!(ctx.rows(s, DAYS_QUERY).await, raw_days);
-    assert_eq!(ctx.rows(s, SEGMENTS_QUERY).await, raw_segments);
-    let split_failed = warn("upload: daily recalc skipped: split failed");
-    let mut want = vec![skipped.clone(), skipped, split_failed];
-    assert_eq!(ctx.daily_logs(), want);
+    // 同じ zip をもう一度: 前回の KUDGIVT (1 回読む) と今回が同じ・snapshot も同じ → 印なし・日別もそのまま
+    ctx.upload_ok(t, "same.zip", &zip).await;
+    assert_eq!(ctx.marks(t).await, Vec::<Value>::new());
+    assert_eq!(ctx.rows(t, DAYS_QUERY).await, days);
+    assert_eq!(ctx.unko_gets(t), 2 + 1);
 
-    // 分割の出力を読めない → 200・取り込み時の値のまま・失敗の件数
-    let g = ctx.tenant("Dtako Daily Keep Get").await;
-    ctx.upload_ok(g, "first.zip", &first).await;
-    ctx.store.fail_gets_containing(&format!("{g}/unko/"), 100);
-    let (status, get_body) = ctx.upload(g, "second.zip", &second).await;
-    assert_eq!(status, StatusCode::OK, "{get_body}");
-    assert_eq!(json_of(&get_body)["split_failed"], 0);
-    assert_eq!(ctx.rows(g, DAYS_QUERY).await, raw_days);
-    assert_eq!(ctx.rows(g, SEGMENTS_QUERY).await, raw_segments);
-    want.push(warn("upload: KUDGIVT unavailable for 2 operation(s)"));
-    want.push(warn("upload: daily recalc failed: 1"));
-    assert_eq!(ctx.daily_logs(), want);
+    // KUDGIVT だけを変えた (KUDGURI も分数も同じで、運転の始まりだけが 15 分遅い。snapshot は変わらない = 変更記録なし) →
+    // 前回と今回の KUDGIVT のバイト列の違いで印
+    let later = upload_zip(&kudguri, &kudgivt("08:30"));
+    ctx.upload_ok(t, "kudgivt.zip", &later).await;
+    assert_eq!(ctx.changes(t).await, Vec::<Value>::new());
+    assert_eq!(ctx.marks(t).await, [march("D-ONE")]);
+    assert_eq!(ctx.pending(t).await, counts(1, 0, 0));
 
-    // 保存が落ちる (束ねた日エントリ = 運行NO 2 つ、を入れられない検査用の制約) → 200・取り込み時の値のまま・失敗の件数
-    let ctx = ctx
-        .run_as_superuser(
-            "ALTER TABLE alc_api.dtako_daily_work_hours ADD CONSTRAINT test_reject_bundled \
-             CHECK (cardinality(unko_nos) < 2) NOT VALID",
-        )
+    // 前回の KUDGIVT が保存先に無い → 印 / 読めない (GET の失敗) → 印
+    ctx.store.remove(&format!("{t}/unko/U-7101/KUDGIVT.csv"));
+    ctx.upload_ok(t, "gone.zip", &later).await;
+    assert_eq!(ctx.marks(t).await, [march("D-ONE")]);
+    assert_eq!(ctx.pending(t).await, counts(1, 0, 0));
+    ctx.store.fail_gets_containing("/unko/U-7101/KUDGIVT", 1);
+    ctx.upload_ok(t, "unreadable.zip", &later).await;
+    assert_eq!(ctx.marks(t).await, [march("D-ONE")]);
+    assert_eq!(ctx.pending(t).await, counts(1, 0, 0));
+
+    // 乗務員を変えた → 今の乗務員と前の乗務員の両方。印の口で、前の乗務員の 3 月も計算し直す (運行が無いので保存は空)
+    let moved = [kudguri_line("U-7101", 1, "D-TWO", 2, 8, 17)];
+    let moved_kudgivt = [kudgivt_line("U-7101", 1, "D-TWO", 2, "08:15", "201", 480)];
+    ctx.upload_ok(t, "moved.zip", &upload_zip(&moved, &moved_kudgivt))
         .await;
-    let d = ctx.tenant("Dtako Daily Keep Db").await;
-    ctx.upload_ok(d, "first.zip", &first).await;
-    let (status, db_body) = ctx.upload(d, "second.zip", &second).await;
-    assert_eq!(status, StatusCode::OK, "{db_body}");
-    assert_eq!(ctx.rows(d, DAYS_QUERY).await, raw_days);
-    assert_eq!(ctx.rows(d, SEGMENTS_QUERY).await, raw_segments);
-    want.push(warn("upload: daily recalc failed: 1"));
-    assert_eq!(ctx.daily_logs(), want);
-    // 本文の形 (8 フィールドとその順) は変わらない
-    let keys: Vec<String> = [&split_body, &get_body, &db_body]
-        .iter()
-        .map(|b| {
-            let v: serde_json::Map<String, Value> = serde_json::from_str(b).unwrap();
-            v.keys().cloned().collect::<Vec<_>>().join(",")
-        })
-        .collect();
-    assert!(split_body.starts_with(r#"{"upload_id":""#));
-    assert_eq!(keys[0], keys[1]);
-    assert_eq!(keys[1], keys[2]);
-    let needles = ["U-7001", "U-7002", "D-ONE"];
-    for tenant_id in [raw, s, g, d] {
-        ctx.assert_no_identifiers(tenant_id, &[], &needles);
-    }
+    assert_eq!(ctx.marks(t).await, [march("D-ONE"), march("D-TWO")]);
+    assert_eq!(ctx.pending(t).await, counts(2, 0, 0));
+    assert_eq!(ctx.marks(t).await, Vec::<Value>::new());
+    let drivers: Vec<Value> = ctx.rows(t, DAYS_QUERY).await;
+    let drivers: Vec<&Value> = drivers.iter().map(|r| &r["driver_cd"]).collect();
+    assert!(drivers.contains(&&json!("D-TWO")));
+    assert_eq!(ctx.pending_logs(), []);
+    ctx.assert_no_identifiers(t, &[], &["U-7101", "D-ONE", "D-TWO", ".zip"]);
     ctx.finish().await;
 }
 
-/// 計算し直しの GET が上限を越える乗務員 × 月から先は飛ばす (件数だけ Warn)。上限 2 = 運行 1 つぶん: 3 人のうち 1 人だけ計算し直す。
+/// 印の口の上限と失敗: GET の合計が上限を越える手前で止め、残りは印のまま `remaining` に数える (もう一度呼ぶと進む)。
+/// 失敗 (KUDGIVT が 1 件も無い・1 つで上限を越える・保存の DB の失敗) は `failed` に数えて印を残し、`remaining` に入れない。
+/// 印を読めなければ 500 `internal_error`。別テナントの印は読まない・消さない。ログは固定の語と件数だけ。
 #[tokio::test(flavor = "multi_thread")]
-async fn upload_skips_the_daily_recalc_over_the_get_limit() {
+async fn pending_stops_at_the_get_limit_and_keeps_the_failed_marks() {
     let ctx = Ctx::start().await;
-    let t = ctx.tenant("Dtako Daily Limit Tenant").await;
+    let t = ctx.tenant("Dtako Pending Limit Tenant").await;
+    let other = ctx.tenant("Dtako Pending Limit Other").await;
     let zip = upload_zip(
         &[
             kudguri_line("U-8001", 1, "D-THREE", 10, 8, 17),
@@ -2712,19 +2725,156 @@ async fn upload_skips_the_daily_recalc_over_the_get_limit() {
             kudgivt_line("U-9002", 1, "D-FIVE", 12, "08:15", "201", 300),
         ],
     );
-    let body = ctx
-        .upload_via(ctx.limited_app(t, 2), "three.zip", &zip)
-        .await;
-    assert_eq!(json_of(&body)["split_failed"], 0);
+    ctx.upload_ok(t, "three.zip", &zip).await;
+    ctx.upload_ok(other, "three.zip", &zip).await;
+    let three = [march("D-FIVE"), march("D-FOUR"), march("D-THREE")];
+    assert_eq!(ctx.marks(t).await, three);
+
+    // 上限 2 = 運行 1 つぶん: 1 人ずつ進む。残りは印のまま
+    let limited = || ctx.limited_app(t, 2);
+    let (status, body) = ctx.pending_via(limited()).await;
+    assert_eq!((status, json_of(&body)), (StatusCode::OK, counts(1, 0, 2)));
     assert_eq!(ctx.unko_gets(t), 2);
-    let skipped = warn("upload: daily recalc skipped over the GET limit: 2");
-    assert_eq!(ctx.daily_logs(), [skipped]);
-    // 既定の上限では 3 人とも計算し直す (運行 3 つ × 2)
-    ctx.upload_ok(t, "three-again.zip", &zip).await;
-    assert_eq!(ctx.unko_gets(t), 2 + 3 * 2 + 3);
-    assert_eq!(ctx.daily_logs().len(), 1);
-    // 成功の本文は運行NO の一覧を返す (アップロードの口の 8 フィールド)。識別子を見るのはログだけ
-    assert_eq!(json_of(&body)["split_unko_nos_total"], 3);
-    ctx.assert_no_identifiers(t, &[], &["U-8001", "U-9001", "D-THREE", "D-FOUR"]);
+    assert_eq!(ctx.marks(t).await.len(), 2);
+    let (_, body) = ctx.pending_via(limited()).await;
+    assert_eq!(json_of(&body), counts(1, 0, 1));
+    let (_, body) = ctx.pending_via(limited()).await;
+    assert_eq!(json_of(&body), counts(1, 0, 0));
+    assert_eq!(ctx.marks(t).await, Vec::<Value>::new());
+    assert_eq!(ctx.unko_gets(t), 6);
+    let limit_logs = [
+        warn("recalculate-pending: processed 1, failed 0, remaining 2"),
+        warn("recalculate-pending: processed 1, failed 0, remaining 1"),
+    ];
+    assert_eq!(ctx.pending_logs(), limit_logs);
+    // 別テナントの印は読まない・消さない
+    assert_eq!(ctx.marks(other).await, three);
+    assert_eq!(ctx.unko_gets(other), 0);
+
+    // 失敗: D-THREE の分割の出力の KUDGIVT が無い → 失敗に数え、印は残る (remaining に入れないので、呼び手は繰り返さない)
+    ctx.store.remove(&format!("{t}/unko/U-8001/KUDGIVT.csv"));
+    let rerun_all = upload_zip(
+        &[kudguri_line("U-8001", 1, "D-THREE", 10, 8, 17)],
+        &[kudgivt_line(
+            "U-8001", 1, "D-THREE", 10, "08:15", "201", 300,
+        )],
+    );
+    ctx.store
+        .fail_puts_containing(&format!("{t}/unko/U-8001/KUDGIVT"), 100);
+    ctx.upload_ok(t, "no-kudgivt.zip", &rerun_all).await;
+    assert_eq!(ctx.marks(t).await, [march("D-THREE")]);
+    assert_eq!(ctx.pending(t).await, counts(0, 1, 0));
+    assert_eq!(ctx.pending(t).await, counts(0, 1, 0));
+    assert_eq!(ctx.marks(t).await, [march("D-THREE")]);
+    // 1 つで上限を越える (上限 0) も失敗に数える (いつまでも入らないので remaining にしない)
+    let (_, body) = ctx.pending_via(ctx.limited_app(t, 0)).await;
+    assert_eq!(json_of(&body), counts(0, 1, 0));
+    // 乗務員を引けない (乗務員CD の無い乗務員の印) も失敗に数え、印は残る
+    {
+        let mut c = ctx.pg.inner.lock().await;
+        let no_cd = "INSERT INTO employees (tenant_id, name) VALUES ($1, 'TEST-NO-CD')";
+        assert_eq!(exec(&mut c, t, no_cd).await, 1);
+        let mark = "INSERT INTO dtako_daily_recalc_pending (tenant_id, driver_id, month) \
+                    SELECT $1, id, DATE '2026-03-01' FROM employees WHERE tenant_id = $1 AND name = 'TEST-NO-CD'";
+        assert_eq!(exec(&mut c, t, mark).await, 1);
+    }
+    assert_eq!(ctx.pending(t).await, counts(0, 2, 0));
+    assert_eq!(ctx.count(t, "dtako_daily_recalc_pending").await, 2);
+
+    // 保存の DB の失敗 (検査用の制約で D-FOUR の日別を入れられない) → 失敗に数え、印は残る
+    let ctx = ctx
+        .run_as_superuser(
+            "ALTER TABLE alc_api.dtako_daily_work_segments ADD CONSTRAINT test_reject_pending \
+             CHECK (unko_no <> 'U-9001') NOT VALID",
+        )
+        .await;
+    ctx.upload_ok(other, "again.zip", &zip).await;
+    assert_eq!(ctx.pending(other).await, counts(2, 1, 0));
+    assert_eq!(ctx.marks(other).await, [march("D-FOUR")]);
+    let no_cd = json!({ "driver_cd": null, "month": "2026-03-01" });
+    assert_eq!(ctx.marks(t).await, [march("D-THREE"), no_cd]);
+
+    // 印を読めない (権限なし) → 500・固定の語
+    let ctx = ctx
+        .run_as_superuser("REVOKE SELECT ON alc_api.dtako_daily_recalc_pending FROM alc_api_app")
+        .await;
+    let (status, body) = ctx.pending_via(ctx.app(t)).await;
+    assert_eq!(
+        (status, body.as_str()),
+        (StatusCode::INTERNAL_SERVER_ERROR, INTERNAL_ERROR)
+    );
+    let last = ctx.log_lines().pop().unwrap();
+    let db_error = (
+        LogLevel::Error,
+        "recalculate-pending failed: db (42501)".to_owned(),
+    );
+    assert_eq!(last, db_error);
+    let needles = ["U-8001", "U-9001", "D-THREE", "D-FOUR", &other.to_string()];
+    ctx.assert_no_identifiers(t, &[&body], &needles);
+    ctx.finish().await;
+}
+
+/// 再計算の 3 口も、計算した 乗務員 × 月 の印を消す (月の全員は乗務員CD で、1 人・一括は乗務員の id で)。ほかの月の印・
+/// 口が運行を読み始めた後に付いた印 (created_at が後) は消さない。
+#[tokio::test(flavor = "multi_thread")]
+async fn recalculations_clear_only_the_marks_they_computed() {
+    let ctx = Ctx::start().await;
+    let t = ctx.tenant("Dtako Pending Clear Tenant").await;
+    let (first, second) = driver_zips();
+    ctx.upload_ok(t, "first.zip", &first).await;
+    ctx.upload_ok(t, "second.zip", &second).await;
+    let april = upload_zip(
+        &[kudguri_line("U-8401", 1, "D-ONE", 1, 8, 17).replace("2026/03/01", "2026/04/01")],
+        &[],
+    );
+    ctx.upload_ok(t, "april.zip", &april).await;
+    let april_one = json!({ "driver_cd": "D-ONE", "month": "2026-04-01" });
+    let all = || {
+        vec![
+            march("D-ONE"),
+            march("D-THREE"),
+            march("D-TWO"),
+            april_one.clone(),
+        ]
+    };
+    assert_eq!(ctx.marks(t).await, all());
+    // 後に付いた印にする (D-TWO の 3 月の印を、時刻 1 時間先で付け直す。アプリのロールは印を UPDATE できない)
+    let d_two_march = "DELETE FROM dtako_daily_recalc_pending WHERE tenant_id = $1 AND month = DATE '2026-03-01' \
+                       AND driver_id IN (SELECT id FROM employees WHERE tenant_id = $1 AND driver_cd = 'D-TWO')";
+    let later = "INSERT INTO dtako_daily_recalc_pending (tenant_id, driver_id, month, created_at) \
+                 SELECT $1, id, DATE '2026-03-01', now() + interval '1 hour' FROM employees \
+                 WHERE tenant_id = $1 AND driver_cd = 'D-TWO'";
+    {
+        let mut c = ctx.pg.inner.lock().await;
+        assert_eq!(exec(&mut c, t, d_two_march).await, 1);
+        assert_eq!(exec(&mut c, t, later).await, 1);
+    }
+
+    // 月の全員: 3 月の D-ONE・D-THREE の印が消える。後に付いた D-TWO の印と、4 月の印は残る
+    let (_, events, _) = recalc(ctx.app(t), "year=2026&month=3").await;
+    assert_eq!(events.last().unwrap()["event"], "done");
+    assert_eq!(ctx.marks(t).await, [march("D-TWO"), april_one.clone()]);
+
+    // 1 人: 3 月の印を今の時刻で付け直す → D-ONE の 3 月だけ消える
+    let restore = "INSERT INTO dtako_daily_recalc_pending (tenant_id, driver_id, month) \
+         SELECT $1, id, DATE '2026-03-01' FROM employees WHERE tenant_id = $1 AND driver_cd IN ('D-ONE', 'D-THREE', 'D-TWO')";
+    {
+        let mut c = ctx.pg.inner.lock().await;
+        assert_eq!(exec(&mut c, t, d_two_march).await, 1);
+        assert_eq!(exec(&mut c, t, restore).await, 3);
+    }
+    let one = ctx.driver_id(t, "D-ONE").await;
+    let (_, events, _) = recalc_driver(ctx.app(t), 3, &one).await;
+    assert_eq!(events.last().unwrap()["event"], "done");
+    let rest = [march("D-THREE"), march("D-TWO"), april_one.clone()];
+    assert_eq!(ctx.marks(t).await, rest);
+
+    // 一括: D-TWO・D-THREE の 3 月が消える。4 月の印は残る
+    let two = ctx.driver_id(t, "D-TWO").await;
+    let three = ctx.driver_id(t, "D-THREE").await;
+    let (_, events, _) = recalc_drivers(ctx.app(t), 3, &[&two, &three]).await;
+    let done = json!({ "event": "batch_done", "total": 2, "done": 2, "errors": 0 });
+    assert_eq!(events.last().unwrap(), &done);
+    assert_eq!(ctx.marks(t).await, [april_one]);
     ctx.finish().await;
 }

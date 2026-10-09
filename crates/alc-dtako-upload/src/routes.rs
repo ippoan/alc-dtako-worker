@@ -8,6 +8,8 @@
 //! - `POST /recalculate?year=&month=` → 月の全員の日別を計算し直す ([`crate::recalc`])。応答は `text/event-stream`
 //! - `POST /recalculate-driver?year=&month=&driver_id=` → 乗務員 1 人の月の日別を計算し直す。応答は `text/event-stream`
 //! - `POST /recalculate-drivers` (JSON `{year, month, driver_ids}`) → 乗務員の一括。応答は `text/event-stream`
+//! - `POST /recalculate-pending` → 日別の要再計算の印の付いた 乗務員 × 月 を計算し直す ([`crate::recalc::recalc_pending`])。
+//!   応答は JSON `{"processed","failed","remaining"}` (件数だけ。呼び手は `remaining > 0` の間だけ繰り返す)
 //! - `POST /split-csv/{upload_id}` → アップロード 1 件を分割する ([`crate::split::split_upload`])
 //! - `POST /split-csv-all` → 未分割の運行が在るテナントの、分割の元にできるアップロードを新しい順に
 //!   最大 [`SPLIT_CSV_ALL_LIMIT`] 件、1 件ずつ分割し直す。応答は `text/event-stream` (1 件ごとに `progress`、終わりに `done`)
@@ -38,7 +40,7 @@ use uuid::Uuid;
 
 use crate::ingest::{ingest_upload, rerun_upload, IngestError, IngestLimits, IngestOutcome};
 use crate::pg::{self, PendingUploadRow, UploadRow};
-use crate::recalc::{next_recalc_event, RecalcRun};
+use crate::recalc::{next_recalc_event, recalc_pending, PendingOutcome, RecalcRun};
 use crate::split::{split_upload, LogLevel, LogSink, SplitError};
 use crate::store::{ObjectStore, Sleeper};
 use crate::timing::{Clock, StageTimer};
@@ -82,6 +84,11 @@ pub fn tenant_router_with(limits: IngestLimits) -> Router<DtakoState> {
             rerun(limits, state, tenant, upload_id)
         },
     );
+    let pending = post(
+        move |state: State<DtakoState>, tenant: Extension<TenantId>| {
+            recalculate_pending(limits, state, tenant)
+        },
+    );
     Router::new()
         .route("/uploads", get(list_uploads))
         .route("/internal/pending", get(list_pending_uploads))
@@ -96,6 +103,7 @@ pub fn tenant_router_with(limits: IngestLimits) -> Router<DtakoState> {
         .route("/recalculate", post(recalculate))
         .route("/recalculate-driver", post(recalculate_driver))
         .route("/recalculate-drivers", post(recalculate_drivers))
+        .route("/recalculate-pending", pending)
 }
 
 type ApiError = (StatusCode, Json<Value>);
@@ -560,6 +568,36 @@ async fn recalculate_drivers(
     };
     let run = recalc_run(&state, tenant_id, body.year, body.month);
     recalc_response(run.drivers(body.driver_ids))
+}
+
+/// `POST /recalculate-pending` の応答 (件数だけ。識別子を返さない)。**field の順 = 本文のキーの順**。
+#[derive(Serialize)]
+struct PendingResponse {
+    processed: usize,
+    failed: usize,
+    remaining: usize,
+}
+
+/// 印の付いた 乗務員 × 月 を計算し直す。印を読めなければ 500 `internal_error` (ログは段の名前と kind だけ)。
+async fn recalculate_pending(
+    limits: IngestLimits,
+    State(state): State<DtakoState>,
+    Extension(TenantId(tenant_id)): Extension<TenantId>,
+) -> Result<Json<PendingResponse>, ApiError> {
+    let (store, log) = (state.store.as_ref(), &state.log);
+    let max_gets = limits.max_daily_recalc_gets;
+    let outcome = recalc_pending(&state.pg, store, log, tenant_id, max_gets).await;
+    let outcome = outcome.map_err(|e| db_failure(log, "recalculate-pending", &e))?;
+    let PendingOutcome {
+        processed,
+        failed,
+        remaining,
+    } = outcome;
+    Ok(Json(PendingResponse {
+        processed,
+        failed,
+        remaining,
+    }))
 }
 
 /// `text/event-stream` の応答 (`Cache-Control: no-cache`・`X-Accel-Buffering: no`)。

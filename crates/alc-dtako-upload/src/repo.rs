@@ -1,7 +1,7 @@
 //! デジタコの運行 CSV のアップロードの SQL の定数 (Refs ippoan/rust-alc-api#725)。表は alc-migrations の migration 054
 //! (`dtako_upload_history`・`dtako_operations`・`dtako_offices`・`dtako_vehicles`・`dtako_event_classifications`・
 //! `dtako_daily_work_hours`・`dtako_daily_work_segments`) と
-//! 152 (`dtako_operation_changes`)、乗務員は `employees`。
+//! 152 (`dtako_operation_changes`)・162 (`dtako_daily_recalc_pending` = 日別の「要再計算」の印)、乗務員は `employees`。
 //!
 //! ここに在るのは SQL の定数だけで、流すのは [`crate::pg`] の 1 か所 (worker と `tests/sql_db.rs` が同じものを使う)。
 //! テナントを設定した接続 (RLS) で流し、加えて `WHERE tenant_id` でも絞る。
@@ -241,4 +241,34 @@ pub mod sql {
     /// 履歴に完了の印を付ける。$1 operations_count / $2 id / $3 tenant_id。
     pub const MARK_UPLOAD_COMPLETED: &str =
         "UPDATE alc_api.dtako_upload_history SET status = 'completed', operations_count = $1 WHERE id = $2 AND tenant_id = $3";
+
+    // ---- 日別の「要再計算」の印 (migration 162。Refs ippoan/alc-dtako-worker#23) ----
+
+    /// 入れ替える前の運行の 乗務員 × 日付 (印を付ける対象を決めるため)。$1 tenant_id / $2 unko_no の配列 (TEXT[]) →
+    /// unko_no, crew_role, driver_id (NULL 可), reading_date, operation_date (NULL 可)。
+    pub const LIST_OPERATION_RECALC_KEYS: &str = r#"SELECT unko_no, crew_role, driver_id, reading_date, operation_date
+               FROM alc_api.dtako_operations
+               WHERE tenant_id = $1 AND unko_no = ANY($2)"#;
+
+    /// 印を付ける (在れば何もしない)。$1 tenant_id / $2 driver_id の配列 (UUID[]) / $3 月初の配列 (DATE[]。$2 と同じ長さ)。
+    pub const INSERT_RECALC_PENDING: &str = r#"INSERT INTO alc_api.dtako_daily_recalc_pending (tenant_id, driver_id, month)
+               SELECT $1, t.driver_id, t.month FROM unnest($2::UUID[], $3::DATE[]) AS t(driver_id, month)
+               ON CONFLICT (tenant_id, driver_id, month) DO NOTHING"#;
+
+    /// テナントの印の全部と、読んだ時刻 (transaction の開始の時刻)。$1 tenant_id → driver_id, month, created_at, read_at
+    /// (月・乗務員の順)。
+    pub const LIST_RECALC_PENDING: &str = r#"SELECT driver_id, month, created_at, now() AS read_at
+               FROM alc_api.dtako_daily_recalc_pending
+               WHERE tenant_id = $1
+               ORDER BY month, driver_id"#;
+
+    /// 計算し直した 乗務員 × 月 の印を消す (`created_at` が $3 以前のものだけ。計算の後に付いた印は残す)。
+    /// $1 tenant_id / $2 月初 / $3 created_at の上限 / $4 driver_id (NULL 可) / $5 乗務員CD (NULL 可。その CD の乗務員の印)。
+    pub const DELETE_RECALC_PENDING: &str = r#"DELETE FROM alc_api.dtako_daily_recalc_pending
+               WHERE tenant_id = $1 AND month = $2 AND created_at <= $3
+                 AND (driver_id = $4
+                      OR driver_id IN (SELECT e.id FROM alc_api.employees e WHERE e.tenant_id = $1 AND e.driver_cd = $5))"#;
+
+    /// DB の今の時刻 (transaction の開始の時刻。再計算の口が運行を読み始めた時刻として、印を消す条件に使う)。
+    pub const SELECT_NOW: &str = "SELECT now()";
 }

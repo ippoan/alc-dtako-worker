@@ -1321,7 +1321,7 @@ async fn daily_hours_are_saved_and_replaced_on_reupload() {
     let second_day = json!({
         "driver": "TEST-ONE", "work_date": "2026-03-03", "start_time": "00:15:00", "total_work_minutes": 720,
         "total_drive_minutes": 720, "total_rest_minutes": 0, "late_night_minutes": 285, "drive_minutes": 720,
-        "cargo_minutes": 0, "total_distance": 123.5, "operation_count": 1, "unko_nos": ["DAY-1"],
+        "cargo_minutes": 0, "total_distance": 0, "operation_count": 1, "unko_nos": ["DAY-1"],
         "overlap_drive_minutes": 0, "overlap_cargo_minutes": 0, "overlap_break_minutes": 0,
         "overlap_restraint_minutes": 0, "ot_late_night_minutes": 0,
     });

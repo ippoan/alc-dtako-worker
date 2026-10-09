@@ -3,18 +3,17 @@
 //! backend の `alc-dtako` (`calculate_daily_hours`) と分割 worker (ippoan/alc-dtako-worker) が、同じこの関数を呼ぶ。
 //! **DB を呼ばない** (分類の読み込み・乗務員 id の引き当て・削除・保存は呼び手が持つ)。
 //! 式は `calculate_daily_hours` に在ったものをそのまま移した — 数値を変えない。
+//! 休息と距離の配り方は #26 で勤務日ごとに変えた (ippoan/alc-dtako-worker#26)。
 
 use std::collections::HashMap;
 
-use chrono::{NaiveDate, NaiveDateTime};
+use chrono::NaiveDateTime;
 
 use alc_csv_parser::kudgivt::KudgivtRow;
 use alc_csv_parser::kudguri::KudguriRow;
 use alc_csv_parser::work_segments::EventClass;
 
-use crate::{
-    build_day_map, group_operations_into_work_days, post_process_day_map, DayKey, FerryInfo,
-};
+use crate::{build_day_map, post_process_day_map, DayKey, FerryInfo};
 
 /// フェリーデータ（合計分 + 各エントリの開始時刻）
 pub struct FerryData {
@@ -101,9 +100,6 @@ pub fn compute_daily_hours(
     classifications: &HashMap<String, EventClass>,
     ferry: &HashMap<String, FerryData>,
 ) -> HashMap<DayKey, DailyHours> {
-    // 0. 始業ベースのワークデイグルーピング（unko_no → work_date）
-    let unko_work_date = group_operations_into_work_days(rows);
-
     // 2. Group KUDGIVT rows by unko_no
     let mut kudgivt_by_unko: HashMap<String, Vec<&KudgivtRow>> = HashMap::new();
     for row in kudgivt_rows {
@@ -111,24 +107,6 @@ pub fn compute_daily_hours(
             .entry(row.unko_no.clone())
             .or_default()
             .push(row);
-    }
-
-    // 2.5. 302休息イベントを始業ベースのワークデイで集計
-    let mut rest_event_map: HashMap<(String, NaiveDate), i32> = HashMap::new();
-    for row in kudgivt_rows {
-        if classifications.get(&row.event_cd) == Some(&EventClass::RestSplit) {
-            let dur = row.duration_minutes.unwrap_or(0);
-            if dur <= 0 {
-                continue;
-            }
-            let work_date = unko_work_date
-                .get(&row.unko_no)
-                .copied()
-                .unwrap_or(row.start_at.date());
-            *rest_event_map
-                .entry((row.driver_cd.clone(), work_date))
-                .or_insert(0) += dur;
-        }
     }
 
     // 3. 共通 build_day_map で日別集計を構築
@@ -183,33 +161,103 @@ pub fn compute_daily_hours(
         &compare_ferry_info,
     );
 
-    // 3.7. compare::DayAgg → upload用の enriched 構造体に変換
-    // unko_no → (total_distance, driver_cd) マッピング
-    let mut unko_meta: HashMap<String, (f64, String)> = HashMap::new();
-    for row in rows {
-        unko_meta.insert(
-            row.unko_no.clone(),
-            (row.total_distance.unwrap_or(0.0), row.driver_cd.clone()),
-        );
+    // 3.8. 時刻 t が属する日エントリ: 乗務員の日エントリのうち、t が [始業, 終業) に入るもの →
+    // 無ければ始業 <= t の最後のもの → それも無ければ始業が最も早いもの (build_day_map の find_start_time と同じ規則)。
+    // 窓は post_process で更新された後の workday_boundaries。日エントリに残っていない key (構内結合で消えた等) は候補にしない。
+    let mut windows: HashMap<&str, Vec<(NaiveDateTime, NaiveDateTime, &DayKey)>> = HashMap::new();
+    for (key, &(start, end)) in &workday_boundaries {
+        if compare_day_map.contains_key(key) {
+            windows
+                .entry(key.0.as_str())
+                .or_default()
+                .push((start, end, key));
+        }
+    }
+    for list in windows.values_mut() {
+        list.sort();
+    }
+    let day_of = |driver_cd: &str, t: NaiveDateTime| -> Option<DayKey> {
+        let list = windows.get(driver_cd)?;
+        list.iter()
+            .find(|(start, end, _)| t >= *start && t < *end)
+            .or_else(|| list.iter().rev().find(|(start, _, _)| t >= *start))
+            .or(list.first())
+            .map(|(_, _, key)| (*key).clone())
+    };
+
+    // 3.9. 休息 (302): 1 本ずつ、その開始が属する日エントリに積む (休息はその前の勤務の行に付く)
+    let mut rest_by_day: HashMap<DayKey, i32> = HashMap::new();
+    for row in kudgivt_rows {
+        let dur = row.duration_minutes.unwrap_or(0);
+        if classifications.get(&row.event_cd) != Some(&EventClass::RestSplit) || dur <= 0 {
+            continue;
+        }
+        if let Some(key) = day_of(&row.driver_cd, row.start_at) {
+            *rest_by_day.entry(key).or_insert(0) += dur;
+        }
     }
 
+    // 3.10. 距離: 運行 × 乗務員ごとに、勤務の状態のイベント (Ignore でないもの) の区間距離を日エントリごとの重みにして、
+    // 運行の総距離をその比で配る。道路種別 (Ignore) は同じ区間を別に持つので重みに入れない (入れると二重になる)。
+    let mut weights: HashMap<(&str, &str), HashMap<DayKey, f64>> = HashMap::new();
+    for row in kudgivt_rows {
+        let class = classifications.get(&row.event_cd);
+        let dist = row.section_distance.unwrap_or(0.0);
+        if class.is_none() || class == Some(&EventClass::Ignore) || dist <= 0.0 {
+            continue;
+        }
+        if let Some(key) = day_of(&row.driver_cd, row.start_at) {
+            *weights
+                .entry((row.unko_no.as_str(), row.driver_cd.as_str()))
+                .or_default()
+                .entry(key)
+                .or_insert(0.0) += dist;
+        }
+    }
+    let mut distance_by_day: HashMap<DayKey, f64> = HashMap::new();
+    for row in rows {
+        let total = row.total_distance.unwrap_or(0.0);
+        let mut shares: Vec<(DayKey, f64)> = weights
+            .get(&(row.unko_no.as_str(), row.driver_cd.as_str()))
+            .map(|w| w.iter().map(|(k, v)| (k.clone(), *v)).collect())
+            .unwrap_or_default();
+        shares.sort_by(|a, b| a.0.cmp(&b.0));
+        if shares.is_empty() {
+            // 区間距離が無い運行は、その運行を持つ日エントリのうち最初の 1 つに総距離を入れる
+            let first = compare_day_map
+                .iter()
+                .filter(|(k, agg)| k.0 == row.driver_cd && agg.unko_nos.contains(&row.unko_no))
+                .map(|(k, _)| k)
+                .min();
+            if let Some(key) = first {
+                *distance_by_day.entry(key.clone()).or_insert(0.0) += total;
+            }
+            continue;
+        }
+        // 0.1km に丸め、丸めの残りは最後の日エントリに寄せる (運行の日ごとの和 = 総距離。浮動小数の誤差だけ落とす)
+        let weight_sum: f64 = shares.iter().map(|(_, w)| w).sum();
+        let last = shares.len() - 1;
+        let mut given = 0.0;
+        for (i, (key, w)) in shares.into_iter().enumerate() {
+            let share = if i == last {
+                ((total - given) * 1e6).round() / 1e6
+            } else {
+                (total * w / weight_sum * 10.0).round() / 10.0
+            };
+            given += share;
+            *distance_by_day.entry(key).or_insert(0.0) += share;
+        }
+    }
+
+    // 3.11. compare::DayAgg → upload用の enriched 構造体に変換
     let mut day_map: HashMap<DayKey, DailyHours> = HashMap::new();
 
     for (key, c_agg) in &compare_day_map {
-        let (driver_cd, _work_date, _start_time) = key;
+        // total_distance: 運行の総距離を区間距離の比で日エントリに配った値 (3.10)
+        let total_distance = distance_by_day.get(key).copied().unwrap_or(0.0);
 
-        // total_distance: 各unko_noの距離をwork_minutes比率で按分
-        let total_distance: f64 = c_agg
-            .unko_nos
-            .iter()
-            .map(|u| unko_meta.get(u).map(|(d, _)| *d).unwrap_or(0.0))
-            .sum();
-
-        // rest_event_minutes: rest_event_mapから取得
-        let rest_minutes = rest_event_map
-            .get(&(driver_cd.clone(), *_work_date))
-            .copied()
-            .unwrap_or(0);
+        // rest_event_minutes: 開始がこの日エントリに属する休息 (3.9)
+        let rest_minutes = rest_by_day.get(key).copied().unwrap_or(0);
 
         // SegmentRecord の構築: compare SegRec の start_at/end_at から詳細を再計算
         // unko_no の特定: セグメント時刻と operations の dep/ret を照合
@@ -298,7 +346,7 @@ pub fn compute_daily_hours(
 mod tests {
     use super::*;
     use crate::test_support::{dt, make_kudgivt, make_kudguri};
-    use chrono::NaiveTime;
+    use chrono::{NaiveDate, NaiveTime};
 
     /// 既定の分類 (201 運転 / 202〜204 荷役 / 302 休息 / 301 休憩)。
     fn cls() -> HashMap<String, EventClass> {
@@ -857,6 +905,195 @@ mod tests {
                 let segment = ferry_day(1).remove(0).1.segments.remove(0);
                 assert!(format!("{segment:?}").starts_with("DailySegment { unko_no: \"T7\""));
                 assert_eq!(segment.clone(), segment);
+            }
+        );
+    }
+
+    /// 既定の分類に道路種別 (103 高速道) とアイドリング (412) を Ignore で足したもの。
+    fn cls_with_road() -> HashMap<String, EventClass> {
+        let mut c = cls();
+        c.insert("103".into(), EventClass::Ignore);
+        c.insert("412".into(), EventClass::Ignore);
+        c
+    }
+
+    /// 区間距離 `km` を付けたイベント。
+    fn evt_km(unko: &str, start: NaiveDateTime, cd: &str, dur: i32, km: Option<f64>) -> KudgivtRow {
+        let mut e = evt(unko, "D01", start, cd, dur);
+        e.section_distance = km;
+        e
+    }
+
+    /// 3 日にわたる 1 運行 (2026-03-02 6:00 出 → 03-04 12:00 帰着、総距離 2191.2km)。
+    /// 勤務日ごとに 6:00 から運転し、その後ろに休息 (302) が 1 本。道路種別 (103) が運転と同じ区間を重ねて持つ。
+    fn long_haul(km: [Option<f64>; 3]) -> (KudguriRow, Vec<KudgivtRow>) {
+        let mut op = make_kudguri("L1", "D01", at(2, 6, 0), at(4, 12, 0));
+        op.total_distance = Some(2191.2);
+        let mut events = Vec::new();
+        for (i, (day, drive, rest)) in [(2, 480, 960), (3, 480, 960), (4, 300, 60)]
+            .into_iter()
+            .enumerate()
+        {
+            events.push(evt_km("L1", at(day, 6, 0), "201", drive, km[i]));
+            events.push(evt_km("L1", at(day, 6, 0), "103", drive, km[i]));
+            let rest_at = at(day, 6, 0) + chrono::Duration::minutes(drive as i64);
+            events.push(evt_km("L1", rest_at, "302", rest, Some(0.0)));
+        }
+        // アイドリング (412) の距離は重みに入らない
+        events.push(evt_km("L1", at(4, 11, 30), "412", 10, Some(99.0)));
+        (op, events)
+    }
+
+    /// 日エントリごとの (key, 休息の分, 距離)。
+    fn rest_and_distance(map: HashMap<DayKey, DailyHours>) -> Vec<(DayKey, i32, f64)> {
+        sorted(map)
+            .into_iter()
+            .map(|(k, h)| (k, h.rest_event_minutes, h.total_distance))
+            .collect()
+    }
+
+    #[test]
+    fn test_long_haul_rest_goes_to_each_workday() {
+        test_group!("日別の集計 (アップロード)");
+        test_case!(
+            "24 時間を超える 1 運行: 休息 (302) は開始が属する勤務日 (= その前の勤務) の行に 1 本ずつ付く",
+            {
+                let (op, events) = long_haul([Some(100.0), Some(200.0), Some(50.0)]);
+                let got = rest_and_distance(compute_daily_hours(
+                    &[op],
+                    &events,
+                    &cls_with_road(),
+                    &no_ferry(),
+                ));
+                let rest: Vec<_> = got.iter().map(|(k, r, _)| (k.clone(), *r)).collect();
+                assert_eq!(
+                    rest,
+                    vec![
+                        (key("D01", 2, 6), 960),
+                        (key("D01", 3, 6), 960),
+                        (key("D01", 4, 6), 60)
+                    ]
+                );
+                assert_eq!(rest.iter().map(|(_, r)| r).sum::<i32>(), 960 + 960 + 60);
+            }
+        );
+    }
+
+    #[test]
+    fn test_long_haul_distance_split_by_section_distance() {
+        test_group!("日別の集計 (アップロード)");
+        test_case!(
+            "24 時間を超える 1 運行: 総距離を勤務の状態のイベントの区間距離の比 (100:200:50) で配る。道路種別は足さない。丸めの残りは最後の日",
+            {
+                let (op, events) = long_haul([Some(100.0), Some(200.0), Some(50.0)]);
+                let got = rest_and_distance(compute_daily_hours(
+                    &[op],
+                    &events,
+                    &cls_with_road(),
+                    &no_ferry(),
+                ));
+                let dist: Vec<_> = got.iter().map(|(k, _, d)| (k.clone(), *d)).collect();
+                // 2191.2 × 100/350 = 626.06 → 626.1、× 200/350 = 1252.11 → 1252.1、最後 = 2191.2 − 626.1 − 1252.1
+                assert_eq!(
+                    dist,
+                    vec![
+                        (key("D01", 2, 6), 626.1),
+                        (key("D01", 3, 6), 1252.1),
+                        (key("D01", 4, 6), 313.0)
+                    ]
+                );
+                let sum: f64 = dist.iter().map(|(_, d)| d).sum();
+                assert!((sum - 2191.2).abs() < 1e-9);
+            }
+        );
+    }
+
+    #[test]
+    fn test_long_haul_without_section_distance_goes_to_first_day() {
+        test_group!("日別の集計 (アップロード)");
+        test_case!(
+            "区間距離の無い複数日の運行: 総距離は最初の日エントリに入れ、ほかは 0 (全部の日に入れない)",
+            {
+                let (op, events) = long_haul([None, Some(0.0), None]);
+                let got = rest_and_distance(compute_daily_hours(
+                    &[op],
+                    &events,
+                    &cls_with_road(),
+                    &no_ferry(),
+                ));
+                let dist: Vec<_> = got.iter().map(|(k, _, d)| (k.clone(), *d)).collect();
+                assert_eq!(
+                    dist,
+                    vec![
+                        (key("D01", 2, 6), 2191.2),
+                        (key("D01", 3, 6), 0.0),
+                        (key("D01", 4, 6), 0.0)
+                    ]
+                );
+            }
+        );
+    }
+
+    #[test]
+    fn test_two_operations_share_a_day_get_tail_and_head() {
+        test_group!("日別の集計 (アップロード)");
+        test_case!(
+            "2 運行が同じ日エントリに載る日 = 前の運行の末尾ぶん + 次の運行の頭ぶん",
+            {
+                let mut first = make_kudguri("L2", "D01", at(2, 6, 0), at(3, 12, 0));
+                first.total_distance = Some(300.0);
+                let mut second = make_kudguri("L3", "D01", at(3, 13, 0), at(4, 17, 0));
+                second.total_distance = Some(90.0);
+                let events = vec![
+                    evt_km("L2", at(2, 6, 0), "201", 480, Some(200.0)),
+                    evt_km("L2", at(2, 14, 0), "302", 960, Some(0.0)),
+                    evt_km("L2", at(3, 6, 0), "201", 360, Some(100.0)),
+                    evt_km("L3", at(3, 13, 0), "201", 240, Some(40.0)),
+                    evt_km("L3", at(3, 17, 0), "302", 780, Some(0.0)),
+                    evt_km("L3", at(4, 6, 0), "201", 660, Some(50.0)),
+                ];
+                let got = rest_and_distance(compute_daily_hours(
+                    &[first, second],
+                    &events,
+                    &cls_with_road(),
+                    &no_ferry(),
+                ));
+                // 03-03 = L2 の末尾 (300 × 100/300) + L3 の頭 (90 × 40/90)
+                assert_eq!(
+                    got,
+                    vec![
+                        (key("D01", 2, 6), 960, 200.0),
+                        (key("D01", 3, 6), 780, 140.0),
+                        (key("D01", 4, 6), 0, 50.0)
+                    ]
+                );
+            }
+        );
+    }
+
+    #[test]
+    fn test_event_owner_falls_back() {
+        test_group!("日別の集計 (アップロード)");
+        test_case!(
+            "どの勤務日の始業より前の休息は最も早い勤務日に付く。日エントリの無い乗務員・分類に無いコードは配らない",
+            {
+                let mut op = make_kudguri("L4", "D01", at(2, 8, 0), at(2, 17, 0));
+                op.total_distance = Some(80.0);
+                let mut stranger = evt("L4", "D09", at(2, 10, 0), "302", 30);
+                stranger.section_distance = Some(5.0);
+                let events = vec![
+                    evt_km("L4", at(2, 7, 0), "302", 45, Some(0.0)),
+                    evt_km("L4", at(2, 8, 0), "201", 540, Some(80.0)),
+                    evt_km("L4", at(2, 9, 0), "999", 10, Some(500.0)),
+                    stranger,
+                ];
+                let got = rest_and_distance(compute_daily_hours(
+                    &[op],
+                    &events,
+                    &cls_with_road(),
+                    &no_ferry(),
+                ));
+                assert_eq!(got, vec![(key("D01", 2, 8), 45, 80.0)]);
             }
         );
     }

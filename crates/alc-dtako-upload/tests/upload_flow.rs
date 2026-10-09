@@ -593,25 +593,34 @@ async fn previous_kudgivt_is_read_concurrently_and_bound_to_its_operation() {
         let kudgivt: Vec<String> = (1..=8).map(line).collect();
         upload_zip(&kudguri, &kudgivt)
     };
+    // 取り込みの後の日別の計算し直し (分割の出力を同時に読む) は外す (上限 0)。ここで見る GET を前回の KUDGIVT の読み込みだけにする
+    let app = || ctx.limited_app(t, 0);
+    // 計算し直しを飛ばした Warn を除いたログ
+    let import_logs = |ctx: &Ctx| -> Vec<(LogLevel, String)> {
+        let lines = ctx.log_lines().into_iter();
+        lines.filter(|(_, m)| !m.contains("daily recalc")).collect()
+    };
 
-    // 初回: 既に在る運行が無いので、前回の KUDGIVT は読まない (KUDGIVT の GET は、分割の後の日別の計算し直しの運行ごとの 1 回だけ)
-    ctx.upload_ok(t, "first.zip", &zip_of_minutes(100)).await;
-    let kudgivt_gets = ctx.store.get_calls_containing("/KUDGIVT.csv");
-    assert_eq!(kudgivt_gets.len(), 8);
-    assert!(kudgivt_gets.iter().all(|(_, n)| *n == 1));
+    // 初回: 既に在る運行が無いので、前回の KUDGIVT は読まない (GET は分割の zip の読み直しの 1 本だけ)
+    ctx.upload_via(app(), "first.zip", &zip_of_minutes(100))
+        .await;
+    assert_eq!(ctx.store.max_get_running(), 1);
 
     // 同じ zip の上げ直し: 8 運行ぶんを同時に読む (上限まで)。全部読めて値が同じなので、変更記録は付かない
-    let body = ctx.upload_ok(t, "same.zip", &zip_of_minutes(100)).await;
-    assert_eq!(body["operations_count"], 8);
+    let body = ctx
+        .upload_via(app(), "same.zip", &zip_of_minutes(100))
+        .await;
+    assert_eq!(json_of(&body)["operations_count"], 8);
     assert_eq!(ctx.store.max_get_running(), GET_CONCURRENCY);
     assert_eq!(ctx.changes(t).await, Vec::<Value>::new());
-    assert_eq!(ctx.log_lines(), []);
+    assert_eq!(import_logs(&ctx), []);
 
     // 全運行の運転の分数を変えた上げ直しで、1 本 (U-9005) の読み込みだけ失敗させる:
     // ほかの 7 運行は、その運行の前回の分数 (100 + 番号) と今回の分数 (200 + 番号) で記録が付く。
     // U-9005 は前回の分数が取れないので、分数だけの違いでは記録しない
     ctx.store.fail_gets_containing("/unko/U-9005/", 1);
-    ctx.upload_ok(t, "changed.zip", &zip_of_minutes(200)).await;
+    ctx.upload_via(app(), "changed.zip", &zip_of_minutes(200))
+        .await;
     let snapshot = |drive_minutes: i32| {
         json!({
             "driver_cd": "D-ONE", "departure_at": "2026-03-02T08:15:00Z", "return_at": "2026-03-02T17:15:00Z",
@@ -622,8 +631,17 @@ async fn previous_kudgivt_is_read_concurrently_and_bound_to_its_operation() {
     let want_changes: Vec<Value> = [1, 2, 3, 4, 6, 7, 8].into_iter().map(change).collect();
     assert_eq!(ctx.changes(t).await, want_changes);
     let warn = "upload: previous KUDGIVT unavailable for 1 row(s)".to_owned();
-    assert_eq!(ctx.log_lines(), [(LogLevel::Warn, warn)]);
+    assert_eq!(import_logs(&ctx), [(LogLevel::Warn, warn)]);
     assert_eq!(ctx.store.max_get_running(), GET_CONCURRENCY);
+    // 3 回とも計算し直しは飛んでいる (分割の出力の KUDGIVT は、前回の分数の読み込みの 2 回だけ読まれた)
+    let skipped = (
+        LogLevel::Warn,
+        "upload: daily recalc skipped over the GET limit: 1".to_owned(),
+    );
+    assert_eq!(ctx.log_lines().iter().filter(|l| **l == skipped).count(), 3);
+    let kudgivt_gets = ctx.store.get_calls_containing("/KUDGIVT.csv");
+    assert_eq!(kudgivt_gets.len(), 8);
+    assert!(kudgivt_gets.iter().all(|(_, n)| *n == 2));
 
     ctx.assert_no_identifiers(t, &[], &["U-90", "D-ONE", ".zip"]);
     ctx.finish().await;

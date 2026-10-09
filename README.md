@@ -4,11 +4,12 @@
 rust-alc-api を Cloudflare Workers へ段階移行する 2 本目 (Refs ippoan/rust-alc-api#725) で、型は 1 本目の
 ippoan/alc-vein-worker に合わせている。
 
-口は 10 本 (どれも `/api` 付きでも受ける): **`POST /upload`** (zip の取り込み)・**`POST /internal/rerun/{upload_id}`** (やり直し)・**`POST /split-csv/{upload_id}`** (アップロード 1 件の分割)・
+口は 11 本 (どれも `/api` 付きでも受ける): **`POST /upload`** (zip の取り込み)・**`POST /internal/rerun/{upload_id}`** (やり直し)・**`POST /split-csv/{upload_id}`** (アップロード 1 件の分割)・
 **`POST /split-csv-all`** (一括分割)・**`POST /recalculate`** (月の全員の再計算)・**`POST /recalculate-driver`** (乗務員 1 人の再計算)・
-**`POST /recalculate-drivers`** (乗務員の一括の再計算) と、履歴の読み取りの **`GET /uploads`**・**`GET /internal/pending`**・**`GET /internal/download/{upload_id}`**。それ以外の path は、
+**`POST /recalculate-drivers`** (乗務員の一括の再計算)・**`POST /recalculate-pending`** (日別の要再計算の印の付いた 乗務員 × 月 の再計算) と、履歴の読み取りの **`GET /uploads`**・**`GET /internal/pending`**・**`GET /internal/download/{upload_id}`**。それ以外の path は、
 tenant ヘッダー無しが 401・有りが 404 (どのリクエストも、その前に DB へ繋ぐので、繋げなければ 503 / 500)。
-アップロード (`/upload`)・分割の 2 口・やり直しの口・履歴の読み取りの 3 口は、auth-worker の振り分けから呼ばれる。再計算の 3 口は、まだ振り分けに無い (呼ばれない)。
+アップロード (`/upload`)・分割の 2 口・やり直しの口・履歴の読み取りの 3 口・印の再計算の口 (`/api/recalculate-pending`。ippoan/auth-worker#617) は、
+auth-worker の振り分けから呼ばれる。再計算の 3 口は、まだ振り分けに無い (呼ばれない)。
 
 ## 配置
 
@@ -103,7 +104,9 @@ SQL は `src/repo.rs` の `sql` の 1 か所、流すのは `src/pg.rs` の 1 �
 | `upload_download(pg, tenant_id, upload_id)` | `SELECT_UPLOAD_DOWNLOAD` | 履歴 1 件の `(r2_zip_key, filename)` (行が無ければ `None`。key が NULL の行は `Some((None, _))`) |
 | `operations_for_recalc(pg, tenant_id, month_start, fetch_end)` | `LIST_OPERATIONS_FOR_RECALC` | 月の再計算の対象の運行 (`Vec<RecalcOperationRow>`。運行日か読取日が範囲に入る行と、その乗務員CD。読取日・運行NO の順。2 人乗務は乗務員ごとに 1 行) |
 | `driver_operations_for_recalc(pg, tenant_id, driver_id, month_start, fetch_end)` | `SELECT_DRIVER_CD`・`LIST_DRIVER_OPERATIONS_FOR_RECALC` | 乗務員の乗務員CD と、その乗務員の月の運行 (`Option<(String, Vec<RecalcOperationRow>)>`。1 transaction。乗務員が無い・乗務員CD が NULL なら `None`。運行の並びと範囲は月の全員と同じ) |
-| `save_daily_hours_in_tx(pg, tenant_id, daily, all_unko_nos)` | (日別の保存の文) | 日別の保存を 1 transaction で (`save_daily_hours_with` = 消す対象の運行NO を外から渡す形。再計算が乗務員ごとに呼ぶ) |
+| `save_daily_hours_in_tx(pg, tenant_id, daily, all_unko_nos, clear)` | (日別の保存の文)・`DELETE_RECALC_PENDING` | 日別の保存を 1 transaction で (`save_daily_hours_with` = 消す対象の運行NO を外から渡す形。再計算が乗務員ごとに呼ぶ)。`clear` (`PendingClear` = 月初・乗務員の id か乗務員CD・時刻の上限) が在れば、同じ transaction の中でその 乗務員 × 月 の要再計算の印を消す (印を消すのはここ 1 か所) |
+| `recalc_pending_marks(pg, tenant_id)` | `LIST_RECALC_PENDING` | テナントの要再計算の印の全部 (`Vec<PendingMark>`。月・乗務員の順。読んだ時刻 `read_at` も) |
+| `db_now(pg, tenant_id)` | `SELECT_NOW` | DB の今の時刻 (再計算の口が運行を読み始める前に引き、印を消す時刻の上限にする) |
 | `uploads_needing_split(pg, tenant_id)` | `LIST_UPLOADS_NEEDING_SPLIT` | 分割がまだの運行がテナントに 1 件でも在るとき、completed で key の在るアップロードの `(id, filename)` を新しい順に |
 
 分割 1 件の口が使うのは `upload_zip_key` と `mark_has_kudgivt`、一括分割の口は候補を `uploads_needing_split` で引く。
@@ -119,7 +122,7 @@ zip の取り込みのうち DB に書く部分。**SQL は backend (ippoan/rust
 | `create_upload(pg, tenant_id, filename)` | 履歴を作り id を返す (id は DB の既定値)。**テナントが存在しない**ときは `CreateUploadError::TenantNotFound` (ほかの DB の失敗と区別する) |
 | `set_upload_zip_key(pg, tenant_id, upload_id, key)` | 履歴に zip の key を記録する。**単独の transaction** (後の段が落ちても key は残る)。返すのは更新した行数 |
 | `prepare_upload(pg, tenant_id, rows, kudgivt_rows)` | 1 transaction の中で、**KUDGURI の行の順に** 営業所・車輌・乗務員を解決し、運行が既に在るかを見て、続けて分類を読み、未登録のイベントCD を既定の分類で足す。「既に在る」= DB に在る、または同じ zip の中で先の行に同じ (運行NO, crew_role) が出た |
-| `apply_upload(pg, tenant_id, upload_id, rows, inputs, daily)` | 取り込みの本体。**1 transaction の中で** 運行の入れ替え (`replace_operations_in`。行の順に入れ替え、前の行と違えば変更記録) → 日別の保存 (`save_daily_hours`) → 履歴に完了の印 (`operations_count` = 流した**行数**。運行NO の種類の数ではない)。途中で落ちたら、運行も日別も履歴も元のまま。`rows` と `inputs` の数が違えば DB を触る前に `ApplyUploadError::LengthMismatch` |
+| `apply_upload(pg, tenant_id, upload_id, rows, inputs)` | 取り込みの本体。**1 transaction の中で** 運行の入れ替え (`replace_operations_in`。入れ替える前の運行の 乗務員 × 日付を `LIST_OPERATION_RECALC_KEYS` で 1 回引き、行の順に入れ替え、前の行と違えば変更記録) → 日別の要再計算の印 (`insert_recalc_pending` = 同じ 乗務員 × 月 の印を消してから (`DELETE_RECALC_PENDING_FOR_MARKS`) 入れ直す (`INSERT_RECALC_PENDING`。時刻は `clock_timestamp()`)。既に印が在っても時刻が新しくなるので、印の口が読んだ後に付いた印を消さない。対象は上の「アップロードの口」の段 7) → 履歴に完了の印 (`operations_count` = 流した**行数**。運行NO の種類の数ではない)。**日別は書かない**。途中で落ちたら、運行も印も履歴も元のまま。`rows` と `inputs` の数が違えば DB を触る前に `ApplyUploadError::LengthMismatch` |
 | `mark_upload_failed(pg, tenant_id, upload_id, label)` | 履歴に失敗の印を付ける。`label` は呼び手が渡す固定の語 (生のエラー文を入れない) |
 
 - **乗務員の解決 (`upsert_driver`)**: 乗務員CD は `code` 列に入っていることも `driver_cd` 列に入っていることも在るので、順に当てる —
@@ -130,11 +133,11 @@ zip の取り込みのうち DB に書く部分。**SQL は backend (ippoan/rust
   変更記録は追記だけ (UPDATE・DELETE を書かない)。
 - 日時 (出発・帰着・出庫・入庫) は、KUDGURI の壁時計を**そのまま UTC の時刻として**入れる。営業所・車輌・乗務員の cd が空なら DB を引かず NULL。
 - 分類は `(event_cd, 分類の文字列)` で返す。`PreparedUpload::classification_map()` が `EventClass` の map にする。
-- **日別の保存 (`save_daily_hours`)**: `daily` は `alc_compare::upload_daily::compute_daily_hours` (backend と同じ関数) の出力そのまま。
+- **日別の保存 (`save_daily_hours_with`。呼ぶのは再計算の口)**: `daily` は `alc_compare::upload_daily::compute_daily_hours` (backend と同じ関数) の出力そのまま。
   ここでは計算しない (保存する値のうち 2 つは `DailyHours::saved_total_drive_minutes()`・`saved_late_night_minutes()` を呼ぶ。ほかは field の写し)。順:
   1. 日エントリの乗務員CD のうち空でないものの id を引く (`get_employee_id_by_driver_cd` = `code` の行 → 無ければ `driver_cd` の行。**読むだけ**で、
      埋めない・作らない。運行の `upsert_driver` とは別の id を返しうる)。id が引けない CD と空の CD の日エントリは、消す対象にも保存の対象にもしない
-  2. 引けた乗務員ごとに、全日エントリの運行NO で、セグメントと日別 (`unko_nos` が重なる行) を消す (上げ直しで帰属日が変わっても古い行が残らない)
+  2. 引けた乗務員ごとに、渡された運行NO (再計算は月の運行のもの) で、セグメントと日別 (`unko_nos` が重なる行) を消す (帰属日が変わっても古い行が残らない)
   3. 日エントリを保存: (乗務員, 日, 開始時刻) の日別を消す → 日別を入れる → (乗務員, 日) のセグメントを消す → セグメントを入れる
 - 日別の日は `DATE`、開始時刻は `TIME`、セグメントの開始・終了は壁時計を**そのまま UTC の時刻として**入れる。
 
@@ -145,13 +148,14 @@ zip の取り込みのうち DB に書く部分。**SQL は backend (ippoan/rust
   先に入れたセグメントが後の日エントリの保存で消え、結果が実行ごとに変わりうる。worker は両方のセグメントが残る。
 - 「運行NO でセグメントを消す」は、乗務員ごとに `unko_no = ANY($3)` の 1 文 (旧は 乗務員 × 運行NO の数だけ流す。消える行は同じ)。
 - 完了の印の UPDATE に `AND tenant_id` を足している (RLS に加えて文でも絞る。ほかの文と同じ形)。
-- 運行の入れ替え・日別の保存・完了の印が 1 つの transaction (旧は文ごとに別)。そのため、1 回のアップロードで入る運行と変更記録の時刻
+- 運行の入れ替え・要再計算の印・完了の印が 1 つの transaction (旧は文ごとに別)。そのため、1 回のアップロードで入る運行と変更記録の時刻
   (`created_at`・`recorded_at` などの DB の既定値) は全部同じ値になる (旧は行ごとに別の時刻)。
 
 ## アップロードの口 `POST /upload`
 
-デジタコの zip を受け取り、保存先に置き、運行と日別を DB に入れ、運行NO ごとの CSV に分割する。backend (ippoan/rust-alc-api) の
-`POST /api/upload` と同じ仕事・同じ順で、**応答の形も同じ**。流れは `crates/alc-dtako-upload/src/ingest.rs`。
+デジタコの zip を受け取り、保存先に置き、運行を DB に入れ、運行NO ごとの CSV に分割する。backend (ippoan/rust-alc-api) の
+`POST /api/upload` と同じ仕事・同じ順で、**応答の形も同じ**。**日別は書かない** — 日別が変わりうる 乗務員 × 月 に「要再計算」の印を付け、
+印の分は `POST /recalculate-pending` が計算し直す (Refs ippoan/alc-dtako-worker#23。下の「印の口」)。流れは `crates/alc-dtako-upload/src/ingest.rs`。
 
 - 入力: `multipart/form-data` の **`file` field** (filename が無ければ `upload.zip`)。body は 20MB まで。
 - 段の順:
@@ -159,20 +163,19 @@ zip の取り込みのうち DB に書く部分。**SQL は backend (ippoan/rust
   2. zip を保存先に置く (key = `{テナント}/uploads/{履歴の id}/{filename}`。filename は加工しない)
   3. key を履歴に記録する
   4. zip を展開して KUDGURI と KUDGIVT を読む (名前に `KUDGURI`・`KUDGIVT` を含む最初のエントリ。Shift_JIS)。
-     KUDGURI が 0 行なら、KUDGIVT が無くても運行 0 件として進む
+     KUDGURI が 0 行なら、KUDGIVT が無くても運行 0 件として進む。KUDGIVT のエントリは分割と同じ `split_csv_entry` で運行NO ごとのバイト列にもしておく
+     (8 の分割が保存先に置くものと同じ。6 で前回と比べる)
   5. 営業所・車輌・乗務員を解決し、運行が既に在るかを見て、分類を読む (上の `prepare_upload`)
   6. 既に在る運行だけ、前回の分割が置いた旧 KUDGIVT (`{テナント}/unko/{運行NO}/KUDGIVT.csv`) を保存先から読んで前回の分数を出す
      (運行NO ごとに 1 回、まとめて同時 6 本までで読む。やり直しはしない。読めない・無い・parse できないときは「取れなかった」として続け、
-     変更記録の before に印が残る)。
-     今回の分数と日別は、backend と共有の関数 (`alc_csv_parser::operation_changes`・`alc_compare::upload_daily::compute_daily_hours`) で出す
-  7. 運行の入れ替え + 日別の保存 + 完了の印 (上の `apply_upload`。1 transaction)。`operations_count` は KUDGURI の行数
+     変更記録の before に印が残る)。今回の分数は backend と共有の関数 (`alc_csv_parser::operation_changes`) で出す。
+     旧 KUDGIVT のバイト列が今回のものと違う・読めない運行は、日別の要再計算の印の対象にする
+  7. 運行の入れ替え + 日別の要再計算の印 + 完了の印 (上の `apply_upload`。1 transaction)。`operations_count` は KUDGURI の行数。
+     印 (`dtako_daily_recalc_pending`。migration 162) を付けるのは、運行の `driver_id` × 読取日と運行日の月で、次のどれかに当たる運行:
+     新しい運行 / 既に在る運行で snapshot が変わった・乗務員か日付が変わった (前の乗務員 × 前の月にも)・6 で KUDGIVT が違う / 読めない。
+     やり直しの口は全部の行。乗務員の無い運行には付けない。**何も変わっていなければ付かない** (月をまとめて取り直しても、計算も保存先の読み直しも起きない)
   8. 分割 (下の分割の口と同じ `split_upload`。zip は保存先から読み直す)。丸ごと失敗したら待って、全体を最大 3 回 (待ち 300ms・800ms)。
-     尽きても応答は 200 のままで、`split_failed` が 1 になる (後から分割の口で復旧できる)
-  9. 日別の計算し直し (分割が成功したときだけ。Refs ippoan/alc-dtako-worker#23)。今回の行の乗務員 × その行の運行日・読取日の月ごとに、
-     乗務員の再計算の口 (`/recalculate-drivers` の 1 人ぶん) と同じ処理 (乗務員の月の運行 → 運行ごとの分割の出力で計算 → 1 transaction で保存) で
-     7 の日別を上書きする (勤務日の束ねが前後の運行に効くので、取り込み直後と再計算後の日別が揃う)。失敗 (乗務員が無い・KUDGIVT が読めない・DB) は
-     数えて続け、応答と status は変えない (7 の値が残る。ログは件数だけ)。保存先の GET (運行NO の数の 2 倍) は 1 リクエスト 4000 まで
-     (`DAILY_RECALC_MAX_GETS`。Workers の subrequest の上限 10,000 を分割の PUT と分け合う)。越える乗務員 × 月から先は飛ばす
+     尽きても応答は 200 のままで、`split_failed` が 1 になる (後から分割の口で復旧できる)。印は 7 で付いているので残る
 - 応答 (200): `upload_id`・`operations_count`・`status` (`"completed"`)・`split_failed`・`split_unko_nos`・`split_unko_nos_total`・
   `split_failed_unko_nos`・`split_failed_unko_nos_total` (運行NO の一覧は 500 件で切り、総数は `_total`)。
   **本文のキーはこの順** (backend と同じ。`upload_id` が先頭)。呼び手に、本文の先頭の決まった長さだけを取っておいて `upload_id` を読むものが在るので、順を変えない
@@ -184,7 +187,7 @@ zip の取り込みのうち DB に書く部分。**SQL は backend (ippoan/rust
   - 履歴を作った後の失敗は、履歴に失敗の印を付けてから返す (`error_message` は上の語。500 のときは段の名前 `storage`・`db`)。
     準備 (5) が通って 7 が失敗したとき、営業所・車輌・乗務員・分類の行は残る
 - **段ごとの所要**: 応答 (成功でも失敗でも) の `Server-Timing` に、終えた段の所要 (ミリ秒) を終えた順に載せる
-  (`history`・`put_zip`・`parse`・`prepare`・`old_kudgivt`・`apply`・`split`・`daily`。やり直しの口は頭が `zip_key`・`get_zip`)。載せるのは
+  (`history`・`put_zip`・`parse`・`prepare`・`old_kudgivt`・`apply`・`split`。やり直しの口は頭が `zip_key`・`get_zip`)。載せるのは
   **固定の語の名前と数字だけ**で、件数・id・key は載せない。直下の worker が、その前に接続の所要 `connect` を足す。
   時計は差し込み (`timing.rs` の `Clock`。worker はランタイムの時計、テストは固定の歩幅の偽物)。**Workers の時計は I/O をまたがないと進まない**ので、
   I/O を含まない段 (`parse` と、旧 KUDGIVT を読まないときの `old_kudgivt`) は 0 に見え、その時間は次の I/O を含む段に乗る。
@@ -196,8 +199,9 @@ zip の取り込みのうち DB に書く部分。**SQL は backend (ippoan/rust
 - **400 の本文は固定の語**。旧と本文の形が違う (旧は平文の理由、こちらは `{"error": "<固定の語>"}`)。履歴の `error_message` も同じ語。入力の値・テナント ID・エラーの生の文を、本文・履歴・ログに出さない。
 - **保存先・DB の失敗は 500** (旧は取り込みの中の失敗を、種類を問わず 400 で返す)。
 - **展開後の大きさに上限 (64MB)** が在り、圧縮は deflate と無圧縮だけ。旧より受け付ける zip が狭い (上限を超える zip と、deflate・無圧縮以外の zip は入力の誤りになる)。
-- 取り込みの本体が 1 つの transaction (上の「アップロードの取り込みの段 > 旧との違い」。旧は行ごとに別の transaction)。途中で落ちたら、運行も日別も入らない。
-  日別のセグメントの消し方が決定的 (同じ節)。
+- 取り込みの本体が 1 つの transaction (上の「アップロードの取り込みの段 > 旧との違い」。旧は行ごとに別の transaction)。途中で落ちたら、運行も印も入らない。
+- **日別を書かない** (旧は取り込みの zip の行だけで日別を計算して書く)。印の口が、乗務員の月の運行をまとめて再計算の口と同じ処理で計算する
+  (勤務日の束ねが前後の運行に効くので、取り込み直後と再計算後で日別が食い違っていた。Refs ippoan/alc-dtako-worker#23)。
 - 旧 KUDGIVT を読むのは運行NO ごとに 1 回 (旧は行ごと)。
 - **呼び手との接続が切れると、失敗の印も付かずに途中で止まることがある** (Workers はリクエストが終わると処理を打ち切る)。履歴が `processing` のまま残る・
   分割が未完になる、がありうる。運行と日別は 1 つの transaction なので半端には入らない。取り込みが終わっていない履歴は、やり直しの口 (下) で、
@@ -226,7 +230,8 @@ zip の取り込みのうち DB に書く部分。**SQL は backend (ippoan/rust
 既に保存先に在る zip を、もう一度取り込む (失敗した履歴の復旧に使う)。backend (ippoan/rust-alc-api) の `POST /api/internal/rerun/{upload_id}` と
 同じ仕事。流れは `ingest.rs` の `rerun_upload` で、**アップロードの口の段 4 から後ろと同じもの**を通す (同じ流れを 2 つ持たない)。
 
-- 履歴の zip の key を引く → zip を保存先から読む → 展開して読む → 準備 → 前回の分数 → 運行の入れ替え + 日別の保存 + 完了の印 → 分割 (最大 3 回) → 日別の計算し直し。
+- 履歴の zip の key を引く → zip を保存先から読む → 展開して読む → 準備 → 前回の分数 → 運行の入れ替え + 日別の要再計算の印 + 完了の印 → 分割 (最大 3 回)。
+  明示のやり直しなので、何も変わっていなくても**全部の行の 乗務員 × 月 に印を付ける**。
 - 履歴を作らない・zip を保存先に置き直さない・key を更新しない。履歴の status は、始めるときには変えない (成功で `completed` と行数)。
 - 応答 (200) はアップロードの口と同じ 8 フィールド (`upload_id` は path の id)。`Server-Timing` も同じ形 (頭の 2 段が `zip_key`・`get_zip`)。
 - 失敗:
@@ -271,8 +276,8 @@ rust-alc-api の同じ口と同じ仕事。流れは `recalc.rs` (月の全員�
 
 - 乗務員を id から引き (`SELECT_DRIVER_CD`。テナントで絞る)、その乗務員の月の運行を引く (`LIST_DRIVER_OPERATIONS_FOR_RECALC`)。運行の行の乗務員CD は引いた乗務員CD。
 - KUDGIVT・KUDGFRY は、月の全員の口と同じ運行ごとの分割の出力 (`{テナント}/unko/{運行NO}/KUDGIVT.csv`・`KUDGFRY.csv`) を運行NO ごとに 1 回だけ読む
-  (同時 6 本)。**乗務員の運行に入っていない運行NO の行は拾わない** (乗務員CD が同じでも。月の全員の口と同じ)。なので取り込み (zip の全行を渡す) とは、
-  その行 (運行の外の休息) の分だけ食い違いうる。未登録のイベントCD の分類は、読んだ KUDGIVT の行から足す。
+  (同時 6 本)。**乗務員の運行に入っていない運行NO の行は拾わない** (乗務員CD が同じでも。月の全員の口と同じ)。
+  未登録のイベントCD の分類は、読んだ KUDGIVT の行から足す。
   KUDGIVT が 1 件も無い (運行の行はある) と、1 人の口は `error{kudgivt_not_found}`、一括はその人だけ数えて続ける。一部の運行の KUDGIVT が読めないときは件数を Warn。
 - 一括は乗務員を 1 人ずつ読んで計算し、保存する (メモリは 1 人ぶん)。
 - 保存は乗務員ごとの transaction (`save_daily_hours_in_tx`)。1 人の口は失敗で止まる。一括は 1 人の失敗 (引き当てられない・DB の失敗) を数えて続ける
@@ -291,6 +296,29 @@ rust-alc-api の同じ口と同じ仕事。流れは `recalc.rs` (月の全員�
 - KUDGIVT は zip ではなく運行ごとの分割の出力を読む (月の全員の口と同じ)。乗務員の運行の外の運行NO の行は拾わない。一括は乗務員を 1 人ずつ読む。
 - 保存は乗務員ごとの transaction。呼び手との接続が切れると、そこで止まる (もう一度呼べば揃う)。一括の乗務員は 1 人ずつ順に処理する。
 - `error` の `message` と、読めない query / body の本文は固定の語。
+
+## 印の口 `POST /recalculate-pending`
+
+取り込みが付けた日別の要再計算の印の 乗務員 × 月 を計算し直す (Refs ippoan/alc-dtako-worker#23)。流れは `recalc.rs` の `recalc_pending`。
+呼び手 (nuxt-dtako-admin の relay と画面) が取り込みの一区切りで呼び、`remaining > 0` の間だけ繰り返す。
+
+- ヘッダーのテナントの印を全部読み (`LIST_RECALC_PENDING`。月・乗務員の順。読んだ時刻も)、1 つずつ**乗務員 1 人の口と同じ処理**で計算し直す
+  (乗務員の月の運行 → 運行ごとの分割の出力で計算 → 1 transaction で保存。消す対象の運行NO は月の運行のもの = 月ごとに 1 回引く)。
+  なので、この口の後の日別は `/recalculate-driver` の後と 1 列も違わない。一括の 1 人ぶんと同じ関数 (`recalc_driver_rows`) を通る。
+- 保存の transaction の中で、その 乗務員 × 月 の印を消す。消すのは**印を読んだ時刻までに付いた印**だけ (`created_at <= 読んだ時刻`)。
+- 1 回の保存先の GET (運行NO の数の 2 倍) の合計は 4000 まで (`DAILY_RECALC_MAX_GETS`。Workers の subrequest の上限 10,000 より十分に小さく)。
+  越える手前で止め、残りは印のまま。1 つで上限を越えるものは、いつまでも入らないので失敗に数える。
+- 失敗 (乗務員が引けない・KUDGIVT が 1 件も無い・DB) は数えて続け、印は残す。
+- 応答は JSON `{"processed":n,"failed":n,"remaining":n}` (件数だけ。この順)。`remaining` = 上限で手を付けなかった数 (失敗は含めない。
+  失敗が残っても呼び手は無限に回らない)。印を読めなければ 500 `{"error":"internal_error"}`。
+- ログは固定の語と件数だけ (`recalculate-pending: processed <n>, failed <n>, remaining <n>` = 失敗か残りが在るとき・
+  `recalculate-pending failed: db (<kind>)`・`recalculate-pending: KUDGIVT unavailable for <n> operation(s)`)。
+- 再計算の 3 口も、同じく保存の transaction の中で、計算した 乗務員 × 月 の印を消す (月の全員は乗務員CD で、1 人・一括は乗務員の id で。
+  消すのは、口が運行を読み始める前の DB の時刻までに付いた印だけ)。
+- 限界: KUDGFRY (フェリー) の変化では印を付けない (取り込みの zip に材料が無い)。乗務員が変わった運行の前の乗務員は、印の口で計算し直すが、
+  その月に運行が残っていなければ日別の古い行は消えない (保存が消すのは日エントリの在る乗務員の行だけ。`/recalculate-driver` と同じ)。
+  取り込みは印を消してから入れ直す (時刻は文を流した時刻) ので、印の口が読んだ後に付き直った印は消さない。ただし取り込みが印を入れた後・
+  commit する前に印の口が印と運行を読むと、その取り込みの変化を取りこぼしうる (時刻で比べる方式の限界。もう一度取り込むか再計算の口で揃う)。
 
 ## 分割の口 `POST /split-csv/{upload_id}`
 
@@ -429,22 +457,26 @@ done
 bash scripts/check_coverage_100.sh --use-cache cov-alc-dtako-upload.txt --use-cache cov-alc-compare.txt --use-cache cov-alc-csv-parser.txt
 ```
 
-`tests/upload_flow.rs` (21 本。口から、組み込みの PostgreSQL と偽の保存先まで) はアップロードの口 (7 本)・やり直しの口 (2 本)・履歴の読み取り口 (3 本)・月の全員の再計算の口 (2 本)・乗務員ごとの再計算の口 (3 本)・3 つの口で消す運行NO を月の運行に揃える 1 本・取り込みの後の日別の計算し直し (3 本) を確かめる。zip はテストの中で作る
-(`upload_zip`。KUDGURI・KUDGIVT は Shift_JIS・CRLF): 端から端 (応答の 8 field・履歴・運行・日別・セグメント・保存先の zip と分割の出力・分割済みの印) /
+`tests/upload_flow.rs` (22 本。口から、組み込みの PostgreSQL と偽の保存先まで) はアップロードの口 (7 本)・やり直しの口 (2 本)・履歴の読み取り口 (3 本)・月の全員の再計算の口 (2 本)・乗務員ごとの再計算の口 (3 本)・3 つの口で消す運行NO を月の運行に揃える 1 本・要再計算の印と印の口 (4 本) を確かめる。zip はテストの中で作る
+(`upload_zip`。KUDGURI・KUDGIVT は Shift_JIS・CRLF): 端から端 (応答の 8 field・履歴・運行・取り込みは日別を書かず印だけ・印の口の後の日別とセグメント・保存先の zip と分割の出力・分割済みの印) /
 上げ直し (同じ zip は記録なし・値が変われば before と after の分数・旧 KUDGIVT が無い / 読めないときの印) / リクエストの形の誤り (400 の語・
 tenant ヘッダー無しは 401・body は 2MB を超えても通り 20MB を超えると読めない) / zip の中身の誤り (語ごとに履歴の `error_message`・展開後の上限・
-KUDGURI が 0 行は 0 件で completed) / 保存先と DB の失敗 (500・履歴の段の名前・取り込みの本体の途中の失敗で運行も日別も入らない・切れた接続) /
+KUDGURI が 0 行は 0 件で completed) / 保存先と DB の失敗 (500・履歴の段の名前・取り込みの本体の途中の失敗で運行も印も入らない・切れた接続) /
 分割のやり直し (2 回失敗 → 3 回目で通る・3 回とも失敗 → `split_failed = 1` で 200・後から分割の口で復旧) /
-前回の KUDGIVT の読み込み (8 運行の上げ直しで、同時の読み込みが上限の 6 本まで・結果が運行NO どおりに結び付く・1 本の読み込みの失敗はその運行だけ)。やり直しの口: 復旧 (途中で失敗した履歴を
-取り込み直す → completed と行数・運行と日別と分割の出力・もう一度やり直しても変更記録が増えない・zip は置き直さない) / 引けない・読めない
+前回の KUDGIVT の読み込み (8 運行の上げ直しで、同時の読み込みが上限の 6 本まで・結果が運行NO どおりに結び付く・1 本の読み込みの失敗はその運行だけ)。
+要再計算の印と印の口 (4 本): **#23 の完了条件** (同じ乗務員の 2 運行を別々の zip で取り込む → 印だけ・分割の出力を読まない → 印の口の後の日別・セグメントが `/recalculate-driver` の後と 1 列も違わない (印の口を通さず乗務員の口だけを打った別テナントとも同じ)・印が消える。陽性対照 = 印の口の前は日別が無い・2 本目だけの計算の値は無い) /
+印を付けるのは変わりうる運行だけ (同じ zip は付けない・KUDGIVT だけの違いは付ける・前回の KUDGIVT が無い / 読めないなら付ける・乗務員の変更は前の乗務員にも) /
+上限で止めて `remaining`・もう一度呼ぶと進む・失敗 (KUDGIVT 0 件・1 つで上限超え・保存の DB の失敗) は `failed` で印が残る・印を読めなければ 500・別テナントの印は読まない /
+再計算の 3 口が計算した 乗務員 × 月 の印を消す (ほかの月と、後に付いた印は残す)。やり直しの口: 復旧 (途中で失敗した履歴を
+取り込み直す → completed と行数・運行と印と分割の出力・もう一度やり直しても変更記録が増えないが、全部の行に印が付く・zip は置き直さない) / 引けない・読めない
 (存在しない id・別テナントの履歴・key が NULL は 404 / zip が無い・読めないは 500 / 壊れた zip は 400 / UUID でない id・tenant ヘッダー無し・切れた接続)。
 本文とログに識別子が出ないことも見る。履歴の読み取り口: 一覧 2 口の本文を文字列で固定 (キーの順と、`created_at` の 3 通りの書式)・別テナントは空の配列・
 GET 以外は 405・切れた接続は 500 / ダウンロード (本文が保存先の bytes と同じ・2 つのヘッダー・filename の残し方・404 の 3 通り・保存先に無い / 読めないは 500・
-エラーの本文とログに id と filename が出ない) / filename の残し方の規則だけを見る 1 本 (DB を使わない)。月の全員の再計算の口: アップロードしたときと同じ日別とセグメントを
+エラーの本文とログに id と filename が出ない) / filename の残し方の規則だけを見る 1 本 (DB を使わない)。月の全員の再計算の口: zip の行を共有の `compute_daily_hours` に渡したのと同じ日別を作り、日別を消して呼べば同じ日別とセグメントを
 作り直す (休息の分数も同じ)・event の並び・もう一度呼んでも同じ・フェリーの記録の分数が入る / 運行が無い月 (12 月を含む)・月が不正・query の 400・KUDGIVT が無い・
 分類を読む段と 1 人の保存の DB の失敗 (先に保存した乗務員の分は残り、失敗した人の分は戻る)・別テナントに触れない・401・切れた接続・本文とログに識別子が出ない。
 乗務員ごとの再計算の口: zip 2 本 (別の乗務員の行・KUDGURI に無い運行NO のその乗務員の行・zip をまたぐ重複を混ぜる) を上げた後に、1 人の日別が
-**月の全員の再計算と同じ** (KUDGURI に無い運行NO の休息は数えない。取り込みとは、その休息の分だけ違う)・**その行の計算が、同じ行を共有の `compute_daily_hours` に渡した結果と同じ**・
+**月の全員の再計算と同じ** (KUDGURI に無い運行NO の休息は数えない。取り込みは日別を書かない)・**その行の計算が、同じ行を共有の `compute_daily_hours` に渡した結果と同じ**・
 運行の無い月 / 一括 (2 人 + 居ない 1 人 → `batch_done{3,2,1}`・空の一覧)・別テナントの乗務員・月が不正・居ない乗務員・query と body の 4xx・
 分類と保存の DB の失敗 (1 人は `error`・一括は数えて続ける)・運行の表を読めない (42501)・別テナントに触れない・401・本文とログに識別子が出ない / 一括で 1 人だけ
 KUDGIVT が 0 件 → その人だけ errors・ほかは保存 (1 人の口は `kudgivt_not_found`)。
@@ -463,12 +495,12 @@ KUDGIVT が 0 件 → その人だけ errors・ほかは保存 (1 人の口は `
 同時に走る PUT は 6 本まで / 空の入力は何も呼ばない / `get` の 3 通り / `StoreError` の文に key が出ない /
 まとめて読む `get_all` (同時 6 本まで・結果は tag に結び付く・無い / 読めないは `None`・やり直さない・空の入力は何も呼ばない)。
 
-CI は target ごとに本数を固定で見る (`sql_db` は `18 passed`、`store` は `10 passed`、`split_flow` は `20 passed`、`upload_flow` は `21 passed`、どれも `0 failed; 0 ignored`)。減らすと落ちる。
+CI は target ごとに本数を固定で見る (`sql_db` は `20 passed`、`store` は `10 passed`、`split_flow` は `20 passed`、`upload_flow` は `22 passed`、どれも `0 failed; 0 ignored`)。減らすと落ちる。
 足したら `ci.yml` の数も上げる (テスト 1 本ごとに DB を起動して全 migration を流すので、本数を増やさず 1 本に筋書きを束ねる)。
-`sql_db` が確かめること (18 本)。再計算の対象の運行 (1 本): 月の範囲の境界 (月末の翌日を含む)・運行日と読取日のどちらかが入る行・
+`sql_db` が確かめること (20 本)。再計算の対象の運行 (1 本): 月の範囲の境界 (月末の翌日を含む)・運行日と読取日のどちらかが入る行・
 2 人乗務は乗務員ごとに 1 行 (同じ乗務員CD なら 1 行)・別テナントが出ない・切れた接続。乗務員ごとの再計算の文 (1 本): 乗務員CD (NULL・別テナントの乗務員・居ない id は `None`) /
 乗務員 1 人の運行 (範囲・その乗務員だけ・同じ運行NO は 1 行・並び・列の中身・別テナント) / 切れた接続。履歴の読み取り (1 本): 一覧 2 つが新しい順・同じ時刻は id の降順・51 行入れて 50 件・別テナントの行が出ない・
-NULL の列・pending は `pending_retry` と `failed` だけ / ダウンロード用の行 (在る・無い・別テナントの id・key が NULL) / 切れた接続。取り込みの DB の層 (8 本):
+NULL の列・pending は `pending_retry` と `failed` だけ / ダウンロード用の行 (在る・無い・別テナントの id・key が NULL) / 切れた接続。取り込みの DB の層と要再計算の印 (10 本):
 
 - 乗務員の解決: `code` の行を使って `driver_cd` を埋める / `driver_cd` の行へ落ちる / 新規 / 別の生存行が同じ driver_cd を持つときは埋めない /
   論理削除済みは対象外 / INSERT が一意の制約に当たったら引き直す
@@ -485,8 +517,15 @@ NULL の列・pending は `pending_retry` と `failed` だけ / ダウンロー�
   その zip に出てこない乗務員の行はそのまま / 履歴が completed と行数になる
 - 決定的な消し方と skip: 同じ乗務員・同じ日の日エントリ 2 つ (1 運行の中の休息で分かれる) の両方のセグメントが残る (2 回流しても同じ) /
   乗務員CD が空・id が引けない日エントリは保存されず、乗務員も作られない / 運行は `upsert_driver` の id、日別は `get_employee_id_by_driver_cd` の id に付く
-- 日別の分離と失敗: 別テナントの日別・セグメント・履歴は変わらない / 別テナントの履歴の id を渡しても completed にならない /
-  セグメントの INSERT が落ちると、運行の入れ替え・変更記録・日別・履歴が元のまま / 行と入力の数が違うと何も変わらない
+- 日別の分離と失敗: 別テナントの日別・セグメント・履歴・印は変わらない / 別テナントの履歴の id を渡しても completed にならない /
+  保存のセグメントの INSERT が落ちると、日別と、同じ transaction で消すはずだった印が元のまま (落ちなければ乗務員CD で指した印が消え、別テナントの印は残る) /
+  取り込みの 2 行目の INSERT が落ちると、運行の入れ替え・変更記録・印・履歴が元のまま / 行と入力の数が違うと何も変わらない
+- 要再計算の印 (1 本): 新しい運行は 乗務員 × 読取日と運行日の月 (月をまたげば 2 つ)・乗務員CD が空の運行には付けない / ON CONFLICT で増えない /
+  変化の無い上げ直しは付けない・`recalc` なら付ける・snapshot の変化で付ける / 乗務員が変われば前の乗務員 × 前の月にも・読取日だけの移動も前の月にも /
+  別テナントに付けた印は混ざらない / 一覧の並びと読んだ時刻 (どの行も同じで、印の時刻より後)・DB の時刻 / 時刻の上限より後の印は消さない・
+  乗務員の id で指せばその 乗務員 × 月 だけ・乗務員CD で指す形・別テナントから指しても消えない
+- 印の付け直し (1 本): 印を読んだ後に同じ 乗務員 × 月 へ取り込みが印を付け直すと、1 つのまま時刻が読んだ時刻より後になり、
+  読んだ時刻までの消去では残る (付け直した後に読んだ時刻なら消える)
 
 分割の口が使う 3 関数 (7 本):
 
@@ -494,7 +533,7 @@ NULL の列・pending は `pending_retry` と `failed` だけ / ダウンロー�
 - 分割済みの印: 渡した運行NO の行だけに付き `RETURNING` が返る / 同じ運行NO が 2 行なら 2 つ返る / 別テナントの同じ運行NO は変わらない /
   空の入力は何もしない / 101 件以上を 1 回で渡せる
 - 分割待ちの一覧: 未分割が在れば completed かつ key ありの履歴が新しい順 / 未分割が無ければ空 / completed でない・key が NULL・別テナントは出ない
-- テナントを設定しない素の接続では、この crate が触る 9 つの表の行が読めない (エラーか 0 行)
+- テナントを設定しない素の接続では、この crate が触る 10 の表の行が読めない (エラーか 0 行)
 - DB のエラーがそのまま `Err` で返り、失敗した transaction が残らない / 権限の無いロールは 42501 / 切れた接続は `Err`
 
 `crates/alc-dtako-upload/src/` の `pg.rs`・`store.rs`・`split.rs`・`routes.rs`・`ingest.rs`・`archive.rs`・`timing.rs`・`recalc.rs` は行カバレッジ 100% を保つ (登録簿は直下の `coverage_100.toml`。`repo.rs` は定数だけで実行行が無いので登録しない)。

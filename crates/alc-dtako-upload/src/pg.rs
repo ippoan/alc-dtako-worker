@@ -16,10 +16,11 @@
 //!   手に入らないので、テナントを設定していない transaction では呼べない。
 //!
 //! アップロードの取り込みの段は、[`create_upload`] → [`set_upload_zip_key`] → [`prepare_upload`] → [`apply_upload`]
-//! (失敗したら [`mark_upload_failed`])。[`apply_upload`] は「運行の入れ替え → 日別の保存 → 完了の印」を 1 つの
-//! transaction で行う (途中で落ちたら、運行も日別も履歴も元のまま)。
+//! (失敗したら [`mark_upload_failed`])。[`apply_upload`] は「運行の入れ替え → 日別の要再計算の印 → 完了の印」を 1 つの
+//! transaction で行う (途中で落ちたら、運行も印も履歴も元のまま)。取り込みは日別を書かない (Refs ippoan/alc-dtako-worker#23)。
+//! 日別は再計算の口が [`save_daily_hours_in_tx`] で保存し、同じ transaction の中で、その 乗務員 × 月 の印を消す。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use alc_compare::upload_daily::DailyHours;
@@ -31,7 +32,7 @@ use alc_csv_parser::operation_changes::{
 };
 use alc_csv_parser::work_segments::{default_classification, EventClass};
 use alc_worker_db::{PgClient, TenantTx, TxOutput};
-use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
+use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, Utc};
 use tokio_postgres::error::SqlState;
 use tokio_postgres::types::Type;
 use uuid::Uuid;
@@ -198,17 +199,139 @@ pub async fn driver_operations_for_recalc(
     .await
 }
 
-/// 日別の保存の段 (1 transaction): [`save_daily_hours_with`] を流す。再計算が乗務員ごとに呼ぶ。
+/// 日別の保存の段 (1 transaction): [`save_daily_hours_with`] を流し、`clear` が在れば同じ transaction の中で
+/// [`clear_recalc_pending`] を流す (保存が落ちたら印も残る)。再計算が乗務員ごとに呼ぶ。
 pub async fn save_daily_hours_in_tx(
     pg: &mut PgClient,
     tenant_id: Uuid,
     daily: HashMap<DayKey, DailyHours>,
     all_unko_nos: Arc<Vec<String>>,
+    clear: Option<PendingClear>,
 ) -> Result<(), tokio_postgres::Error> {
     pg.tenant_tx(tenant_id, move |tx| {
-        Box::pin(async move { save_daily_hours_with(tx, tenant_id, &daily, &all_unko_nos).await })
+        Box::pin(async move {
+            save_daily_hours_with(tx, tenant_id, &daily, &all_unko_nos).await?;
+            if let Some(clear) = clear {
+                clear_recalc_pending(tx, tenant_id, &clear).await?;
+            }
+            Ok(())
+        })
     })
     .await
+}
+
+/// 計算し直した 乗務員 × 月 の印の消し方 ([`sql::DELETE_RECALC_PENDING`])。乗務員は `driver_id` か `driver_cd` で指す。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingClear {
+    /// 月初
+    pub month: NaiveDate,
+    /// 乗務員の id (乗務員ごとの再計算・印の口。運行の `driver_id` と同じもの)
+    pub driver_id: Option<Uuid>,
+    /// 乗務員CD (月の全員の再計算。その CD の乗務員の印)
+    pub driver_cd: Option<String>,
+    /// これより後に付いた印は消さない (計算の間に別の取り込みが付けた印を残すため)
+    pub before: DateTime<Utc>,
+}
+
+/// [`sql::DELETE_RECALC_PENDING`] (transaction は開かない。呼ぶのは [`save_daily_hours_in_tx`] の 1 か所)。返すのは消した数。
+pub async fn clear_recalc_pending(
+    tx: &TenantTx<'_>,
+    tenant_id: Uuid,
+    clear: &PendingClear,
+) -> Result<u64, tokio_postgres::Error> {
+    let params: [(&(dyn tokio_postgres::types::ToSql + Sync), Type); 5] = [
+        (&tenant_id, Type::UUID),
+        (&clear.month, Type::DATE),
+        (&clear.before, Type::TIMESTAMPTZ),
+        (&clear.driver_id, Type::UUID),
+        (&clear.driver_cd, Type::TEXT),
+    ];
+    tx.execute_typed(sql::DELETE_RECALC_PENDING, &params).await
+}
+
+/// [`sql::SELECT_NOW`] (DB の今の時刻。再計算の口が運行を読み始める前に引き、印を消す条件にする)。
+pub async fn db_now(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+) -> Result<DateTime<Utc>, tokio_postgres::Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move { Ok(tx.query_typed_one(sql::SELECT_NOW, &[]).await?.get(0)) })
+    })
+    .await
+}
+
+/// 日別の「要再計算」の印 1 つ ([`sql::LIST_RECALC_PENDING`])。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingMark {
+    pub driver_id: Uuid,
+    /// 月初
+    pub month: NaiveDate,
+    pub created_at: DateTime<Utc>,
+    /// 印を読んだ時刻 (どの行も同じ値)
+    pub read_at: DateTime<Utc>,
+}
+
+impl TxOutput for PendingMark {}
+
+/// [`sql::LIST_RECALC_PENDING`]。テナントの印の全部 (月・乗務員の順)。
+pub async fn recalc_pending_marks(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+) -> Result<Vec<PendingMark>, tokio_postgres::Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            let rows = tx
+                .query_typed(sql::LIST_RECALC_PENDING, &[(&tenant_id, Type::UUID)])
+                .await?;
+            let mark = |r: tokio_postgres::Row| PendingMark {
+                driver_id: r.get(0),
+                month: r.get(1),
+                created_at: r.get(2),
+                read_at: r.get(3),
+            };
+            Ok(rows.into_iter().map(mark).collect())
+        })
+    })
+    .await
+}
+
+/// 日付の月初。
+pub fn month_of(date: NaiveDate) -> NaiveDate {
+    date.with_day(1).expect("the first day of a month")
+}
+
+/// 乗務員 × 運行の読取日・運行日の月 (乗務員が無ければ空。月末の運行なら 2 つ)。
+fn recalc_keys(
+    driver_id: Option<Uuid>,
+    reading_date: NaiveDate,
+    operation_date: Option<NaiveDate>,
+) -> Vec<(Uuid, NaiveDate)> {
+    let dates = [Some(reading_date), operation_date].into_iter().flatten();
+    let months = dates.map(month_of);
+    driver_id.map_or_else(Vec::new, |id| months.map(|m| (id, m)).collect())
+}
+
+/// 印を付け直す (transaction は開かない): [`sql::DELETE_RECALC_PENDING_FOR_MARKS`] → [`sql::INSERT_RECALC_PENDING`]。
+/// 既に印が在っても時刻が新しくなるので、再計算の口が印を読んだ後に付いた印は、その口の「読んだ時刻まで」の消去に当たらない
+/// (ON CONFLICT DO NOTHING だけだと古い時刻のまま消され、計算に入らなかった変化の印が無くなる)。空なら DB を触らない。
+pub async fn insert_recalc_pending(
+    tx: &TenantTx<'_>,
+    tenant_id: Uuid,
+    marks: &BTreeSet<(Uuid, NaiveDate)>,
+) -> Result<u64, tokio_postgres::Error> {
+    if marks.is_empty() {
+        return Ok(0);
+    }
+    let driver_ids: Vec<Uuid> = marks.iter().map(|(id, _)| *id).collect();
+    let months: Vec<NaiveDate> = marks.iter().map(|(_, month)| *month).collect();
+    let params: [(&(dyn tokio_postgres::types::ToSql + Sync), Type); 3] = [
+        (&tenant_id, Type::UUID),
+        (&driver_ids, Type::UUID_ARRAY),
+        (&months, Type::DATE_ARRAY),
+    ];
+    tx.execute_typed(sql::DELETE_RECALC_PENDING_FOR_MARKS, &params)
+        .await?;
+    tx.execute_typed(sql::INSERT_RECALC_PENDING, &params).await
 }
 
 /// 履歴の一覧の 1 行 ([`sql::LIST_UPLOADS`])。
@@ -664,6 +787,9 @@ pub struct OperationInput {
     pub before_minutes: Option<OperationMinutes>,
     /// 今回の zip の KUDGIVT から出した分数
     pub after_minutes: OperationMinutes,
+    /// KUDGURI の行の外に、日別に効く変化が在る (前回の KUDGIVT と今回の KUDGIVT が違う・前回が読めない・やり直し)。
+    /// 既に在る運行でも、この運行の乗務員 × 月 に印を付ける
+    pub recalc: bool,
 }
 
 /// [`sql::SELECT_OPERATION_SNAPSHOT`] で 1 運行・1 crew_role の snapshot を読む (無ければ `None`)。
@@ -770,21 +896,57 @@ pub async fn replace_operation(
     Ok(true)
 }
 
+/// 入れ替える前の運行の (乗務員, 読取日, 運行日)。キーは (運行NO, crew_role)。
+type RecalcKeys = HashMap<(String, i32), (Option<Uuid>, NaiveDate, Option<NaiveDate>)>;
+
+/// [`sql::LIST_OPERATION_RECALC_KEYS`] (transaction は開かない)。
+async fn operation_recalc_keys(
+    tx: &TenantTx<'_>,
+    tenant_id: Uuid,
+    rows: &[KudguriRow],
+) -> Result<RecalcKeys, tokio_postgres::Error> {
+    let unko_nos: Vec<&str> = rows.iter().map(|r| r.unko_no.as_str()).collect();
+    let params: [(&(dyn tokio_postgres::types::ToSql + Sync), Type); 2] =
+        [(&tenant_id, Type::UUID), (&unko_nos, Type::TEXT_ARRAY)];
+    let found = tx
+        .query_typed(sql::LIST_OPERATION_RECALC_KEYS, &params)
+        .await?;
+    let key = |r: tokio_postgres::Row| ((r.get(0), r.get(1)), (r.get(2), r.get(3), r.get(4)));
+    Ok(found.into_iter().map(key).collect())
+}
+
 /// KUDGURI の行の順に [`replace_operation`] を流す (transaction は開かない。呼び手の transaction の中で使う)。
-/// `inputs` は `rows` と同じ順・同じ数。返すのは流した行数 (運行NO の種類の数ではなく、行の数)。
+/// `inputs` は `rows` と同じ順・同じ数。返すのは流した行数 (運行NO の種類の数ではなく、行の数) と、
+/// 日別の要再計算の印を付ける (乗務員, 月初):
+/// - 新しい運行 (入れ替える前に無い) → 今回の乗務員 × 月
+/// - 既に在る運行で、snapshot が変わった・乗務員か日付が変わった・[`OperationInput::recalc`] → 今回の乗務員 × 月。
+///   乗務員か日付が変わったなら、前の乗務員 × 前の月にも (前の乗務員の日別の行が残るため)
+///
+/// 乗務員の id は運行の `driver_id` (乗務員ごとの再計算の口が引くのと同じ)。無い運行には付けない。
 pub async fn replace_operations_in(
     tx: &TenantTx<'_>,
     tenant_id: Uuid,
     upload_id: Uuid,
     rows: &[KudguriRow],
     inputs: &[OperationInput],
-) -> Result<i32, tokio_postgres::Error> {
+) -> Result<(i32, BTreeSet<(Uuid, NaiveDate)>), tokio_postgres::Error> {
+    let previous = operation_recalc_keys(tx, tenant_id, rows).await?;
     let mut operations_count = 0i32;
+    let mut marks = BTreeSet::new();
     for (row, input) in rows.iter().zip(inputs) {
-        replace_operation(tx, tenant_id, upload_id, row, input).await?;
+        let changed = replace_operation(tx, tenant_id, upload_id, row, input).await?;
         operations_count += 1;
+        let current = (input.driver_id, row.reading_date, row.operation_date);
+        let before = previous.get(&(row.unko_no.clone(), row.crew_role)).copied();
+        let moved = before.filter(|before| *before != current);
+        if before.is_none() || changed || input.recalc || moved.is_some() {
+            marks.extend(recalc_keys(current.0, current.1, current.2));
+        }
+        if let Some((driver_id, reading_date, operation_date)) = moved {
+            marks.extend(recalc_keys(driver_id, reading_date, operation_date));
+        }
     }
-    Ok(operations_count)
+    Ok((operations_count, marks))
 }
 
 /// 日別の保存先の乗務員を引く: [`sql::SELECT_EMPLOYEE_ID_BY_CODE`] → 無ければ [`sql::SELECT_EMPLOYEE_BY_DRIVER_CD`]。
@@ -808,27 +970,7 @@ pub async fn get_employee_id_by_driver_cd(
     Ok(by_driver_cd.map(|row| row.get(0)))
 }
 
-/// 日別の労働時間とセグメントを保存する (transaction は開かない。呼び手の transaction の中で使う)。
-/// `daily` は `alc_compare::upload_daily::compute_daily_hours` の出力そのまま (ここでは計算しない)。
-///
-/// 1. 日エントリの乗務員CD のうち空でないものの id を [`get_employee_id_by_driver_cd`] で引く (同じ CD は 1 回)。
-///    id が引けない CD と空の CD の日エントリは、消す対象にも保存の対象にもしない。
-/// 2. 引けた乗務員ごとに、全日エントリの運行NO で [`sql::DELETE_SEGMENTS_BY_UNKO_NOS`] → [`sql::DELETE_DAILY_HOURS_BY_UNKO_NOS`]
-///    (帰属日が変わっても古い行が残らないように)。
-/// 3. 日エントリを **[`DayKey`] の順** (乗務員CD・日・開始時刻) に保存する: [`sql::DELETE_DAILY_HOURS_EXACT`] →
-///    [`sql::INSERT_DAILY_WORK_HOURS`] → [`sql::DELETE_SEGMENTS_BY_DATE`] → [`sql::INSERT_SEGMENT`]。
-///    `DELETE_SEGMENTS_BY_DATE` は **(乗務員, 日) ごとに最初の 1 回だけ**流す (同じ乗務員・同じ日に日エントリが 2 つ以上
-///    在っても、先に入れたセグメントを消さない)。
-pub async fn save_daily_hours(
-    tx: &TenantTx<'_>,
-    tenant_id: Uuid,
-    daily: &HashMap<DayKey, DailyHours>,
-) -> Result<(), tokio_postgres::Error> {
-    let all_unko_nos = daily_unko_nos(daily);
-    save_daily_hours_with(tx, tenant_id, daily, &all_unko_nos).await
-}
-
-/// 全日エントリの運行NO を、[`DayKey`] の順に重複なしで並べる ([`save_daily_hours`] の手順 2 で消す対象)。
+/// 全日エントリの運行NO を、[`DayKey`] の順に重複なしで並べる (日エントリの運行NO だけを消す対象にするとき)。
 pub fn daily_unko_nos(daily: &HashMap<DayKey, DailyHours>) -> Vec<String> {
     let mut entries: Vec<(&DayKey, &DailyHours)> = daily.iter().collect();
     entries.sort_by(|a, b| a.0.cmp(b.0));
@@ -843,8 +985,18 @@ pub fn daily_unko_nos(daily: &HashMap<DayKey, DailyHours>) -> Vec<String> {
     all_unko_nos
 }
 
-/// [`save_daily_hours`] の、手順 2 で消す対象の運行NO を外から渡す形。日エントリを分けて (例: 乗務員ごとに) 別の
-/// transaction で保存するとき、全体の運行NO ([`daily_unko_nos`]) を渡せば、まとめて保存したときと同じ行が消える。
+/// 日別の労働時間とセグメントを保存する (transaction は開かない。呼び手の transaction の中で使う)。
+/// `daily` は `alc_compare::upload_daily::compute_daily_hours` の出力そのまま (ここでは計算しない)。
+/// `all_unko_nos` = 手順 2 で消す対象の運行NO (再計算は月の運行のもの。日エントリの運行NO だけなら [`daily_unko_nos`])。
+///
+/// 1. 日エントリの乗務員CD のうち空でないものの id を [`get_employee_id_by_driver_cd`] で引く (同じ CD は 1 回)。
+///    id が引けない CD と空の CD の日エントリは、消す対象にも保存の対象にもしない。
+/// 2. 引けた乗務員ごとに、`all_unko_nos` で [`sql::DELETE_SEGMENTS_BY_UNKO_NOS`] → [`sql::DELETE_DAILY_HOURS_BY_UNKO_NOS`]
+///    (帰属日が変わっても古い行が残らないように)。
+/// 3. 日エントリを **[`DayKey`] の順** (乗務員CD・日・開始時刻) に保存する: [`sql::DELETE_DAILY_HOURS_EXACT`] →
+///    [`sql::INSERT_DAILY_WORK_HOURS`] → [`sql::DELETE_SEGMENTS_BY_DATE`] → [`sql::INSERT_SEGMENT`]。
+///    `DELETE_SEGMENTS_BY_DATE` は **(乗務員, 日) ごとに最初の 1 回だけ**流す (同じ乗務員・同じ日に日エントリが 2 つ以上
+///    在っても、先に入れたセグメントを消さない)。
 pub async fn save_daily_hours_with(
     tx: &TenantTx<'_>,
     tenant_id: Uuid,
@@ -966,8 +1118,8 @@ impl ApplyUploadError {
     }
 }
 
-/// 取り込みの本体 (1 transaction): [`replace_operations_in`] → [`save_daily_hours`] → [`sql::MARK_UPLOAD_COMPLETED`]
-/// (`operations_count` は流した行数)。返すのも、その行数。
+/// 取り込みの本体 (1 transaction): [`replace_operations_in`] → [`insert_recalc_pending`] (日別の要再計算の印) →
+/// [`sql::MARK_UPLOAD_COMPLETED`] (`operations_count` は流した行数)。返すのも、その行数。日別は書かない。
 /// `rows` と `inputs` の数が違えば、DB を触る前に [`ApplyUploadError::LengthMismatch`] を返す。
 pub async fn apply_upload(
     pg: &mut PgClient,
@@ -975,16 +1127,15 @@ pub async fn apply_upload(
     upload_id: Uuid,
     rows: Arc<Vec<KudguriRow>>,
     inputs: Vec<OperationInput>,
-    daily: HashMap<DayKey, DailyHours>,
 ) -> Result<i32, ApplyUploadError> {
     if rows.len() != inputs.len() {
         return Err(ApplyUploadError::LengthMismatch);
     }
     pg.tenant_tx(tenant_id, move |tx| {
         Box::pin(async move {
-            let operations_count =
+            let (operations_count, marks) =
                 replace_operations_in(tx, tenant_id, upload_id, &rows, &inputs).await?;
-            save_daily_hours(tx, tenant_id, &daily).await?;
+            insert_recalc_pending(tx, tenant_id, &marks).await?;
             let completed: [(&(dyn tokio_postgres::types::ToSql + Sync), Type); 3] = [
                 (&operations_count, Type::INT4),
                 (&upload_id, Type::UUID),

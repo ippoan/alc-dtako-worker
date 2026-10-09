@@ -219,6 +219,7 @@ async fn connection_without_tenant_reads_no_rows() {
         "INSERT INTO dtako_operation_changes (tenant_id, unko_no, crew_role, reason) VALUES ($1, '3001', 0, 'reupload')",
         "INSERT INTO dtako_daily_work_hours (tenant_id, driver_id, work_date) SELECT $1, id, DATE '2026-03-02' FROM employees WHERE tenant_id = $1",
         "INSERT INTO dtako_daily_work_segments (tenant_id, driver_id, work_date, unko_no, start_at, end_at, work_minutes) SELECT $1, id, DATE '2026-03-02', '3001', now(), now(), 0 FROM employees WHERE tenant_id = $1",
+        "INSERT INTO dtako_daily_recalc_pending (tenant_id, driver_id, month) SELECT $1, id, DATE '2026-03-01' FROM employees WHERE tenant_id = $1",
     ] {
         assert_eq!(exec(c, t, insert).await, 1);
     }
@@ -384,6 +385,19 @@ async fn import(
     before: Option<OperationMinutes>,
     after: OperationMinutes,
 ) -> (Vec<PreparedRow>, i32) {
+    import_with(c, tenant_id, upload_id, rows, before, after, false).await
+}
+
+/// [`import`] の、全部の行の [`OperationInput::recalc`] を指定する形。
+async fn import_with(
+    c: &mut PgClient,
+    tenant_id: Uuid,
+    upload_id: Uuid,
+    rows: Vec<KudguriRow>,
+    before: Option<OperationMinutes>,
+    after: OperationMinutes,
+    recalc: bool,
+) -> (Vec<PreparedRow>, i32) {
     let rows = Arc::new(rows);
     let prepared = pg::prepare_upload(c, tenant_id, rows.clone(), Arc::new(vec![]));
     let prepared = prepared.await.unwrap().rows;
@@ -395,9 +409,10 @@ async fn import(
             driver_id: p.driver_id,
             before_minutes: before.filter(|_| p.exists),
             after_minutes: after,
+            recalc,
         })
         .collect();
-    let count = pg::apply_upload(c, tenant_id, upload_id, rows, inputs, HashMap::new());
+    let count = pg::apply_upload(c, tenant_id, upload_id, rows, inputs);
     (prepared, count.await.unwrap())
 }
 
@@ -1025,24 +1040,31 @@ async fn upload_stages_fail_on_a_closed_connection() {
         driver_id: None,
         before_minutes: None,
         after_minutes: minutes(0),
+        recalc: false,
     };
     assert_eq!(
         format!("{:?}", input.clone()).len(),
         format!("{input:?}").len()
     );
     // 行と入力の数が違えば、DB に触れる前に失敗する (切れた接続でも DB の失敗にならない)
-    let applied = pg::apply_upload(&mut c, t, t, rows.clone(), vec![], HashMap::new()).await;
+    let applied = pg::apply_upload(&mut c, t, t, rows.clone(), vec![]).await;
     assert!(
         matches!(applied, Err(ApplyUploadError::LengthMismatch)),
         "{applied:?}"
     );
     assert_eq!(applied.unwrap_err().kind(), "length_mismatch");
-    let applied = pg::apply_upload(&mut c, t, t, rows, vec![input], HashMap::new()).await;
+    let applied = pg::apply_upload(&mut c, t, t, rows, vec![input]).await;
     assert!(
         matches!(&applied, Err(ApplyUploadError::Db(e)) if e.is_closed()),
         "{applied:?}"
     );
     assert_eq!(applied.unwrap_err().kind(), "closed");
+    // 印の読み取り・DB の時刻・保存 (と印を消す) の段も、切れた接続では `Err`
+    assert!(pg::recalc_pending_marks(&mut c, t)
+        .await
+        .unwrap_err()
+        .is_closed());
+    assert!(pg::db_now(&mut c, t).await.unwrap_err().is_closed());
     drop(c);
     db.shutdown();
 }
@@ -1087,7 +1109,8 @@ fn event(
     row
 }
 
-/// 取り込みと同じ順で 1 回流す: 準備 → `compute_daily_hours` (backend と同じ関数) → `apply_upload`。
+/// 取り込みと再計算の順で 1 回流す: 準備 → `apply_upload` (運行と印) → `compute_daily_hours` (backend と同じ関数) →
+/// `save_daily_hours_in_tx` (消す対象は日エントリの運行NO。印は消さない)。返すのは流した行数と保存の結果。
 /// `extra` は、計算の出力に足す日エントリ (計算からは出てこない形を保存に通すため)。
 async fn import_daily(
     c: &mut PgClient,
@@ -1096,7 +1119,7 @@ async fn import_daily(
     rows: Vec<KudguriRow>,
     events: Vec<KudgivtRow>,
     extra: Vec<(DayKey, DailyHours)>,
-) -> Result<i32, ApplyUploadError> {
+) -> (i32, Result<(), tokio_postgres::Error>) {
     let (rows, events) = (Arc::new(rows), Arc::new(events));
     let prepared = pg::prepare_upload(c, tenant_id, rows.clone(), events.clone());
     let prepared = prepared.await.unwrap();
@@ -1112,9 +1135,14 @@ async fn import_daily(
             driver_id: p.driver_id,
             before_minutes: None,
             after_minutes: minutes(0),
+            recalc: false,
         })
         .collect();
-    pg::apply_upload(c, tenant_id, upload_id, rows, inputs, daily).await
+    let count = pg::apply_upload(c, tenant_id, upload_id, rows, inputs);
+    let count = count.await.unwrap();
+    let all_unko_nos = Arc::new(pg::daily_unko_nos(&daily));
+    let saved = pg::save_daily_hours_in_tx(c, tenant_id, daily, all_unko_nos, None);
+    (count, saved.await)
 }
 
 /// 日別の行 (乗務員は名前で。乗務員・日・開始時刻の順)。
@@ -1151,6 +1179,13 @@ async fn operation_rows(c: &mut PgClient, tenant_id: Uuid) -> Vec<Value> {
 async fn completion(c: &mut PgClient, tenant_id: Uuid) -> Vec<Value> {
     let query = "SELECT filename, status, operations_count FROM dtako_upload_history \
                  WHERE tenant_id = $1 ORDER BY filename";
+    rows_json(c, tenant_id, query).await
+}
+
+/// 日別の要再計算の印の `(乗務員の名前, 月)` (月・名前の順)。
+async fn marks(c: &mut PgClient, tenant_id: Uuid) -> Vec<Value> {
+    let query = "SELECT e.name AS driver, p.month FROM dtako_daily_recalc_pending p \
+                 JOIN employees e ON e.id = p.driver_id WHERE p.tenant_id = $1 ORDER BY p.month, e.name";
     rows_json(c, tenant_id, query).await
 }
 
@@ -1255,7 +1290,7 @@ async fn daily_hours_are_saved_and_replaced_on_reupload() {
     );
     let extra = vec![(hand_key, distinct_hours())];
     let count = import_daily(c, t, first, rows, events, extra).await;
-    assert_eq!(count.unwrap(), 1);
+    assert_eq!((count.0, count.1.unwrap()), (1, ()));
     // 保存する 2 つの値は method の値: total_drive_minutes = 労働の合計 (102)、late_night_minutes = 103 - 7
     let hand_day = json!({
         "driver": "TEST-HAND", "work_date": "2026-03-05", "start_time": "04:05:06", "total_work_minutes": 101,
@@ -1325,7 +1360,7 @@ async fn daily_hours_are_saved_and_replaced_on_reupload() {
     // この zip に出てこない乗務員 (TEST-HAND) の行と、当たらない行は、そのまま
     let (rows, events) = one_day_trip("DAY-1", "D-ONE");
     let count = import_daily(c, t, second, rows, events, vec![]).await;
-    assert_eq!(count.unwrap(), 1);
+    assert_eq!((count.0, count.1.unwrap()), (1, ()));
     let new_day = json!({
         "driver": "TEST-ONE", "work_date": "2026-03-02", "start_time": "09:15:00", "total_work_minutes": 480,
         "total_drive_minutes": 480, "total_rest_minutes": 0, "late_night_minutes": 0, "drive_minutes": 480,
@@ -1403,7 +1438,7 @@ async fn daily_hours_keep_both_entries_of_a_day_and_skip_unresolved_drivers() {
     for _ in 0..2 {
         let count =
             import_daily(c, t, upload_id, rows.clone(), events.clone(), extra.clone()).await;
-        assert_eq!(count.unwrap(), 2);
+        assert_eq!((count.0, count.1.unwrap()), (2, ()));
         // 日別は `code` の行に、運行は `driver_cd` の行に付く。空の CD と、id が引けない CD (D-GHOST) の日エントリは無い
         assert_eq!(rows_json(c, t, days).await, want_days);
         // 同じ日の 2 つめの日エントリを保存しても、1 つめのセグメントは消えない
@@ -1420,7 +1455,8 @@ async fn daily_hours_keep_both_entries_of_a_day_and_skip_unresolved_drivers() {
     db.shutdown();
 }
 
-/// 別テナントの日別・セグメント・履歴には触れない。段の途中で失敗したら、運行の入れ替えも日別も履歴も元のまま (transaction は 1 つ)。
+/// 別テナントの日別・セグメント・履歴・印には触れない。取り込みの段の途中で失敗したら、運行の入れ替えも印も履歴も元のまま、
+/// 保存の段の途中で失敗したら、日別も印も元のまま (どちらも transaction は 1 つ)。
 #[tokio::test(flavor = "multi_thread")]
 async fn daily_hours_stay_inside_the_tenant_and_roll_back_with_the_operations() {
     let db = Embedded::start().await;
@@ -1436,7 +1472,7 @@ async fn daily_hours_stay_inside_the_tenant_and_roll_back_with_the_operations() 
     for (tenant_id, upload_id) in [(a, a_up), (b, b_up)] {
         let (rows, events) = one_day_trip("SAME-1", "D-ONE");
         let count = import_daily(c, tenant_id, upload_id, rows, events, vec![]).await;
-        assert_eq!(count.unwrap(), 1);
+        assert_eq!((count.0, count.1.unwrap()), (1, ()));
     }
     let b_days = daily_rows(c, b).await;
     let b_segments = segment_rows(c, b).await;
@@ -1454,7 +1490,7 @@ async fn daily_hours_stay_inside_the_tenant_and_roll_back_with_the_operations() 
     // テナント A が上げ直す (2 日ぶんに変わる)。upload_id にテナント B の履歴の id を渡しても、B の履歴は completed にならない
     let (rows, events) = two_day_trip("SAME-1", "D-ONE");
     let count = import_daily(c, a, b_pending, rows, events, vec![]).await;
-    assert_eq!(count.unwrap(), 1);
+    assert_eq!((count.0, count.1.unwrap()), (1, ()));
     assert_eq!(
         (daily_rows(c, a).await.len(), segment_rows(c, a).await.len()),
         (2, 2)
@@ -1464,32 +1500,69 @@ async fn daily_hours_stay_inside_the_tenant_and_roll_back_with_the_operations() 
     assert_eq!(completion(c, b).await, b_history);
     assert_eq!(completion(c, a).await, [done("a1.zip", "completed", 1)]);
 
-    // 段の途中の失敗: 運行を入れ替え、日別を入れた後の、セグメントの INSERT が落ちる (文字列に NUL)
+    // 印: どちらのテナントにも、取り込んだ乗務員 × 月 に 1 つずつ (上げ直しは同じ印に当たって増えない)
+    let one_mark = || json!([{ "driver": "TEST-DRIVER D-ONE", "month": "2026-03-01" }]);
+    assert_eq!(json!(marks(c, a).await), one_mark());
+    assert_eq!(json!(marks(c, b).await), one_mark());
+
+    // 保存の段の途中の失敗: 日別を入れた後の、セグメントの INSERT が落ちる (文字列に NUL) → 日別・セグメントも、
+    // 同じ transaction で消すはずだった印も元のまま
     let a_failing = pg::create_upload(c, a, "a2.zip".into()).await.unwrap();
     let a_days = daily_rows(c, a).await;
     let a_segments = segment_rows(c, a).await;
+    let mut broken = distinct_hours();
+    broken.segments[1].unko_no = "BAD\0".into();
+    let broken_key = ("D-ONE".to_string(), at(8, 0).date(), NaiveTime::MIN);
+    let daily = HashMap::from([(broken_key, broken)]);
+    let clear = pg::PendingClear {
+        month: NaiveDate::from_ymd_opt(2026, 3, 1).unwrap(),
+        driver_id: None,
+        driver_cd: Some("D-ONE".into()),
+        before: Utc::now() + Duration::days(1),
+    };
+    let unko_nos = Arc::new(vec!["SAME-1".to_owned()]);
+    let failed =
+        pg::save_daily_hours_in_tx(c, a, daily, unko_nos.clone(), Some(clear.clone())).await;
+    assert!(!failed.unwrap_err().is_closed());
+    assert_eq!(daily_rows(c, a).await, a_days);
+    assert_eq!(segment_rows(c, a).await, a_segments);
+    assert_eq!(json!(marks(c, a).await), one_mark());
+    // 落ちなければ、乗務員CD で指した印が消える (テナント B の同じ乗務員CD の印は残る)
+    let saved = pg::save_daily_hours_in_tx(c, a, HashMap::new(), unko_nos, Some(clear)).await;
+    saved.unwrap();
+    assert_eq!(marks(c, a).await, Vec::<Value>::new());
+    assert_eq!(json!(marks(c, b).await), one_mark());
+
+    // 取り込みの段の途中の失敗: 1 行目を入れ替えた後、2 行目の INSERT が落ちる (raw_data に JSONB が受けない NUL) →
+    // 運行・変更記録・印・履歴は元のまま (1 行目の変化の印も、新しい 2 行目の印も付かない)
     let a_operations = operation_rows(c, a).await;
     let a_changes = changes(c, a).await;
     assert_eq!(a_changes.len(), 1);
     let departed =
         json!({ "unko_no": "SAME-1", "driver": "TEST-DRIVER D-ONE", "departure": "02 06:15" });
     assert_eq!(a_operations, [departed]);
-    let (rows, events) = one_day_trip("SAME-1", "D-ONE");
-    let mut broken = distinct_hours();
-    broken.segments[1].unko_no = "BAD\0".into();
-    let extra = vec![(
-        ("D-ONE".to_string(), at(8, 0).date(), NaiveTime::MIN),
-        broken,
-    )];
-    let failed = import_daily(c, a, a_failing, rows, events, extra).await;
+    let (mut rows, _) = one_day_trip("SAME-1", "D-ONE");
+    let mut bad = kudguri("NEW-2", 1, "D-ONE", 3, 22);
+    bad.raw_data = json!({ "x": "\u{0}" });
+    rows.push(bad);
+    let driver_id = resolve_driver(c, a, "D-ONE").await;
+    let input = |_| OperationInput {
+        office_id: None,
+        vehicle_id: None,
+        driver_id,
+        before_minutes: None,
+        after_minutes: minutes(0),
+        recalc: false,
+    };
+    let inputs = (0..2).map(input).collect();
+    let failed = pg::apply_upload(c, a, a_failing, Arc::new(rows), inputs).await;
     assert!(
         matches!(&failed, Err(ApplyUploadError::Db(e)) if !e.is_closed()),
         "{failed:?}"
     );
     assert_eq!(operation_rows(c, a).await, a_operations);
     assert_eq!(changes(c, a).await, a_changes);
-    assert_eq!(daily_rows(c, a).await, a_days);
-    assert_eq!(segment_rows(c, a).await, a_segments);
+    assert_eq!(marks(c, a).await, Vec::<Value>::new());
     assert_eq!(
         completion(c, a).await,
         [
@@ -1500,8 +1573,7 @@ async fn daily_hours_stay_inside_the_tenant_and_roll_back_with_the_operations() 
 
     // 行と入力の数が違えば、DB に触れる前に失敗する (何も変わらない)
     let (rows, _) = one_day_trip("SAME-1", "D-ONE");
-    let mismatched =
-        pg::apply_upload(c, a, a_failing, Arc::new(rows), vec![], HashMap::new()).await;
+    let mismatched = pg::apply_upload(c, a, a_failing, Arc::new(rows), vec![]).await;
     assert!(
         matches!(mismatched, Err(ApplyUploadError::LengthMismatch)),
         "{mismatched:?}"
@@ -1514,6 +1586,181 @@ async fn daily_hours_stay_inside_the_tenant_and_roll_back_with_the_operations() 
             done("a2.zip", "processing", 0)
         ]
     );
+
+    held.close().await;
+    db.shutdown();
+}
+
+// ---- 日別の要再計算の印 ----
+
+/// 印: 取り込み (`apply_upload`) が付ける対象 (新しい運行・snapshot の変化・`recalc`・乗務員と日付の移動。変化なしは付けない)・
+/// ON CONFLICT・一覧の並びと読んだ時刻・消す条件 (月・乗務員の id か乗務員CD・created_at の上限)・テナントの分離。
+#[tokio::test(flavor = "multi_thread")]
+async fn recalc_pending_marks_follow_the_changes_and_clear_inside_the_tenant() {
+    let db = Embedded::start().await;
+    let mut held = db.client(APP_ROLE).await;
+    let c = &mut held.inner;
+    let a = tenant(c, "Dtako Pending Tenant A").await;
+    let b = tenant(c, "Dtako Pending Tenant B").await;
+    let up = pg::create_upload(c, a, "p.zip".into()).await.unwrap();
+    let unmark = "DELETE FROM dtako_daily_recalc_pending WHERE tenant_id = $1";
+    let mark = |driver: &str, month: &str| json!({ "driver": format!("TEST-DRIVER {driver}"), "month": month });
+    let same = Some(minutes(0));
+
+    // 新しい運行 → 乗務員 × 読取日と運行日の月 (月をまたぐ運行は 2 つ)。乗務員CD が空の運行には付けない
+    let mut p1 = kudguri("P-1", 1, "D-ONE", 8, 17);
+    p1.reading_date = NaiveDate::from_ymd_opt(2026, 4, 1).unwrap();
+    let rows = vec![p1.clone(), kudguri("P-2", 1, "", 8, 17)];
+    let (_, n) = import(c, a, up, rows.clone(), None, minutes(0)).await;
+    assert_eq!(n, 2);
+    let both_months = [mark("D-ONE", "2026-03-01"), mark("D-ONE", "2026-04-01")];
+    assert_eq!(marks(c, a).await, both_months);
+    // 印が残っているところへもう一度付けても (ON CONFLICT) 増えない
+    import_with(c, a, up, rows.clone(), same, minutes(0), true).await;
+    assert_eq!(marks(c, a).await, both_months);
+
+    // 何も変わらない上げ直しは印を付けない。`recalc` (KUDGIVT の変化・やり直し) なら付ける
+    exec(c, a, unmark).await;
+    import(c, a, up, rows.clone(), same, minutes(0)).await;
+    assert_eq!(marks(c, a).await, Vec::<Value>::new());
+    import_with(c, a, up, rows.clone(), same, minutes(0), true).await;
+    assert_eq!(marks(c, a).await, both_months);
+    // snapshot (出発の時刻) が変わった
+    exec(c, a, unmark).await;
+    let mut later = p1.clone();
+    later.departure_at = later.departure_at.map(|d| d + Duration::hours(1));
+    import(c, a, up, vec![later], same, minutes(0)).await;
+    assert_eq!(marks(c, a).await, both_months);
+
+    // 乗務員が変わった → 今の乗務員 × 月と、前の乗務員 × 前の月
+    exec(c, a, unmark).await;
+    let mut moved = p1.clone();
+    moved.driver_cd = "D-TWO".into();
+    moved.driver_name = "TEST-DRIVER D-TWO".into();
+    import(c, a, up, vec![moved.clone()], same, minutes(0)).await;
+    let four = [
+        mark("D-ONE", "2026-03-01"),
+        mark("D-TWO", "2026-03-01"),
+        mark("D-ONE", "2026-04-01"),
+        mark("D-TWO", "2026-04-01"),
+    ];
+    assert_eq!(marks(c, a).await, four);
+    // 読取日だけが変わった (snapshot は同じ) → 今の月と前の月
+    exec(c, a, unmark).await;
+    moved.reading_date = NaiveDate::from_ymd_opt(2026, 3, 3).unwrap();
+    import(c, a, up, vec![moved], same, minutes(0)).await;
+    let two_months = [mark("D-TWO", "2026-03-01"), mark("D-TWO", "2026-04-01")];
+    assert_eq!(marks(c, a).await, two_months);
+
+    // テナント B に同じ運行を取り込んでも、A の印は変わらない
+    let b_up = pg::create_upload(c, b, "p.zip".into()).await.unwrap();
+    import(c, b, b_up, vec![p1], None, minutes(0)).await;
+    assert_eq!(marks(c, b).await, both_months);
+    assert_eq!(marks(c, a).await, two_months);
+
+    // 一覧: 月・乗務員の順。読んだ時刻はどの行も同じで、印の時刻より後。DB の時刻はさらに後
+    let listed = pg::recalc_pending_marks(c, a).await.unwrap();
+    let d_two = resolve_driver(c, a, "D-TWO").await.unwrap();
+    let months: Vec<_> = listed.iter().map(|m| (m.driver_id, m.month)).collect();
+    let march = NaiveDate::from_ymd_opt(2026, 3, 1).unwrap();
+    let april = NaiveDate::from_ymd_opt(2026, 4, 1).unwrap();
+    assert_eq!(months, [(d_two, march), (d_two, april)]);
+    let read_at = listed[0].read_at;
+    assert!(listed
+        .iter()
+        .all(|m| m.read_at == read_at && m.created_at <= read_at));
+    assert_eq!(listed[0].clone(), listed[0]);
+    assert!(pg::db_now(c, a).await.unwrap() >= read_at);
+
+    // 消す: 時刻の上限より後の印は消さない → 上限を読んだ時刻にすれば、その乗務員 × 月だけ消える
+    let clear = |before| pg::PendingClear {
+        month: march,
+        driver_id: Some(d_two),
+        driver_cd: None,
+        before,
+    };
+    let older = listed[0].created_at - Duration::microseconds(1);
+    let none = HashMap::new;
+    let no_unko_nos = || Arc::new(Vec::new());
+    let saved = pg::save_daily_hours_in_tx(c, a, none(), no_unko_nos(), Some(clear(older)));
+    saved.await.unwrap();
+    assert_eq!(marks(c, a).await, two_months);
+    let saved = pg::save_daily_hours_in_tx(c, a, none(), no_unko_nos(), Some(clear(read_at)));
+    saved.await.unwrap();
+    assert_eq!(marks(c, a).await, [mark("D-TWO", "2026-04-01")]);
+    // 乗務員CD で指す (月の全員の再計算)。テナント B から A の乗務員CD を指しても、A の印は消えない
+    let by_cd = pg::PendingClear {
+        month: april,
+        driver_id: None,
+        driver_cd: Some("D-TWO".into()),
+        before: read_at,
+    };
+    let saved = pg::save_daily_hours_in_tx(c, b, none(), no_unko_nos(), Some(by_cd.clone()));
+    saved.await.unwrap();
+    assert_eq!(marks(c, a).await, [mark("D-TWO", "2026-04-01")]);
+    let saved = pg::save_daily_hours_in_tx(c, a, none(), no_unko_nos(), Some(by_cd));
+    saved.await.unwrap();
+    assert_eq!(marks(c, a).await, Vec::<Value>::new());
+    assert_eq!(marks(c, b).await, both_months);
+    assert_eq!(pg::recalc_pending_marks(c, a).await.unwrap(), []);
+    assert_eq!(
+        pg::month_of(NaiveDate::from_ymd_opt(2026, 2, 28).unwrap()).to_string(),
+        "2026-02-01"
+    );
+
+    held.close().await;
+    db.shutdown();
+}
+
+/// 再計算の口が印を読んだ後・保存する前に、同じ 乗務員 × 月 へ取り込みが印を付け直すと、印は消してから入れ直されて
+/// 時刻が新しくなる (読んだ時刻より後)。なので、読んだ時刻までの印を消す保存では消えず、計算に入らなかった変化の印が残る。
+/// 付け直した後に読んだ時刻なら消える。
+#[tokio::test(flavor = "multi_thread")]
+async fn recalc_pending_mark_put_again_after_reading_survives_the_clear() {
+    let db = Embedded::start().await;
+    let mut held = db.client(APP_ROLE).await;
+    let c = &mut held.inner;
+    let t = tenant(c, "Dtako Pending Again Tenant").await;
+    let up = pg::create_upload(c, t, "q.zip".into()).await.unwrap();
+    let rows = vec![kudguri("Q-1", 1, "D-ONE", 8, 17)];
+    import(c, t, up, rows.clone(), None, minutes(0)).await;
+    let read = pg::recalc_pending_marks(c, t).await.unwrap();
+    assert_eq!(read.len(), 1);
+    let (read_at, first_created) = (read[0].read_at, read[0].created_at);
+    assert!(first_created <= read_at);
+
+    // 読んだ後に、同じ 乗務員 × 月 へ取り込み (`recalc`) が印を付け直す → 1 つのまま、時刻は読んだ時刻より後
+    import_with(c, t, up, rows, Some(minutes(0)), minutes(0), true).await;
+    let again = pg::recalc_pending_marks(c, t).await.unwrap();
+    assert_eq!(again.len(), 1);
+    assert_eq!(
+        (again[0].driver_id, again[0].month),
+        (read[0].driver_id, read[0].month)
+    );
+    assert!(again[0].created_at > read_at, "{again:?} / {read_at}");
+
+    // 再計算の口と同じ消し方 (最初に読んだ時刻まで) では消えない
+    let clear = |before| pg::PendingClear {
+        month: read[0].month,
+        driver_id: Some(read[0].driver_id),
+        driver_cd: None,
+        before,
+    };
+    let saved =
+        pg::save_daily_hours_in_tx(c, t, HashMap::new(), Arc::new(vec![]), Some(clear(read_at)));
+    saved.await.unwrap();
+    let one = json!([{ "driver": "TEST-DRIVER D-ONE", "month": "2026-03-01" }]);
+    assert_eq!(json!(marks(c, t).await), one);
+    // 付け直した後に読んだ時刻なら消える
+    let saved = pg::save_daily_hours_in_tx(
+        c,
+        t,
+        HashMap::new(),
+        Arc::new(vec![]),
+        Some(clear(again[0].read_at)),
+    );
+    saved.await.unwrap();
+    assert_eq!(marks(c, t).await, Vec::<Value>::new());
 
     held.close().await;
     db.shutdown();
@@ -1741,7 +1988,8 @@ async fn operations_for_recalc_pick_the_month_by_operation_or_reading_date() {
         .await
         .unwrap_err()
         .is_closed());
-    let saved = pg::save_daily_hours_in_tx(&mut c, a, HashMap::new(), Arc::new(Vec::new())).await;
+    let saved = pg::save_daily_hours_in_tx(&mut c, a, HashMap::new(), Arc::new(Vec::new()), None);
+    let saved = saved.await;
     assert!(saved.unwrap_err().is_closed());
     drop(c);
     db.shutdown();

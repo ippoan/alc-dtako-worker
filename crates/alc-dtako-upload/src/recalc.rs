@@ -13,6 +13,8 @@
 //!   乗務員の運行の外にある運行NO の行は拾わない。消す対象の運行NO は月の全員と同じ
 //!   (月の運行の一覧を 1 回引いて運行NO だけ使う。一括は 1 回引いて全員で使い回す)。一括は乗務員を 1 人ずつ読んで計算し、1 人の失敗 (KUDGIVT が 1 件も
 //!   無い場合を含む) を数えて続ける (その人の transaction は戻る)
+//! - 分割の出力を読んで計算する所 (`compute_split_daily`) は 3 口と、取り込みの後の日別の計算し直し ([`crate::ingest`] の段 9) が共有する
+//!   (保存の形は呼び手ごと)
 //! - 進み具合は event で返す ([`next_recalc_event`]。応答の stream の中で 1 歩ずつ進める)。呼び手が切れたら、そこで止まる
 //!   (保存の済んだ乗務員の分は残る。もう一度呼べば揃う)
 //!
@@ -67,7 +69,7 @@ impl From<RecalcOperationRow> for RecalcOperation {
     }
 }
 
-fn kudguri_rows(ops: Vec<RecalcOperationRow>) -> Vec<KudguriRow> {
+pub(crate) fn kudguri_rows(ops: Vec<RecalcOperationRow>) -> Vec<KudguriRow> {
     let into_row = |op: RecalcOperationRow| RecalcOperation::from(op).into_kudguri_row();
     ops.into_iter().map(into_row).collect()
 }
@@ -196,6 +198,12 @@ impl RecalcRun {
     fn warn(&self, what: &str) {
         (self.log)(LogLevel::Warn, &format!("{}: {what}", self.name()));
     }
+
+    /// 運行の行を、分割の出力で計算する ([`compute_split_daily`])。
+    async fn split_daily(&self, rows: &[KudguriRow]) -> Result<SplitDaily, tokio_postgres::Error> {
+        let (store, name) = (self.store.as_ref(), self.name());
+        compute_split_daily(&self.pg, store, &self.log, name, self.tenant_id, rows).await
+    }
 }
 
 fn db_stage(e: &tokio_postgres::Error) -> Option<String> {
@@ -228,18 +236,11 @@ pub async fn next_recalc_event(mut run: RecalcRun) -> Option<(Value, RecalcRun)>
                 let event = json!({ "event": "batch_start", "total_drivers": run.total });
                 return Some((event, run));
             }
-            Step::Compute { rows } => {
-                let (kudgivt_rows, ferry) = read_split_outputs(&run, &rows, true).await;
-                if kudgivt_rows.is_empty() && !rows.is_empty() {
-                    return run.fail("kudgivt_not_found", None);
-                }
-                let samples = kudgivt_rows.clone();
-                let daily = match compute(&run, &rows, &kudgivt_rows, samples, &ferry).await {
-                    Ok(daily) => daily,
-                    Err(e) => return run.fail("internal_error", db_stage(&e)),
-                };
-                run.step = save_step(daily, unko_nos_of(&rows));
-            }
+            Step::Compute { rows } => match run.split_daily(&rows).await {
+                Ok(SplitDaily::Daily(daily)) => run.step = save_step(daily, unko_nos_of(&rows)),
+                Ok(SplitDaily::KudgivtNotFound) => return run.fail("kudgivt_not_found", None),
+                Err(e) => return run.fail("internal_error", db_stage(&e)),
+            },
             Step::DriverLoad { driver_id } => {
                 let Some((month_start, month_end)) = month_range(run.year, run.month) else {
                     return run.fail("month_invalid", None);
@@ -253,14 +254,9 @@ pub async fn next_recalc_event(mut run: RecalcRun) -> Option<(Value, RecalcRun)>
                 };
                 let rows = kudguri_rows(ops);
                 run.total = rows.len();
-                let (kudgivt_rows, ferry) = read_split_outputs(&run, &rows, true).await;
-                if kudgivt_rows.is_empty() && !rows.is_empty() {
-                    return run.fail("kudgivt_not_found", None);
-                }
-                let samples = kudgivt_rows.clone();
-                let daily = compute(&run, &rows, &kudgivt_rows, samples, &ferry).await;
-                match daily {
-                    Ok(daily) => run.step = save_step(daily, all_unko_nos),
+                match run.split_daily(&rows).await {
+                    Ok(SplitDaily::Daily(daily)) => run.step = save_step(daily, all_unko_nos),
+                    Ok(SplitDaily::KudgivtNotFound) => return run.fail("kudgivt_not_found", None),
                     Err(e) => return run.fail("internal_error", db_stage(&e)),
                 }
             }
@@ -388,7 +384,7 @@ async fn month_start(mut run: RecalcRun) -> Option<(Value, RecalcRun)> {
 }
 
 /// 運行の行の運行NO を、重複なしで行の順に並べる (保存で消す対象)。
-fn unko_nos_of(rows: &[KudguriRow]) -> Vec<String> {
+pub(crate) fn unko_nos_of(rows: &[KudguriRow]) -> Vec<String> {
     let mut unko_nos: Vec<String> = Vec::new();
     for row in rows {
         if !unko_nos.contains(&row.unko_no) {
@@ -399,7 +395,7 @@ fn unko_nos_of(rows: &[KudguriRow]) -> Vec<String> {
 }
 
 /// その月の再計算の対象の運行 ([`pg::operations_for_recalc`]) の運行NO (乗務員の口が、月の全員の口と同じ行を消すため)。
-async fn month_unko_nos(
+pub(crate) async fn month_unko_nos(
     client: &mut PgClient,
     tenant_id: Uuid,
     month_start: NaiveDate,
@@ -454,27 +450,39 @@ fn save_step(daily: HashMap<DayKey, DailyHours>, all_unko_nos: Vec<String>) -> S
     }
 }
 
-/// 分類を読み (未登録の event は既定の分類で登録する。`samples` は登録の元の行)、日別を計算する。
-async fn compute(
-    run: &RecalcRun,
+/// [`compute_split_daily`] の結果。
+pub(crate) enum SplitDaily {
+    /// 行が在るのに、KUDGIVT が 1 件も読めない
+    KudgivtNotFound,
+    /// 計算した日別 (乗務員CD ごとに分けていない)
+    Daily(HashMap<DayKey, DailyHours>),
+}
+
+/// 運行の行を、運行ごとの分割の出力 (KUDGIVT・KUDGFRY) で計算する (3 口と取り込みの後の計算し直しが共有する)。
+/// 分割の出力を読み、KUDGIVT が 1 件も無ければ (行が在るとき) [`SplitDaily::KudgivtNotFound`]、在れば分類を読んで
+/// (未登録の event は既定の分類で登録する) `compute_daily_hours` を通す。保存はしない (保存の形は呼び手ごと)。
+/// `name` はログの頭 (口の名前、取り込みからは `upload`・`rerun`)。
+pub(crate) async fn compute_split_daily(
+    pg: &Mutex<PgClient>,
+    store: &dyn ObjectStore,
+    log: &LogSink,
+    name: &str,
+    tenant_id: Uuid,
     rows: &[KudguriRow],
-    kudgivt_rows: &[KudgivtRow],
-    samples: Vec<KudgivtRow>,
-    ferry: &HashMap<String, FerryData>,
-) -> Result<HashMap<DayKey, DailyHours>, tokio_postgres::Error> {
+) -> Result<SplitDaily, tokio_postgres::Error> {
+    let (kudgivt_rows, ferry) = read_split_outputs(store, log, name, tenant_id, rows).await;
+    if kudgivt_rows.is_empty() && !rows.is_empty() {
+        return Ok(SplitDaily::KudgivtNotFound);
+    }
+    let samples = Arc::new(kudgivt_rows.clone());
     let classifications: HashMap<String, EventClass> = {
-        let mut client = run.pg.lock().await;
-        let samples = Arc::new(samples);
-        pg::prepare_upload(&mut client, run.tenant_id, Arc::new(Vec::new()), samples)
+        let mut client = pg.lock().await;
+        pg::prepare_upload(&mut client, tenant_id, Arc::new(Vec::new()), samples)
             .await?
             .classification_map()
     };
-    Ok(compute_daily_hours(
-        rows,
-        kudgivt_rows,
-        &classifications,
-        ferry,
-    ))
+    let daily = compute_daily_hours(rows, &kudgivt_rows, &classifications, &ferry);
+    Ok(SplitDaily::Daily(daily))
 }
 
 /// 一括の乗務員を 1 人ずつ引き当てる (乗務員CD と月の運行。無い・引けないは `None`)。
@@ -521,14 +529,12 @@ async fn recalc_batch_driver(
     rows: Vec<KudguriRow>,
     all_unko_nos: &Arc<Vec<String>>,
 ) -> bool {
-    let (kudgivt_rows, ferry) = read_split_outputs(run, &rows, true).await;
-    if kudgivt_rows.is_empty() && !rows.is_empty() {
-        run.warn("driver failed: kudgivt_not_found");
-        return false;
-    }
-    let samples = kudgivt_rows.clone();
-    let saved = match compute(run, &rows, &kudgivt_rows, samples, &ferry).await {
-        Ok(daily) => {
+    let saved = match run.split_daily(&rows).await {
+        Ok(SplitDaily::KudgivtNotFound) => {
+            run.warn("driver failed: kudgivt_not_found");
+            return false;
+        }
+        Ok(SplitDaily::Daily(daily)) => {
             let mut client = run.pg.lock().await;
             let unko_nos = all_unko_nos.clone();
             pg::save_daily_hours_in_tx(&mut client, run.tenant_id, daily, unko_nos).await
@@ -544,12 +550,14 @@ async fn recalc_batch_driver(
     }
 }
 
-/// 運行NO ごとに 1 回、分割の出力の KUDGFRY (と、`with_kudgivt` なら KUDGIVT) を読む (同時に)。
-/// 読めない・無い・parse できないものは飛ばす。
+/// 運行NO ごとに 1 回、分割の出力の KUDGIVT と KUDGFRY を読む (同時に。GET は運行NO の数の 2 倍)。
+/// 読めない・無い・parse できないものは飛ばす (読めない KUDGIVT は件数を `name` の頭で Warn)。
 async fn read_split_outputs(
-    run: &RecalcRun,
+    store: &dyn ObjectStore,
+    log: &LogSink,
+    name: &str,
+    tenant_id: Uuid,
     rows: &[KudguriRow],
-    with_kudgivt: bool,
 ) -> (Vec<KudgivtRow>, HashMap<String, FerryData>) {
     let mut unko_nos: Vec<&str> = Vec::new();
     for row in rows {
@@ -557,21 +565,18 @@ async fn read_split_outputs(
             unko_nos.push(&row.unko_no);
         }
     }
-    let tenant_id = run.tenant_id;
     let mut wanted: Vec<(String, (usize, bool))> = Vec::new();
     for (index, unko_no) in unko_nos.iter().enumerate() {
-        if with_kudgivt {
-            wanted.push((
-                format!("{tenant_id}/unko/{unko_no}/KUDGIVT.csv"),
-                (index, true),
-            ));
-        }
+        wanted.push((
+            format!("{tenant_id}/unko/{unko_no}/KUDGIVT.csv"),
+            (index, true),
+        ));
         wanted.push((
             format!("{tenant_id}/unko/{unko_no}/KUDGFRY.csv"),
             (index, false),
         ));
     }
-    let mut got = get_all(run.store.as_ref(), wanted).await;
+    let mut got = get_all(store, wanted).await;
     // 返ってくる順に依らないよう、運行NO の順 (KUDGIVT が先) に並べ直す
     got.sort_by_key(|((index, is_kudgivt), _)| (*index, !*is_kudgivt));
 
@@ -594,9 +599,8 @@ async fn read_split_outputs(
         }
     }
     if unreadable > 0 {
-        run.warn(&format!(
-            "KUDGIVT unavailable for {unreadable} operation(s)"
-        ));
+        let message = format!("{name}: KUDGIVT unavailable for {unreadable} operation(s)");
+        log(LogLevel::Warn, &message);
     }
     (kudgivt_rows, ferry)
 }

@@ -311,7 +311,9 @@ fn recalc_keys(
     driver_id.map_or_else(Vec::new, |id| months.map(|m| (id, m)).collect())
 }
 
-/// [`sql::INSERT_RECALC_PENDING`] (transaction は開かない)。空なら DB を触らない。
+/// 印を付け直す (transaction は開かない): [`sql::DELETE_RECALC_PENDING_FOR_MARKS`] → [`sql::INSERT_RECALC_PENDING`]。
+/// 既に印が在っても時刻が新しくなるので、再計算の口が印を読んだ後に付いた印は、その口の「読んだ時刻まで」の消去に当たらない
+/// (ON CONFLICT DO NOTHING だけだと古い時刻のまま消され、計算に入らなかった変化の印が無くなる)。空なら DB を触らない。
 pub async fn insert_recalc_pending(
     tx: &TenantTx<'_>,
     tenant_id: Uuid,
@@ -327,6 +329,8 @@ pub async fn insert_recalc_pending(
         (&driver_ids, Type::UUID_ARRAY),
         (&months, Type::DATE_ARRAY),
     ];
+    tx.execute_typed(sql::DELETE_RECALC_PENDING_FOR_MARKS, &params)
+        .await?;
     tx.execute_typed(sql::INSERT_RECALC_PENDING, &params).await
 }
 

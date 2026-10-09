@@ -122,7 +122,7 @@ zip の取り込みのうち DB に書く部分。**SQL は backend (ippoan/rust
 | `create_upload(pg, tenant_id, filename)` | 履歴を作り id を返す (id は DB の既定値)。**テナントが存在しない**ときは `CreateUploadError::TenantNotFound` (ほかの DB の失敗と区別する) |
 | `set_upload_zip_key(pg, tenant_id, upload_id, key)` | 履歴に zip の key を記録する。**単独の transaction** (後の段が落ちても key は残る)。返すのは更新した行数 |
 | `prepare_upload(pg, tenant_id, rows, kudgivt_rows)` | 1 transaction の中で、**KUDGURI の行の順に** 営業所・車輌・乗務員を解決し、運行が既に在るかを見て、続けて分類を読み、未登録のイベントCD を既定の分類で足す。「既に在る」= DB に在る、または同じ zip の中で先の行に同じ (運行NO, crew_role) が出た |
-| `apply_upload(pg, tenant_id, upload_id, rows, inputs)` | 取り込みの本体。**1 transaction の中で** 運行の入れ替え (`replace_operations_in`。入れ替える前の運行の 乗務員 × 日付を `LIST_OPERATION_RECALC_KEYS` で 1 回引き、行の順に入れ替え、前の行と違えば変更記録) → 日別の要再計算の印 (`insert_recalc_pending` = `INSERT_RECALC_PENDING`。`ON CONFLICT DO NOTHING`。対象は上の「アップロードの口」の段 7) → 履歴に完了の印 (`operations_count` = 流した**行数**。運行NO の種類の数ではない)。**日別は書かない**。途中で落ちたら、運行も印も履歴も元のまま。`rows` と `inputs` の数が違えば DB を触る前に `ApplyUploadError::LengthMismatch` |
+| `apply_upload(pg, tenant_id, upload_id, rows, inputs)` | 取り込みの本体。**1 transaction の中で** 運行の入れ替え (`replace_operations_in`。入れ替える前の運行の 乗務員 × 日付を `LIST_OPERATION_RECALC_KEYS` で 1 回引き、行の順に入れ替え、前の行と違えば変更記録) → 日別の要再計算の印 (`insert_recalc_pending` = 同じ 乗務員 × 月 の印を消してから (`DELETE_RECALC_PENDING_FOR_MARKS`) 入れ直す (`INSERT_RECALC_PENDING`。時刻は `clock_timestamp()`)。既に印が在っても時刻が新しくなるので、印の口が読んだ後に付いた印を消さない。対象は上の「アップロードの口」の段 7) → 履歴に完了の印 (`operations_count` = 流した**行数**。運行NO の種類の数ではない)。**日別は書かない**。途中で落ちたら、運行も印も履歴も元のまま。`rows` と `inputs` の数が違えば DB を触る前に `ApplyUploadError::LengthMismatch` |
 | `mark_upload_failed(pg, tenant_id, upload_id, label)` | 履歴に失敗の印を付ける。`label` は呼び手が渡す固定の語 (生のエラー文を入れない) |
 
 - **乗務員の解決 (`upsert_driver`)**: 乗務員CD は `code` 列に入っていることも `driver_cd` 列に入っていることも在るので、順に当てる —
@@ -317,8 +317,8 @@ rust-alc-api の同じ口と同じ仕事。流れは `recalc.rs` (月の全員�
   消すのは、口が運行を読み始める前の DB の時刻までに付いた印だけ)。
 - 限界: KUDGFRY (フェリー) の変化では印を付けない (取り込みの zip に材料が無い)。乗務員が変わった運行の前の乗務員は、印の口で計算し直すが、
   その月に運行が残っていなければ日別の古い行は消えない (保存が消すのは日エントリの在る乗務員の行だけ。`/recalculate-driver` と同じ)。
-  印が付いたまま (計算の前) に同じ印へ別の取り込みが当たると、`ON CONFLICT DO NOTHING` で時刻が変わらないので、計算の途中の取り込みの変化を
-  取りこぼしうる (印の表は UPDATE しない設計。もう一度取り込むか再計算の口で揃う)。
+  取り込みは印を消してから入れ直す (時刻は文を流した時刻) ので、印の口が読んだ後に付き直った印は消さない。ただし取り込みが印を入れた後・
+  commit する前に印の口が印と運行を読むと、その取り込みの変化を取りこぼしうる (時刻で比べる方式の限界。もう一度取り込むか再計算の口で揃う)。
 
 ## 分割の口 `POST /split-csv/{upload_id}`
 
@@ -495,12 +495,12 @@ KUDGIVT が 0 件 → その人だけ errors・ほかは保存 (1 人の口は `
 同時に走る PUT は 6 本まで / 空の入力は何も呼ばない / `get` の 3 通り / `StoreError` の文に key が出ない /
 まとめて読む `get_all` (同時 6 本まで・結果は tag に結び付く・無い / 読めないは `None`・やり直さない・空の入力は何も呼ばない)。
 
-CI は target ごとに本数を固定で見る (`sql_db` は `19 passed`、`store` は `10 passed`、`split_flow` は `20 passed`、`upload_flow` は `22 passed`、どれも `0 failed; 0 ignored`)。減らすと落ちる。
+CI は target ごとに本数を固定で見る (`sql_db` は `20 passed`、`store` は `10 passed`、`split_flow` は `20 passed`、`upload_flow` は `22 passed`、どれも `0 failed; 0 ignored`)。減らすと落ちる。
 足したら `ci.yml` の数も上げる (テスト 1 本ごとに DB を起動して全 migration を流すので、本数を増やさず 1 本に筋書きを束ねる)。
-`sql_db` が確かめること (19 本)。再計算の対象の運行 (1 本): 月の範囲の境界 (月末の翌日を含む)・運行日と読取日のどちらかが入る行・
+`sql_db` が確かめること (20 本)。再計算の対象の運行 (1 本): 月の範囲の境界 (月末の翌日を含む)・運行日と読取日のどちらかが入る行・
 2 人乗務は乗務員ごとに 1 行 (同じ乗務員CD なら 1 行)・別テナントが出ない・切れた接続。乗務員ごとの再計算の文 (1 本): 乗務員CD (NULL・別テナントの乗務員・居ない id は `None`) /
 乗務員 1 人の運行 (範囲・その乗務員だけ・同じ運行NO は 1 行・並び・列の中身・別テナント) / 切れた接続。履歴の読み取り (1 本): 一覧 2 つが新しい順・同じ時刻は id の降順・51 行入れて 50 件・別テナントの行が出ない・
-NULL の列・pending は `pending_retry` と `failed` だけ / ダウンロード用の行 (在る・無い・別テナントの id・key が NULL) / 切れた接続。取り込みの DB の層と要再計算の印 (9 本):
+NULL の列・pending は `pending_retry` と `failed` だけ / ダウンロード用の行 (在る・無い・別テナントの id・key が NULL) / 切れた接続。取り込みの DB の層と要再計算の印 (10 本):
 
 - 乗務員の解決: `code` の行を使って `driver_cd` を埋める / `driver_cd` の行へ落ちる / 新規 / 別の生存行が同じ driver_cd を持つときは埋めない /
   論理削除済みは対象外 / INSERT が一意の制約に当たったら引き直す
@@ -524,6 +524,8 @@ NULL の列・pending は `pending_retry` と `failed` だけ / ダウンロー�
   変化の無い上げ直しは付けない・`recalc` なら付ける・snapshot の変化で付ける / 乗務員が変われば前の乗務員 × 前の月にも・読取日だけの移動も前の月にも /
   別テナントに付けた印は混ざらない / 一覧の並びと読んだ時刻 (どの行も同じで、印の時刻より後)・DB の時刻 / 時刻の上限より後の印は消さない・
   乗務員の id で指せばその 乗務員 × 月 だけ・乗務員CD で指す形・別テナントから指しても消えない
+- 印の付け直し (1 本): 印を読んだ後に同じ 乗務員 × 月 へ取り込みが印を付け直すと、1 つのまま時刻が読んだ時刻より後になり、
+  読んだ時刻までの消去では残る (付け直した後に読んだ時刻なら消える)
 
 分割の口が使う 3 関数 (7 本):
 

@@ -250,9 +250,17 @@ pub mod sql {
                FROM alc_api.dtako_operations
                WHERE tenant_id = $1 AND unko_no = ANY($2)"#;
 
-    /// 印を付ける (在れば何もしない)。$1 tenant_id / $2 driver_id の配列 (UUID[]) / $3 月初の配列 (DATE[]。$2 と同じ長さ)。
-    pub const INSERT_RECALC_PENDING: &str = r#"INSERT INTO alc_api.dtako_daily_recalc_pending (tenant_id, driver_id, month)
-               SELECT $1, t.driver_id, t.month FROM unnest($2::UUID[], $3::DATE[]) AS t(driver_id, month)
+    /// 付け直す前に、同じ 乗務員 × 月 の印を消す ([`INSERT_RECALC_PENDING`] と同じ transaction で流す。印の時刻を新しくして、
+    /// 印を読んだ後の取り込みの印を再計算の口が消さないように。表は UPDATE しない)。
+    /// $1 tenant_id / $2 driver_id の配列 (UUID[]) / $3 月初の配列 (DATE[]。$2 と同じ長さ)。
+    pub const DELETE_RECALC_PENDING_FOR_MARKS: &str = r#"DELETE FROM alc_api.dtako_daily_recalc_pending
+               WHERE tenant_id = $1
+                 AND (driver_id, month) IN (SELECT t.driver_id, t.month FROM unnest($2::UUID[], $3::DATE[]) AS t(driver_id, month))"#;
+
+    /// 印を付ける (時刻は文を流した時刻 `clock_timestamp()`。transaction の始まりの時刻ではない)。
+    /// $1 tenant_id / $2 driver_id の配列 (UUID[]) / $3 月初の配列 (DATE[]。$2 と同じ長さ)。
+    pub const INSERT_RECALC_PENDING: &str = r#"INSERT INTO alc_api.dtako_daily_recalc_pending (tenant_id, driver_id, month, created_at)
+               SELECT $1, t.driver_id, t.month, clock_timestamp() FROM unnest($2::UUID[], $3::DATE[]) AS t(driver_id, month)
                ON CONFLICT (tenant_id, driver_id, month) DO NOTHING"#;
 
     /// テナントの印の全部と、読んだ時刻 (transaction の開始の時刻)。$1 tenant_id → driver_id, month, created_at, read_at

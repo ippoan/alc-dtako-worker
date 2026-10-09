@@ -1712,6 +1712,60 @@ async fn recalc_pending_marks_follow_the_changes_and_clear_inside_the_tenant() {
     db.shutdown();
 }
 
+/// 再計算の口が印を読んだ後・保存する前に、同じ 乗務員 × 月 へ取り込みが印を付け直すと、印は消してから入れ直されて
+/// 時刻が新しくなる (読んだ時刻より後)。なので、読んだ時刻までの印を消す保存では消えず、計算に入らなかった変化の印が残る。
+/// 付け直した後に読んだ時刻なら消える。
+#[tokio::test(flavor = "multi_thread")]
+async fn recalc_pending_mark_put_again_after_reading_survives_the_clear() {
+    let db = Embedded::start().await;
+    let mut held = db.client(APP_ROLE).await;
+    let c = &mut held.inner;
+    let t = tenant(c, "Dtako Pending Again Tenant").await;
+    let up = pg::create_upload(c, t, "q.zip".into()).await.unwrap();
+    let rows = vec![kudguri("Q-1", 1, "D-ONE", 8, 17)];
+    import(c, t, up, rows.clone(), None, minutes(0)).await;
+    let read = pg::recalc_pending_marks(c, t).await.unwrap();
+    assert_eq!(read.len(), 1);
+    let (read_at, first_created) = (read[0].read_at, read[0].created_at);
+    assert!(first_created <= read_at);
+
+    // 読んだ後に、同じ 乗務員 × 月 へ取り込み (`recalc`) が印を付け直す → 1 つのまま、時刻は読んだ時刻より後
+    import_with(c, t, up, rows, Some(minutes(0)), minutes(0), true).await;
+    let again = pg::recalc_pending_marks(c, t).await.unwrap();
+    assert_eq!(again.len(), 1);
+    assert_eq!(
+        (again[0].driver_id, again[0].month),
+        (read[0].driver_id, read[0].month)
+    );
+    assert!(again[0].created_at > read_at, "{again:?} / {read_at}");
+
+    // 再計算の口と同じ消し方 (最初に読んだ時刻まで) では消えない
+    let clear = |before| pg::PendingClear {
+        month: read[0].month,
+        driver_id: Some(read[0].driver_id),
+        driver_cd: None,
+        before,
+    };
+    let saved =
+        pg::save_daily_hours_in_tx(c, t, HashMap::new(), Arc::new(vec![]), Some(clear(read_at)));
+    saved.await.unwrap();
+    let one = json!([{ "driver": "TEST-DRIVER D-ONE", "month": "2026-03-01" }]);
+    assert_eq!(json!(marks(c, t).await), one);
+    // 付け直した後に読んだ時刻なら消える
+    let saved = pg::save_daily_hours_in_tx(
+        c,
+        t,
+        HashMap::new(),
+        Arc::new(vec![]),
+        Some(clear(again[0].read_at)),
+    );
+    saved.await.unwrap();
+    assert_eq!(marks(c, t).await, Vec::<Value>::new());
+
+    held.close().await;
+    db.shutdown();
+}
+
 // ---- 履歴の読み取り ----
 
 /// 履歴の一覧 2 つ (新しい順・同じ時刻は id の降順・50 件まで・テナントごと・NULL の列) と、ダウンロード用の行。

@@ -489,7 +489,7 @@ async fn upload_imports_operations_daily_hours_and_splits() {
     assert!(text.len() > 300 && text.starts_with(r#"{"upload_id":""#));
 
     // 応答の `Server-Timing` に、段ごとの所要が終えた順に載る (名前と数字だけ。偽の時計は読むたびに 7 進む)
-    let stages = "history;dur=7, put_zip;dur=7, parse;dur=7, prepare;dur=7, old_kudgivt;dur=7, apply;dur=7, split;dur=7";
+    let stages = "history;dur=7, put_zip;dur=7, parse;dur=7, prepare;dur=7, old_kudgivt;dur=7, apply;dur=7, split;dur=7, daily;dur=7";
     let timed = ctx.upload_timing(t, &sample_zip(60)).await;
     assert_eq!(timed, (StatusCode::OK, Some(stages.to_owned())));
     ctx.finish().await;
@@ -594,9 +594,11 @@ async fn previous_kudgivt_is_read_concurrently_and_bound_to_its_operation() {
         upload_zip(&kudguri, &kudgivt)
     };
 
-    // 初回: 既に在る運行が無いので、前回の KUDGIVT は読まない (GET は分割の zip の読み直しの 1 本だけ)
+    // 初回: 既に在る運行が無いので、前回の KUDGIVT は読まない (KUDGIVT の GET は、分割の後の日別の計算し直しの運行ごとの 1 回だけ)
     ctx.upload_ok(t, "first.zip", &zip_of_minutes(100)).await;
-    assert_eq!(ctx.store.max_get_running(), 1);
+    let kudgivt_gets = ctx.store.get_calls_containing("/KUDGIVT.csv");
+    assert_eq!(kudgivt_gets.len(), 8);
+    assert!(kudgivt_gets.iter().all(|(_, n)| *n == 1));
 
     // 同じ zip の上げ直し: 8 運行ぶんを同時に読む (上限まで)。全部読めて値が同じなので、変更記録は付かない
     let body = ctx.upload_ok(t, "same.zip", &zip_of_minutes(100)).await;
@@ -786,6 +788,7 @@ async fn invalid_zip_contents_are_400_and_mark_the_history_failed() {
     // 上限はテストから差し込める: 上限 100 バイトでは、普通の zip も大きすぎる
     let limits = IngestLimits {
         max_uncompressed_bytes: 100,
+        ..IngestLimits::default()
     };
     assert_ne!(limits, IngestLimits::default());
     let small = tenant_router_with(limits)
@@ -981,9 +984,14 @@ async fn split_is_retried_as_a_whole_and_does_not_fail_the_upload() {
     });
     assert_eq!(body, want);
     assert_eq!(ctx.sleeper.slept(), [300, 800, 300, 800]);
+    // 分割が尽きたので、日別の計算し直しはしない (取り込み時の日別が残る。Refs ippoan/alc-dtako-worker#23)
+    let skipped = (
+        LogLevel::Warn,
+        "upload: daily recalc skipped: split failed".to_owned(),
+    );
     assert_eq!(
         ctx.log_lines(),
-        [warn(1), warn(2), warn(1), warn(2), warn(3)]
+        [warn(1), warn(2), warn(1), warn(2), warn(3), skipped]
     );
     assert_eq!(flags(ctx.operations(t).await), [true, true, true, false]);
     assert_eq!(ctx.count(t, "dtako_daily_work_hours").await, 4);
@@ -1085,7 +1093,7 @@ async fn rerun_recovers_a_failed_upload_from_the_stored_zip() {
     assert_eq!(ctx.changes(t).await, Vec::<Value>::new());
     assert_eq!(ctx.history(t).await, [completed]);
     // やり直しの `Server-Timing` は、頭の 2 段が違う (失敗した応答には、終えた段までが載る)
-    let stages = "zip_key;dur=7, get_zip;dur=7, parse;dur=7, prepare;dur=7, old_kudgivt;dur=7, apply;dur=7, split;dur=7";
+    let stages = "zip_key;dur=7, get_zip;dur=7, parse;dur=7, prepare;dur=7, old_kudgivt;dur=7, apply;dur=7, split;dur=7, daily;dur=7";
     let timed = ctx.rerun_timing(t, &upload_id).await;
     assert_eq!(timed, (StatusCode::OK, Some(stages.to_owned())));
     let ctx = ctx.run_as_superuser(REJECT_NEW).await;
@@ -1910,7 +1918,7 @@ fn day_view(row: &Value) -> Value {
 }
 
 /// 乗務員 1 人の再計算は、月の全員の口と同じ運行ごとの分割の出力を読む。乗務員の運行の外にある運行NO の行 (U-6099 の休息) は
-/// 数えないので、取り込み (zip の全行を渡す) とは、その休息の分だけ食い違い、月の全員の再計算とは同じになる。
+/// 数えないので、月の全員の再計算と同じになる (取り込みの後の計算し直しも同じ数え方)。
 /// 計算に残す行 (その乗務員の運行の行) で計算した結果は、その行だけを共有の `compute_daily_hours` に渡した結果と同じ。
 /// ほかの乗務員の日別には触れない。
 #[tokio::test(flavor = "multi_thread")]
@@ -1931,10 +1939,11 @@ async fn recalculate_driver_reads_the_split_outputs_like_the_month_recalculation
     let rest_of = |list: [(&str, i64); 4]| -> Vec<(String, i64)> {
         list.into_iter().map(|(cd, m)| (cd.to_owned(), m)).collect()
     };
-    // 取り込みは zip の全行を渡すので、D-ONE の 03/05 の休息 30 分 (KUDGURI に無い運行NO の行) を数える
+    // 取り込みの後の計算し直し (乗務員の再計算の口と同じ数え方) で、D-ONE の 03/05 の休息 30 分 (KUDGURI に無い運行NO の行) は
+    // 数えない (取り込み時の計算は zip の全行を渡すので数えるが、計算し直しが上書きする。Refs ippoan/alc-dtako-worker#23)
     let uploaded = [
         ("D-ONE", 300),
-        ("D-ONE", 30),
+        ("D-ONE", 0),
         ("D-THREE", 120),
         ("D-TWO", 360),
     ];
@@ -2409,5 +2418,295 @@ async fn recalculation_deletes_stale_days_of_the_months_operations_in_every_entr
     assert_eq!(status, StatusCode::OK);
     assert_eq!(ctx.stale_days(t).await, []);
     assert_eq!(ctx.rows(t, DAYS_QUERY).await, baseline);
+    ctx.finish().await;
+}
+
+// ---- 取り込みの後の日別の計算し直し (Refs ippoan/alc-dtako-worker#23) ----
+
+/// 同じ乗務員 (D-ONE) の 2 運行の KUDGURI。1 本目 (U-7001) の帰着 03/02 21:15 から 7 時間で 2 本目 (U-7002) が 03/03 04:15 に出る
+/// (日跨ぎの 480 分未満) ので、乗務員の月をまとめて計算すると 1 つの勤務日に束ねられる。
+fn bundled_kudguri() -> Vec<String> {
+    vec![
+        kudguri_line("U-7001", 1, "D-ONE", 2, 8, 21),
+        kudguri_line("U-7002", 1, "D-ONE", 3, 4, 12),
+    ]
+}
+
+/// [`bundled_kudguri`] の KUDGIVT (どちらも運転だけ)。
+fn bundled_kudgivt() -> Vec<String> {
+    vec![
+        kudgivt_line("U-7001", 1, "D-ONE", 2, "08:15", "201", 780),
+        kudgivt_line("U-7002", 1, "D-ONE", 3, "04:15", "201", 480),
+    ]
+}
+
+/// [`bundled_kudguri`] の運行を 1 つずつ別の zip にしたもの。
+fn bundled_zips() -> (Vec<u8>, Vec<u8>) {
+    let (kudguri, kudgivt) = (bundled_kudguri(), bundled_kudgivt());
+    let first = upload_zip(&kudguri[..1], &kudgivt[..1]);
+    let second = upload_zip(&kudguri[1..], &kudgivt[1..]);
+    (first, second)
+}
+
+/// `kudguri`・`kudgivt` の行だけを共有の `compute_daily_hours` に渡した日別 ([`day_view`] の形・並び。既定の分類・フェリーなし)。
+fn computed_days(kudguri: &[String], kudgivt: &[String]) -> Vec<Value> {
+    let files = [
+        ("KUDGURI.csv".to_owned(), sjis_csv(KUDGURI_HEADER, kudguri)),
+        ("KUDGIVT.csv".to_owned(), sjis_csv(KUDGIVT_HEADER, kudgivt)),
+    ];
+    let rows = alc_csv_parser::kudguri_rows_in(&files).unwrap().unwrap();
+    let events = alc_csv_parser::kudgivt_rows_in(&files).unwrap().unwrap();
+    let classify = |e: &alc_csv_parser::kudgivt::KudgivtRow| {
+        let class = alc_csv_parser::work_segments::default_classification(&e.event_cd).1;
+        (e.event_cd.clone(), class)
+    };
+    let classifications = events.iter().map(classify).collect();
+    let ferry = std::collections::HashMap::new();
+    let daily =
+        alc_compare::upload_daily::compute_daily_hours(&rows, &events, &classifications, &ferry);
+    let mut views: Vec<Value> = daily
+        .iter()
+        .map(|((cd, date, start), h)| {
+            json!([
+                cd,
+                date.to_string(),
+                start.format("%H:%M:%S").to_string(),
+                h.total_work_minutes,
+                h.saved_total_drive_minutes(),
+                h.rest_event_minutes,
+                h.drive_minutes,
+                h.cargo_minutes,
+                h.unko_nos,
+            ])
+        })
+        .collect();
+    views.sort_by_key(|v| v.to_string());
+    views
+}
+
+impl Ctx {
+    /// 日別の計算し直しの GET の上限を `max_gets` にした口。
+    fn limited_app(&self, tenant_id: Uuid, max_gets: usize) -> Router {
+        let limits = IngestLimits {
+            max_daily_recalc_gets: max_gets,
+            ..IngestLimits::default()
+        };
+        tenant_router_with(limits)
+            .with_state(self.state())
+            .layer(Extension(TenantId(tenant_id)))
+    }
+
+    /// `app` に zip を送り、200 を確かめて本文を返す。
+    async fn upload_via(&self, app: Router, filename: &str, zip: &[u8]) -> String {
+        let body = multipart_body("file", Some(filename), zip);
+        let (status, body) = send(app, &multipart_type(), body).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        body
+    }
+
+    /// 運行ごとの分割の出力 (`{テナント}/unko/`) への GET が呼ばれた回数の合計。
+    fn unko_gets(&self, tenant_id: Uuid) -> u32 {
+        let calls = self
+            .store
+            .get_calls_containing(&format!("{tenant_id}/unko/"));
+        calls.iter().map(|(_, n)| n).sum()
+    }
+
+    /// 日別の計算し直しのログ (計算し直しの Warn と、読めない KUDGIVT の Warn)。
+    fn daily_logs(&self) -> Vec<(LogLevel, String)> {
+        let lines = self.log_lines().into_iter();
+        let daily = |(_, m): &(LogLevel, String)| {
+            m.contains("daily recalc") || m.contains("KUDGIVT unavailable for")
+        };
+        lines.filter(daily).collect()
+    }
+
+    /// 日別を [`day_view`] の形で (乗務員CD・日・開始時刻の順)。
+    async fn day_views(&self, tenant_id: Uuid) -> Vec<Value> {
+        self.rows(tenant_id, DAYS_QUERY)
+            .await
+            .iter()
+            .map(day_view)
+            .collect()
+    }
+}
+
+fn warn(message: &str) -> (LogLevel, String) {
+    (LogLevel::Warn, message.to_owned())
+}
+
+/// 取り込み (アップロード・やり直し) の後、今回の乗務員 × 月を、乗務員の再計算の口と同じ数え方で計算し直す。別々の zip で
+/// 取り込んだ同じ乗務員の 2 運行は、2 本目の取り込み直後に、再計算の口を打った後と同じ日別・セグメントになる。
+/// 陽性対照: 計算し直しを通さない値 (上限 0 で飛ばした取り込み = 2 本目の zip だけで計算した値) とは違う。
+/// やり直しの口も計算し直す。
+#[tokio::test(flavor = "multi_thread")]
+async fn upload_recalculates_the_drivers_month_like_the_driver_recalculation() {
+    let ctx = Ctx::start().await;
+    let t = ctx.tenant("Dtako Daily Recalc Tenant").await;
+    let (first, second) = bundled_zips();
+    ctx.upload_ok(t, "first.zip", &first).await;
+    let gets_before = ctx.unko_gets(t);
+    let (status, body) = ctx.upload(t, "second.zip", &second).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // 2 本目の計算し直しの GET = 乗務員の月の運行 2 つ × (KUDGIVT・KUDGFRY)
+    assert_eq!(ctx.unko_gets(t) - gets_before, 4);
+    let days = ctx.rows(t, DAYS_QUERY).await;
+    let segments = ctx.rows(t, SEGMENTS_QUERY).await;
+    let views = ctx.day_views(t).await;
+    // 03/02 に始まる勤務日に 2 運行が束ねられている
+    assert_eq!(views[0][1], "2026-03-02");
+    assert_eq!(views[0][8], json!(["U-7001", "U-7002"]));
+
+    // 乗務員の再計算の口を打っても、日別もセグメントも変わらない
+    let one = ctx.driver_id(t, "D-ONE").await;
+    let (status, events, _) = recalc_driver(ctx.app(t), 3, &one).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        events.last().unwrap(),
+        &json!({ "event": "done", "total": 2 })
+    );
+    assert_eq!(ctx.rows(t, DAYS_QUERY).await, days);
+    assert_eq!(ctx.rows(t, SEGMENTS_QUERY).await, segments);
+    assert_eq!(ctx.daily_logs(), []);
+
+    // 陽性対照: 計算し直しを飛ばす (上限 0) と、2 本目の日別は 2 本目の zip だけで計算した値のまま。それは束ねた値と違う
+    let raw = ctx.tenant("Dtako Daily Recalc Raw").await;
+    ctx.upload_via(ctx.limited_app(raw, 0), "first.zip", &first)
+        .await;
+    let raw_body = ctx
+        .upload_via(ctx.limited_app(raw, 0), "second.zip", &second)
+        .await;
+    let (kudguri, kudgivt) = (bundled_kudguri(), bundled_kudgivt());
+    let only_first = computed_days(&kudguri[..1], &kudgivt[..1]);
+    let only_second = computed_days(&kudguri[1..], &kudgivt[1..]);
+    let raw_views = ctx.day_views(raw).await;
+    assert_eq!(raw_views, [only_first, only_second.clone()].concat());
+    assert_ne!(raw_views, views);
+    assert!(!views.contains(&only_second[0]));
+    let skipped = warn("upload: daily recalc skipped over the GET limit: 1");
+    assert_eq!(ctx.daily_logs(), [skipped.clone(), skipped]);
+
+    // やり直しの口 (上限は既定) は計算し直す → 束ねた値になる
+    let raw_id = json_of(&raw_body)["upload_id"].as_str().unwrap().to_owned();
+    let (status, again) = ctx.rerun(raw, &raw_id).await;
+    assert_eq!(status, StatusCode::OK, "{again}");
+    assert_eq!(ctx.day_views(raw).await, views);
+    assert_eq!(ctx.rows(raw, SEGMENTS_QUERY).await, segments);
+    assert_eq!(ctx.daily_logs().len(), 2);
+    let needles = ["U-7001", "U-7002", "D-ONE", &one, &raw_id];
+    ctx.assert_no_identifiers(t, &[], &needles);
+    ctx.assert_no_identifiers(raw, &[], &needles);
+    ctx.finish().await;
+}
+
+/// 計算し直しができないとき、取り込みは成功のまま (200・本文の形は同じ) で、日別は取り込み時の値が残る。ログは固定の語と件数だけ。
+/// - 分割が尽きた (PUT が全部失敗): 計算し直さない
+/// - 分割の出力の KUDGIVT を読めない (GET の失敗): その乗務員 × 月を失敗に数える
+/// - 保存が落ちる (検査用の制約): 同じ
+#[tokio::test(flavor = "multi_thread")]
+async fn upload_keeps_the_upload_time_days_when_the_daily_recalc_fails() {
+    let ctx = Ctx::start().await;
+    let (first, second) = bundled_zips();
+    // 取り込み時の値 (計算し直しを飛ばした取り込み)
+    let raw = ctx.tenant("Dtako Daily Keep Raw").await;
+    ctx.upload_via(ctx.limited_app(raw, 0), "first.zip", &first)
+        .await;
+    ctx.upload_via(ctx.limited_app(raw, 0), "second.zip", &second)
+        .await;
+    let raw_days = ctx.rows(raw, DAYS_QUERY).await;
+    let raw_segments = ctx.rows(raw, SEGMENTS_QUERY).await;
+    let skipped = warn("upload: daily recalc skipped over the GET limit: 1");
+    assert_eq!(ctx.daily_logs(), [skipped.clone(), skipped.clone()]);
+
+    // 分割の PUT が全部失敗する (2 エントリ) → 200・split_failed = 2・取り込み時の値のまま
+    let s = ctx.tenant("Dtako Daily Keep Split").await;
+    ctx.upload_ok(s, "first.zip", &first).await;
+    ctx.store.fail_puts_containing(&format!("{s}/unko/"), 100);
+    let (status, split_body) = ctx.upload(s, "second.zip", &second).await;
+    assert_eq!(status, StatusCode::OK, "{split_body}");
+    assert_eq!(json_of(&split_body)["split_failed"], 2);
+    assert_eq!(ctx.rows(s, DAYS_QUERY).await, raw_days);
+    assert_eq!(ctx.rows(s, SEGMENTS_QUERY).await, raw_segments);
+    let split_failed = warn("upload: daily recalc skipped: split failed");
+    let mut want = vec![skipped.clone(), skipped, split_failed];
+    assert_eq!(ctx.daily_logs(), want);
+
+    // 分割の出力を読めない → 200・取り込み時の値のまま・失敗の件数
+    let g = ctx.tenant("Dtako Daily Keep Get").await;
+    ctx.upload_ok(g, "first.zip", &first).await;
+    ctx.store.fail_gets_containing(&format!("{g}/unko/"), 100);
+    let (status, get_body) = ctx.upload(g, "second.zip", &second).await;
+    assert_eq!(status, StatusCode::OK, "{get_body}");
+    assert_eq!(json_of(&get_body)["split_failed"], 0);
+    assert_eq!(ctx.rows(g, DAYS_QUERY).await, raw_days);
+    assert_eq!(ctx.rows(g, SEGMENTS_QUERY).await, raw_segments);
+    want.push(warn("upload: KUDGIVT unavailable for 2 operation(s)"));
+    want.push(warn("upload: daily recalc failed: 1"));
+    assert_eq!(ctx.daily_logs(), want);
+
+    // 保存が落ちる (束ねた日エントリ = 運行NO 2 つ、を入れられない検査用の制約) → 200・取り込み時の値のまま・失敗の件数
+    let ctx = ctx
+        .run_as_superuser(
+            "ALTER TABLE alc_api.dtako_daily_work_hours ADD CONSTRAINT test_reject_bundled \
+             CHECK (cardinality(unko_nos) < 2) NOT VALID",
+        )
+        .await;
+    let d = ctx.tenant("Dtako Daily Keep Db").await;
+    ctx.upload_ok(d, "first.zip", &first).await;
+    let (status, db_body) = ctx.upload(d, "second.zip", &second).await;
+    assert_eq!(status, StatusCode::OK, "{db_body}");
+    assert_eq!(ctx.rows(d, DAYS_QUERY).await, raw_days);
+    assert_eq!(ctx.rows(d, SEGMENTS_QUERY).await, raw_segments);
+    want.push(warn("upload: daily recalc failed: 1"));
+    assert_eq!(ctx.daily_logs(), want);
+    // 本文の形 (8 フィールドとその順) は変わらない
+    let keys: Vec<String> = [&split_body, &get_body, &db_body]
+        .iter()
+        .map(|b| {
+            let v: serde_json::Map<String, Value> = serde_json::from_str(b).unwrap();
+            v.keys().cloned().collect::<Vec<_>>().join(",")
+        })
+        .collect();
+    assert!(split_body.starts_with(r#"{"upload_id":""#));
+    assert_eq!(keys[0], keys[1]);
+    assert_eq!(keys[1], keys[2]);
+    let needles = ["U-7001", "U-7002", "D-ONE"];
+    for tenant_id in [raw, s, g, d] {
+        ctx.assert_no_identifiers(tenant_id, &[], &needles);
+    }
+    ctx.finish().await;
+}
+
+/// 計算し直しの GET が上限を越える乗務員 × 月から先は飛ばす (件数だけ Warn)。上限 2 = 運行 1 つぶん: 3 人のうち 1 人だけ計算し直す。
+#[tokio::test(flavor = "multi_thread")]
+async fn upload_skips_the_daily_recalc_over_the_get_limit() {
+    let ctx = Ctx::start().await;
+    let t = ctx.tenant("Dtako Daily Limit Tenant").await;
+    let zip = upload_zip(
+        &[
+            kudguri_line("U-8001", 1, "D-THREE", 10, 8, 17),
+            kudguri_line("U-9001", 1, "D-FOUR", 11, 8, 17),
+            kudguri_line("U-9002", 1, "D-FIVE", 12, 8, 17),
+        ],
+        &[
+            kudgivt_line("U-8001", 1, "D-THREE", 10, "08:15", "201", 300),
+            kudgivt_line("U-9001", 1, "D-FOUR", 11, "08:15", "201", 300),
+            kudgivt_line("U-9002", 1, "D-FIVE", 12, "08:15", "201", 300),
+        ],
+    );
+    let body = ctx
+        .upload_via(ctx.limited_app(t, 2), "three.zip", &zip)
+        .await;
+    assert_eq!(json_of(&body)["split_failed"], 0);
+    assert_eq!(ctx.unko_gets(t), 2);
+    let skipped = warn("upload: daily recalc skipped over the GET limit: 2");
+    assert_eq!(ctx.daily_logs(), [skipped]);
+    // 既定の上限では 3 人とも計算し直す (運行 3 つ × 2)
+    ctx.upload_ok(t, "three-again.zip", &zip).await;
+    assert_eq!(ctx.unko_gets(t), 2 + 3 * 2 + 3);
+    assert_eq!(ctx.daily_logs().len(), 1);
+    // 成功の本文は運行NO の一覧を返す (アップロードの口の 8 フィールド)。識別子を見るのはログだけ
+    assert_eq!(json_of(&body)["split_unko_nos_total"], 3);
+    ctx.assert_no_identifiers(t, &[], &["U-8001", "U-9001", "D-THREE", "D-FOUR"]);
     ctx.finish().await;
 }

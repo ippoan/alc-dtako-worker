@@ -76,7 +76,7 @@ jobs:
             | grep -Eq '^test result: ok\. 22 passed; 0 failed; 0 ignored'
           # -p を付けないと直下の package (worker) だけが対象になり、報告が空になる
           cargo llvm-cov report --locked -p alc-dtako-upload --text > "$RUNNER_TEMP/alc-dtako-upload-cov.txt"
-          for c in alc-compare:128 alc-csv-parser:67; do
+          for c in alc-compare:133 alc-csv-parser:67; do
             name="${c%%:*}"; count="${c##*:}"
             cargo llvm-cov clean --workspace
             cargo llvm-cov --locked -p "$name" --no-report 2>&1 | tee "$RUNNER_TEMP/$name-test.txt"

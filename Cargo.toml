@@ -24,13 +24,13 @@ members = ["crates/alc-dtako-upload", "crates/alc-compare", "crates/alc-csv-pars
 # alc-csv-parser・alc-compare の正本はこの repo の crates/ (ippoan/rust-alc-api の 79029aa から写した。Refs ippoan/rust-alc-api#736)。
 # path 依存で、書くのはここ 1 か所だけ (出どころを 2 つにしない)。
 [workspace.dependencies]
-alc-core-wasm = { git = "https://github.com/ippoan/alc-worker-kit", rev = "5a3b749e891a68f026b53b4402e8861d3aeb3639" }
+alc-core-wasm = { git = "https://github.com/ippoan/alc-worker-kit", rev = "a256d2a84682d375dc649d3c4e0e2e91d38c17c2" }
 # 分割の純粋な部分 (`split_csv_entry`・`cap_sorted`)。backend と同じ関数を呼ぶ (写さない)。
 # zip の展開 (feature `zip-extract`) は引かない (zip の既定 features が C の依存を連れてきて wasm32 に載らない)
 alc-csv-parser = { path = "crates/alc-csv-parser", default-features = false }
 # 日別の集計の計算 (`upload_daily::compute_daily_hours`)。backend と同じ関数を呼ぶ
 alc-compare = { path = "crates/alc-compare" }
-alc-worker-db = { git = "https://github.com/ippoan/alc-worker-kit", rev = "5a3b749e891a68f026b53b4402e8861d3aeb3639", features = ["chrono"] }
+alc-worker-db = { git = "https://github.com/ippoan/alc-worker-kit", rev = "a256d2a84682d375dc649d3c4e0e2e91d38c17c2", features = ["chrono"] }
 
 # 使わない依存は入れない
 [dependencies]

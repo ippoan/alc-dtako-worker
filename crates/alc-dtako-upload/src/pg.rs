@@ -1751,3 +1751,827 @@ pub async fn unsplit_operations(
     })
     .await
 }
+
+// ---- 画面向けの読み取りと分類の更新 (W5c-1、Refs ippoan/rust-alc-api#680) ----
+// 行の型は応答の JSON の形を兼ねる (欄の名前と並びは rust-alc-api の同名の型と同じ)。
+
+/// 引数の並び (`$n` の型) を書く短い名前。
+type Param<'a> = (&'a (dyn tokio_postgres::types::ToSql + Sync), Type);
+
+/// 運行が在る乗務員 1 人 ([`sql::LIST_DRIVERS`]。rust-alc-api の `Driver`)。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct DriverRow {
+    pub id: Uuid,
+    pub tenant_id: Uuid,
+    pub driver_cd: Option<String>,
+    pub driver_name: String,
+}
+
+impl TxOutput for DriverRow {}
+
+/// 車両 1 台 ([`sql::LIST_VEHICLES`]。rust-alc-api の `DtakoVehicle`)。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct VehicleRow {
+    pub id: Uuid,
+    pub tenant_id: Uuid,
+    pub vehicle_cd: String,
+    pub vehicle_name: String,
+}
+
+impl TxOutput for VehicleRow {}
+
+/// 日別のセグメント 1 件の要約 ([`sql::LIST_WORK_TIMES`]。rust-alc-api の `WorkTimeItem`)。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct WorkTimeRow {
+    pub id: Uuid,
+    pub driver_id: Uuid,
+    pub work_date: NaiveDate,
+    pub unko_no: String,
+    pub segment_index: i32,
+    pub start_at: DateTime<Utc>,
+    pub end_at: DateTime<Utc>,
+    pub work_minutes: i32,
+    pub labor_minutes: i32,
+}
+
+impl TxOutput for WorkTimeRow {}
+
+/// 日別の労働時間 1 行 ([`sql::LIST_DAILY_HOURS`]。rust-alc-api の `DtakoDailyWorkHours`)。
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct DailyHoursRow {
+    pub id: Uuid,
+    pub tenant_id: Uuid,
+    pub driver_id: Uuid,
+    pub work_date: NaiveDate,
+    pub start_time: chrono::NaiveTime,
+    pub total_work_minutes: Option<i32>,
+    pub total_drive_minutes: Option<i32>,
+    pub total_rest_minutes: Option<i32>,
+    pub late_night_minutes: i32,
+    pub drive_minutes: i32,
+    pub cargo_minutes: i32,
+    pub overlap_drive_minutes: i32,
+    pub overlap_cargo_minutes: i32,
+    pub overlap_break_minutes: i32,
+    pub overlap_restraint_minutes: i32,
+    pub ot_late_night_minutes: i32,
+    pub total_distance: Option<f64>,
+    pub operation_count: i32,
+    pub unko_nos: Option<Vec<String>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl TxOutput for DailyHoursRow {}
+
+/// 日別のセグメント 1 行 ([`sql::LIST_DAILY_SEGMENTS`]。rust-alc-api の `DtakoDailyWorkSegment`)。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct DailySegmentRow {
+    pub id: Uuid,
+    pub tenant_id: Uuid,
+    pub driver_id: Uuid,
+    pub work_date: NaiveDate,
+    pub unko_no: String,
+    pub segment_index: i32,
+    pub start_at: DateTime<Utc>,
+    pub end_at: DateTime<Utc>,
+    pub work_minutes: i32,
+    pub labor_minutes: i32,
+    pub late_night_minutes: i32,
+    pub drive_minutes: i32,
+    pub cargo_minutes: i32,
+    pub created_at: DateTime<Utc>,
+}
+
+impl TxOutput for DailySegmentRow {}
+
+/// 運行の一覧の 1 行 ([`sql::LIST_OPERATIONS`]。rust-alc-api の `DtakoOperationListItem`)。
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct OperationListRow {
+    pub id: Uuid,
+    pub unko_no: String,
+    pub crew_role: i32,
+    pub reading_date: NaiveDate,
+    pub operation_date: Option<NaiveDate>,
+    pub driver_name: Option<String>,
+    pub vehicle_name: Option<String>,
+    pub vehicle_cd: Option<String>,
+    pub total_distance: Option<f64>,
+    pub safety_score: Option<f64>,
+    pub economy_score: Option<f64>,
+    pub total_score: Option<f64>,
+    pub has_kudgivt: bool,
+}
+
+impl TxOutput for OperationListRow {}
+
+/// 運行 1 行の全部 ([`sql::SELECT_OPERATIONS_BY_UNKO_NO`]。rust-alc-api の `DtakoOperation`)。
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct OperationRow {
+    pub id: Uuid,
+    pub tenant_id: Uuid,
+    pub unko_no: String,
+    pub crew_role: i32,
+    pub reading_date: NaiveDate,
+    pub operation_date: Option<NaiveDate>,
+    pub office_id: Option<Uuid>,
+    pub vehicle_id: Option<Uuid>,
+    pub driver_id: Option<Uuid>,
+    pub departure_at: Option<DateTime<Utc>>,
+    pub return_at: Option<DateTime<Utc>>,
+    pub garage_out_at: Option<DateTime<Utc>>,
+    pub garage_in_at: Option<DateTime<Utc>>,
+    pub meter_start: Option<f64>,
+    pub meter_end: Option<f64>,
+    pub total_distance: Option<f64>,
+    pub drive_time_general: Option<i32>,
+    pub drive_time_highway: Option<i32>,
+    pub drive_time_bypass: Option<i32>,
+    pub safety_score: Option<f64>,
+    pub economy_score: Option<f64>,
+    pub total_score: Option<f64>,
+    pub raw_data: serde_json::Value,
+    pub r2_key_prefix: Option<String>,
+    pub uploaded_at: DateTime<Utc>,
+    pub has_kudgivt: bool,
+}
+
+impl TxOutput for OperationRow {}
+
+/// 運行の変更記録 1 行 ([`sql::LIST_OPERATION_CHANGES`]。rust-alc-api の `OperationChangeRow`)。
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct OperationChangeRow {
+    pub unko_no: String,
+    pub crew_role: i32,
+    pub recorded_at: DateTime<Utc>,
+    pub reason: String,
+    pub before: Option<serde_json::Value>,
+    pub after: Option<serde_json::Value>,
+}
+
+impl TxOutput for OperationChangeRow {}
+
+/// イベントの分類 1 行 ([`sql::LIST_EVENT_CLASSIFICATIONS`]。rust-alc-api の `DtakoEventClassification`)。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct EventClassificationRow {
+    pub id: Uuid,
+    pub tenant_id: Uuid,
+    pub event_cd: String,
+    pub event_name: String,
+    pub classification: String,
+    pub created_at: DateTime<Utc>,
+}
+
+impl TxOutput for EventClassificationRow {}
+
+/// スクレイプの履歴 1 行 ([`sql::LIST_SCRAPE_HISTORY`]。rust-alc-api の `ScrapeHistoryItem`)。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ScrapeHistoryRow {
+    pub id: Uuid,
+    pub target_date: NaiveDate,
+    pub comp_id: String,
+    pub status: String,
+    pub message: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+impl TxOutput for ScrapeHistoryRow {}
+
+/// 車両の現在地のログ 1 行 (`sql::DTAKOLOGS_*`。rust-alc-api の `DtakologRow`。応答の形は [`crate::screen::DtakologView`])。
+#[derive(Debug, Clone, PartialEq)]
+pub struct DtakologRow {
+    pub gps_direction: f64,
+    pub gps_latitude: f64,
+    pub gps_longitude: f64,
+    pub vehicle_cd: i32,
+    pub vehicle_name: String,
+    pub driver_name: Option<String>,
+    pub address_disp_c: Option<String>,
+    pub data_date_time: String,
+    pub address_disp_p: Option<String>,
+    pub sub_driver_cd: i32,
+    pub all_state: Option<String>,
+    pub recive_type_color_name: Option<String>,
+    pub all_state_ex: Option<String>,
+    pub state2: Option<String>,
+    pub all_state_font_color: Option<String>,
+    pub speed: f32,
+}
+
+impl TxOutput for DtakologRow {}
+
+/// 1 ページぶんの絞り込み (日別・セグメントの一覧の共通)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DayFilter {
+    pub driver_id: Option<Uuid>,
+    pub date_from: Option<NaiveDate>,
+    pub date_to: Option<NaiveDate>,
+    pub limit: i64,
+    pub offset: i64,
+}
+
+/// 運行の一覧の絞り込み。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperationFilter {
+    pub date_from: Option<NaiveDate>,
+    pub date_to: Option<NaiveDate>,
+    pub driver_cd: Option<String>,
+    pub vehicle_cd: Option<String>,
+    pub limit: i64,
+    pub offset: i64,
+}
+
+/// [`sql::LIST_DRIVERS`]。
+pub async fn list_drivers(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+) -> Result<Vec<DriverRow>, tokio_postgres::Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            let rows = tx
+                .query_typed(sql::LIST_DRIVERS, &[(&tenant_id, Type::UUID)])
+                .await?;
+            let row = |r: tokio_postgres::Row| DriverRow {
+                id: r.get(0),
+                tenant_id: r.get(1),
+                driver_cd: r.get(2),
+                driver_name: r.get(3),
+            };
+            Ok(rows.into_iter().map(row).collect())
+        })
+    })
+    .await
+}
+
+/// [`sql::LIST_VEHICLES`]。
+pub async fn list_vehicles(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+) -> Result<Vec<VehicleRow>, tokio_postgres::Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            let rows = tx
+                .query_typed(sql::LIST_VEHICLES, &[(&tenant_id, Type::UUID)])
+                .await?;
+            let row = |r: tokio_postgres::Row| VehicleRow {
+                id: r.get(0),
+                tenant_id: r.get(1),
+                vehicle_cd: r.get(2),
+                vehicle_name: r.get(3),
+            };
+            Ok(rows.into_iter().map(row).collect())
+        })
+    })
+    .await
+}
+
+/// 件数の文 (`$1`〜`$4` = テナント・乗務員・日付の始め・終わり) と、ページの文 (続けて `$5` 件数・`$6` 飛ばす件数) を
+/// 同じ transaction で流す。
+async fn count_and_page<T: TxOutput + Send + 'static>(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+    f: DayFilter,
+    count_sql: &'static str,
+    page_sql: &'static str,
+    row: fn(tokio_postgres::Row) -> T,
+) -> Result<(i64, Vec<T>), tokio_postgres::Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            let params: [Param; 6] = [
+                (&tenant_id, Type::UUID),
+                (&f.driver_id, Type::UUID),
+                (&f.date_from, Type::DATE),
+                (&f.date_to, Type::DATE),
+                (&f.limit, Type::INT8),
+                (&f.offset, Type::INT8),
+            ];
+            let total: i64 = tx.query_typed_one(count_sql, &params[..4]).await?.get(0);
+            let rows = tx.query_typed(page_sql, &params).await?;
+            Ok((total, rows.into_iter().map(row).collect()))
+        })
+    })
+    .await
+}
+
+/// [`sql::COUNT_WORK_TIMES`] と [`sql::LIST_WORK_TIMES`] → (件数, ページ)。
+pub async fn work_times(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+    f: DayFilter,
+) -> Result<(i64, Vec<WorkTimeRow>), tokio_postgres::Error> {
+    let row = |r: tokio_postgres::Row| WorkTimeRow {
+        id: r.get(0),
+        driver_id: r.get(1),
+        work_date: r.get(2),
+        unko_no: r.get(3),
+        segment_index: r.get(4),
+        start_at: r.get(5),
+        end_at: r.get(6),
+        work_minutes: r.get(7),
+        labor_minutes: r.get(8),
+    };
+    count_and_page(
+        pg,
+        tenant_id,
+        f,
+        sql::COUNT_WORK_TIMES,
+        sql::LIST_WORK_TIMES,
+        row,
+    )
+    .await
+}
+
+/// [`sql::COUNT_DAILY_HOURS`] と [`sql::LIST_DAILY_HOURS`] → (件数, ページ)。
+pub async fn daily_hours(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+    f: DayFilter,
+) -> Result<(i64, Vec<DailyHoursRow>), tokio_postgres::Error> {
+    let row = |r: tokio_postgres::Row| DailyHoursRow {
+        id: r.get(0),
+        tenant_id: r.get(1),
+        driver_id: r.get(2),
+        work_date: r.get(3),
+        start_time: r.get(4),
+        total_work_minutes: r.get(5),
+        total_drive_minutes: r.get(6),
+        total_rest_minutes: r.get(7),
+        late_night_minutes: r.get(8),
+        drive_minutes: r.get(9),
+        cargo_minutes: r.get(10),
+        overlap_drive_minutes: r.get(11),
+        overlap_cargo_minutes: r.get(12),
+        overlap_break_minutes: r.get(13),
+        overlap_restraint_minutes: r.get(14),
+        ot_late_night_minutes: r.get(15),
+        total_distance: r.get(16),
+        operation_count: r.get(17),
+        unko_nos: r.get(18),
+        created_at: r.get(19),
+        updated_at: r.get(20),
+    };
+    count_and_page(
+        pg,
+        tenant_id,
+        f,
+        sql::COUNT_DAILY_HOURS,
+        sql::LIST_DAILY_HOURS,
+        row,
+    )
+    .await
+}
+
+/// [`sql::LIST_DAILY_SEGMENTS`]。
+pub async fn daily_segments(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+    driver_id: Uuid,
+    date: NaiveDate,
+) -> Result<Vec<DailySegmentRow>, tokio_postgres::Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            let params: [Param; 3] = [
+                (&tenant_id, Type::UUID),
+                (&driver_id, Type::UUID),
+                (&date, Type::DATE),
+            ];
+            let rows = tx.query_typed(sql::LIST_DAILY_SEGMENTS, &params).await?;
+            let row = |r: tokio_postgres::Row| DailySegmentRow {
+                id: r.get(0),
+                tenant_id: r.get(1),
+                driver_id: r.get(2),
+                work_date: r.get(3),
+                unko_no: r.get(4),
+                segment_index: r.get(5),
+                start_at: r.get(6),
+                end_at: r.get(7),
+                work_minutes: r.get(8),
+                labor_minutes: r.get(9),
+                late_night_minutes: r.get(10),
+                drive_minutes: r.get(11),
+                cargo_minutes: r.get(12),
+                created_at: r.get(13),
+            };
+            Ok(rows.into_iter().map(row).collect())
+        })
+    })
+    .await
+}
+
+/// 読取日 1 日ぶんの運行の件数 ([`sql::CALENDAR_DATES`]。rust-alc-api の `CalendarDateEntry`)。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct CalendarDate {
+    pub date: NaiveDate,
+    pub count: i64,
+}
+
+impl TxOutput for CalendarDate {}
+
+/// [`sql::CALENDAR_DATES`]。
+pub async fn calendar_dates(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+    from: NaiveDate,
+    to: NaiveDate,
+) -> Result<Vec<CalendarDate>, tokio_postgres::Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            let params: [Param; 3] = [
+                (&tenant_id, Type::UUID),
+                (&from, Type::DATE),
+                (&to, Type::DATE),
+            ];
+            let rows = tx.query_typed(sql::CALENDAR_DATES, &params).await?;
+            let row = |r: tokio_postgres::Row| CalendarDate {
+                date: r.get(0),
+                count: r.get(1),
+            };
+            Ok(rows.into_iter().map(row).collect())
+        })
+    })
+    .await
+}
+
+/// [`sql::COUNT_OPERATIONS`] と [`sql::LIST_OPERATIONS`] → (件数, ページ)。
+pub async fn list_operations(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+    f: OperationFilter,
+) -> Result<(i64, Vec<OperationListRow>), tokio_postgres::Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            let params: [Param; 7] = [
+                (&tenant_id, Type::UUID),
+                (&f.date_from, Type::DATE),
+                (&f.date_to, Type::DATE),
+                (&f.driver_cd, Type::TEXT),
+                (&f.vehicle_cd, Type::TEXT),
+                (&f.limit, Type::INT8),
+                (&f.offset, Type::INT8),
+            ];
+            let total: i64 = tx
+                .query_typed_one(sql::COUNT_OPERATIONS, &params[..5])
+                .await?
+                .get(0);
+            let rows = tx.query_typed(sql::LIST_OPERATIONS, &params).await?;
+            let row = |r: tokio_postgres::Row| OperationListRow {
+                id: r.get(0),
+                unko_no: r.get(1),
+                crew_role: r.get(2),
+                reading_date: r.get(3),
+                operation_date: r.get(4),
+                driver_name: r.get(5),
+                vehicle_name: r.get(6),
+                vehicle_cd: r.get(7),
+                total_distance: r.get(8),
+                safety_score: r.get(9),
+                economy_score: r.get(10),
+                total_score: r.get(11),
+                has_kudgivt: r.get(12),
+            };
+            Ok((total, rows.into_iter().map(row).collect()))
+        })
+    })
+    .await
+}
+
+/// [`sql::SELECT_OPERATIONS_BY_UNKO_NO`]。
+pub async fn operations_by_unko_no(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+    unko_no: String,
+) -> Result<Vec<OperationRow>, tokio_postgres::Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            let params: [Param; 2] = [(&tenant_id, Type::UUID), (&unko_no, Type::TEXT)];
+            let rows = tx
+                .query_typed(sql::SELECT_OPERATIONS_BY_UNKO_NO, &params)
+                .await?;
+            let row = |r: tokio_postgres::Row| OperationRow {
+                id: r.get(0),
+                tenant_id: r.get(1),
+                unko_no: r.get(2),
+                crew_role: r.get(3),
+                reading_date: r.get(4),
+                operation_date: r.get(5),
+                office_id: r.get(6),
+                vehicle_id: r.get(7),
+                driver_id: r.get(8),
+                departure_at: r.get(9),
+                return_at: r.get(10),
+                garage_out_at: r.get(11),
+                garage_in_at: r.get(12),
+                meter_start: r.get(13),
+                meter_end: r.get(14),
+                total_distance: r.get(15),
+                drive_time_general: r.get(16),
+                drive_time_highway: r.get(17),
+                drive_time_bypass: r.get(18),
+                safety_score: r.get(19),
+                economy_score: r.get(20),
+                total_score: r.get(21),
+                raw_data: r.get(22),
+                r2_key_prefix: r.get(23),
+                uploaded_at: r.get(24),
+                has_kudgivt: r.get(25),
+            };
+            Ok(rows.into_iter().map(row).collect())
+        })
+    })
+    .await
+}
+
+/// 運行NO の行を全 crew_role まとめて消し、消す前の行を crew_role ごとに変更記録 (`manual_delete`) に残す
+/// (1 つの transaction。rust-alc-api の `delete_by_unko_no` と同じ)。返すのは消した行の数。
+pub async fn delete_operations(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+    unko_no: String,
+) -> Result<u64, tokio_postgres::Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            let all_roles: Option<i32> = None;
+            let snapshot: [Param; 3] = [
+                (&tenant_id, Type::UUID),
+                (&unko_no, Type::TEXT),
+                (&all_roles, Type::INT4),
+            ];
+            let before = tx
+                .query_typed(sql::SELECT_OPERATION_SNAPSHOT, &snapshot)
+                .await?;
+            let key: [Param; 2] = [(&tenant_id, Type::UUID), (&unko_no, Type::TEXT)];
+            let deleted = tx
+                .execute_typed(sql::DELETE_OPERATIONS_BY_UNKO_NO, &key)
+                .await?;
+            for r in before {
+                let crew_role: i32 = r.get(0);
+                let before: serde_json::Value = r.get(1);
+                let driver_cd = record_driver_cd(Some(&before), None);
+                let upload_id: Option<Uuid> = None;
+                let after: Option<serde_json::Value> = None;
+                let params: [Param; 8] = [
+                    (&tenant_id, Type::UUID),
+                    (&unko_no, Type::TEXT),
+                    (&crew_role, Type::INT4),
+                    (&driver_cd, Type::TEXT),
+                    (&upload_id, Type::UUID),
+                    (&"manual_delete", Type::TEXT),
+                    (&before, Type::JSONB),
+                    (&after, Type::JSONB),
+                ];
+                tx.execute_typed(sql::INSERT_OPERATION_CHANGE, &params)
+                    .await?;
+            }
+            Ok(deleted)
+        })
+    })
+    .await
+}
+
+/// [`sql::LIST_OPERATION_CHANGES`] と [`sql::SELECT_OPERATION_CHANGES_SINCE`] → (記録, 記録を始めた時点)。
+pub async fn operation_changes(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+    driver_cd: String,
+) -> Result<(Vec<OperationChangeRow>, Option<DateTime<Utc>>), tokio_postgres::Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            let params: [Param; 2] = [(&tenant_id, Type::UUID), (&driver_cd, Type::TEXT)];
+            let rows = tx.query_typed(sql::LIST_OPERATION_CHANGES, &params).await?;
+            let since: Option<DateTime<Utc>> = tx
+                .query_typed_one(sql::SELECT_OPERATION_CHANGES_SINCE, &params[..1])
+                .await?
+                .get(0);
+            let row = |r: tokio_postgres::Row| OperationChangeRow {
+                unko_no: r.get(0),
+                crew_role: r.get(1),
+                recorded_at: r.get(2),
+                reason: r.get(3),
+                before: r.get(4),
+                after: r.get(5),
+            };
+            Ok((rows.into_iter().map(row).collect(), since))
+        })
+    })
+    .await
+}
+
+/// [`sql::SELECT_R2_KEY_PREFIX`]。行が無い・NULL は、どちらも `Ok(None)`。
+pub async fn r2_key_prefix(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+    unko_no: String,
+) -> Result<Option<String>, tokio_postgres::Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            let params: [Param; 2] = [(&tenant_id, Type::UUID), (&unko_no, Type::TEXT)];
+            let row = tx
+                .query_typed_opt(sql::SELECT_R2_KEY_PREFIX, &params)
+                .await?;
+            Ok(row.and_then(|r| r.get(0)))
+        })
+    })
+    .await
+}
+
+fn event_classification(r: tokio_postgres::Row) -> EventClassificationRow {
+    EventClassificationRow {
+        id: r.get(0),
+        tenant_id: r.get(1),
+        event_cd: r.get(2),
+        event_name: r.get(3),
+        classification: r.get(4),
+        created_at: r.get(5),
+    }
+}
+
+/// [`sql::LIST_EVENT_CLASSIFICATIONS`]。
+pub async fn list_event_classifications(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+) -> Result<Vec<EventClassificationRow>, tokio_postgres::Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            let rows = tx
+                .query_typed(sql::LIST_EVENT_CLASSIFICATIONS, &[(&tenant_id, Type::UUID)])
+                .await?;
+            Ok(rows.into_iter().map(event_classification).collect())
+        })
+    })
+    .await
+}
+
+/// [`sql::UPDATE_EVENT_CLASSIFICATION`]。無ければ `Ok(None)`。
+pub async fn update_event_classification(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+    id: Uuid,
+    classification: String,
+) -> Result<Option<EventClassificationRow>, tokio_postgres::Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            let params: [Param; 3] = [
+                (&tenant_id, Type::UUID),
+                (&id, Type::UUID),
+                (&classification, Type::TEXT),
+            ];
+            let row = tx
+                .query_typed_opt(sql::UPDATE_EVENT_CLASSIFICATION, &params)
+                .await?;
+            Ok(row.map(event_classification))
+        })
+    })
+    .await
+}
+
+/// [`sql::INSERT_SCRAPE_HISTORY`]。
+pub async fn insert_scrape_history(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+    target_date: NaiveDate,
+    comp_id: String,
+    status: String,
+    message: Option<String>,
+) -> Result<(), tokio_postgres::Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            let params: [Param; 5] = [
+                (&tenant_id, Type::UUID),
+                (&target_date, Type::DATE),
+                (&comp_id, Type::TEXT),
+                (&status, Type::TEXT),
+                (&message, Type::TEXT),
+            ];
+            tx.execute_typed(sql::INSERT_SCRAPE_HISTORY, &params)
+                .await?;
+            Ok(())
+        })
+    })
+    .await
+}
+
+/// [`sql::LIST_SCRAPE_HISTORY`]。
+pub async fn list_scrape_history(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<ScrapeHistoryRow>, tokio_postgres::Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            let params: [Param; 3] = [
+                (&tenant_id, Type::UUID),
+                (&limit, Type::INT8),
+                (&offset, Type::INT8),
+            ];
+            let rows = tx.query_typed(sql::LIST_SCRAPE_HISTORY, &params).await?;
+            let row = |r: tokio_postgres::Row| ScrapeHistoryRow {
+                id: r.get(0),
+                target_date: r.get(1),
+                comp_id: r.get(2),
+                status: r.get(3),
+                message: r.get(4),
+                created_at: r.get(5),
+            };
+            Ok(rows.into_iter().map(row).collect())
+        })
+    })
+    .await
+}
+
+fn dtakolog(r: tokio_postgres::Row) -> DtakologRow {
+    DtakologRow {
+        gps_direction: r.get(0),
+        gps_latitude: r.get(1),
+        gps_longitude: r.get(2),
+        vehicle_cd: r.get(3),
+        vehicle_name: r.get(4),
+        driver_name: r.get(5),
+        address_disp_c: r.get(6),
+        data_date_time: r.get(7),
+        address_disp_p: r.get(8),
+        sub_driver_cd: r.get(9),
+        all_state: r.get(10),
+        recive_type_color_name: r.get(11),
+        all_state_ex: r.get(12),
+        state2: r.get(13),
+        all_state_font_color: r.get(14),
+        speed: r.get(15),
+    }
+}
+
+/// 車両の現在地のログの引き方 (`/dtako-logs/*` の 4 つ)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DtakologQuery {
+    /// 車両ごとの最新 ([`sql::DTAKOLOGS_CURRENT`])
+    Current,
+    /// 車両ごとの最新を絞る ([`sql::DTAKOLOGS_CURRENT_SELECT`]。車両CD の配列は `None` なら絞らない)
+    CurrentSelect {
+        address_disp_p: Option<String>,
+        branch_cd: Option<i32>,
+        vehicle_cds: Option<Vec<i32>>,
+    },
+    /// ある日時 ([`sql::DTAKOLOGS_AT`])
+    At {
+        date_time: String,
+        vehicle_cd: Option<i32>,
+    },
+    /// 日時の範囲 ([`sql::DTAKOLOGS_RANGE`])
+    Range {
+        start: String,
+        end: String,
+        vehicle_cd: Option<i32>,
+    },
+}
+
+/// [`DtakologQuery`] の文を流す。
+pub async fn dtakologs(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+    q: DtakologQuery,
+) -> Result<Vec<DtakologRow>, tokio_postgres::Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            let t: Param = (&tenant_id, Type::UUID);
+            let rows = match &q {
+                DtakologQuery::Current => tx.query_typed(sql::DTAKOLOGS_CURRENT, &[t]).await?,
+                DtakologQuery::CurrentSelect {
+                    address_disp_p,
+                    branch_cd,
+                    vehicle_cds,
+                } => {
+                    let params: [Param; 4] = [
+                        t,
+                        (address_disp_p, Type::TEXT),
+                        (branch_cd, Type::INT4),
+                        (vehicle_cds, Type::INT4_ARRAY),
+                    ];
+                    tx.query_typed(sql::DTAKOLOGS_CURRENT_SELECT, &params)
+                        .await?
+                }
+                DtakologQuery::At {
+                    date_time,
+                    vehicle_cd,
+                } => {
+                    let params: [Param; 3] = [t, (date_time, Type::TEXT), (vehicle_cd, Type::INT4)];
+                    tx.query_typed(sql::DTAKOLOGS_AT, &params).await?
+                }
+                DtakologQuery::Range {
+                    start,
+                    end,
+                    vehicle_cd,
+                } => {
+                    let params: [Param; 4] = [
+                        t,
+                        (start, Type::TEXT),
+                        (end, Type::TEXT),
+                        (vehicle_cd, Type::INT4),
+                    ];
+                    tx.query_typed(sql::DTAKOLOGS_RANGE, &params).await?
+                }
+            };
+            Ok(rows.into_iter().map(dtakolog).collect())
+        })
+    })
+    .await
+}

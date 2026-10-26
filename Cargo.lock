@@ -83,6 +83,7 @@ dependencies = [
  "axum",
  "chrono",
  "encoding_rs",
+ "flate2",
  "futures-util",
  "pglite-oxide",
  "serde",

@@ -20,6 +20,9 @@
 //! - `POST /dvr/notifications` (JSON `{items}`) → DVR の動画通知を起票し、実体を取りに行くべき行を返す ([`crate::dvr`])
 //! - `POST /dvr/files/{id}` (生のバイト列) → `.vdf` を保存先に置き、行を `stored` にする
 //!   (この 3 つは機械の取り込み。失敗の応答は rust-alc-api と同じく status だけで本文は空)
+//! - 画面向けの読み取りと分類の更新 (`/drivers`・`/vehicles`・`/work-times`・`/daily-hours/*`・`/operations/*`・
+//!   `/internal/operations`・`/dtako/operation-changes`・`/event-classifications/*`・`/scraper/history`・`/dtako-logs/*` の読み取り) は
+//!   [`crate::screen`] (W5c-1)
 //!
 //! 認可は `TenantId` の Extension だけを見る (直下の worker が `alc_core_wasm::require_tenant_header` の layer で入れる。
 //! 役割は auth-worker の許可表が決める)。DB は、テナントを設定した接続で、テナントでも絞って引く。
@@ -128,6 +131,7 @@ pub fn tenant_router_with(limits: IngestLimits) -> Router<DtakoState> {
         .route("/dvr/files/{id}", post(dvr_file))
         .route("/dtako/events", get(dtako_events))
         .route("/dtako/events/etags", get(dtako_events_etags))
+        .merge(crate::screen::router())
 }
 
 type ApiError = (StatusCode, Json<Value>);

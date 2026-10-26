@@ -37,6 +37,8 @@ use tokio_postgres::error::SqlState;
 use tokio_postgres::types::Type;
 use uuid::Uuid;
 
+use crate::dvr::{DvrIngestResponse, DvrNotificationCreate, DvrPendingItem, MAX_FILE_ATTEMPTS};
+use crate::logs::{DtakologInput, CHUNK_SIZE, DEFAULT_DATA_DATE_TIME};
 use crate::repo::sql;
 
 /// [`sql::SELECT_UPLOAD_ZIP_KEY`]。行が無い・`r2_zip_key` が NULL は、どちらも `Ok(None)`。
@@ -1148,4 +1150,425 @@ pub async fn apply_upload(
     })
     .await
     .map_err(ApplyUploadError::Db)
+}
+
+// ---- 機械の取り込み (W5a、Refs ippoan/rust-alc-api#680) ----
+
+/// [`sql::UPSERT_DTAKOLOGS`] を [`CHUNK_SIZE`] 行ずつ流す (全部を 1 つの transaction で)。返すのは upsert で触れた行数の合計。
+/// `records` が空なら transaction を開かずに 0 を返す。配列の並びは文の `$2..$57` と同じ (生成した列の対応を変えない)。
+pub async fn dtakologs_bulk_upsert(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+    records: Vec<DtakologInput>,
+) -> Result<u64, tokio_postgres::Error> {
+    if records.is_empty() {
+        return Ok(0);
+    }
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            let mut total = 0;
+            for chunk in records.chunks(CHUNK_SIZE) {
+                total += upsert_dtakologs_chunk(tx, tenant_id, chunk).await?;
+            }
+            Ok(total)
+        })
+    })
+    .await
+}
+
+async fn upsert_dtakologs_chunk(
+    tx: &TenantTx<'_>,
+    tenant_id: Uuid,
+    chunk: &[DtakologInput],
+) -> Result<u64, tokio_postgres::Error> {
+    let c2 = chunk
+        .iter()
+        .map(|r| {
+            r.data_date_time
+                .clone()
+                .unwrap_or_else(|| DEFAULT_DATA_DATE_TIME.to_owned())
+        })
+        .collect::<Vec<String>>();
+    let c3 = chunk.iter().map(|r| r.vehicle_cd).collect::<Vec<i32>>();
+    let c4 = chunk
+        .iter()
+        .map(|r| r.r#type.clone())
+        .collect::<Vec<String>>();
+    let c5 = chunk
+        .iter()
+        .map(|r| r.all_state_font_color_index)
+        .collect::<Vec<i32>>();
+    let c6 = chunk
+        .iter()
+        .map(|r| r.all_state_ryout_color.clone())
+        .collect::<Vec<String>>();
+    let c7 = chunk.iter().map(|r| r.branch_cd).collect::<Vec<i32>>();
+    let c8 = chunk
+        .iter()
+        .map(|r| r.branch_name.clone())
+        .collect::<Vec<String>>();
+    let c9 = chunk
+        .iter()
+        .map(|r| r.current_work_cd)
+        .collect::<Vec<i32>>();
+    let c10 = chunk
+        .iter()
+        .map(|r| r.data_filter_type)
+        .collect::<Vec<i32>>();
+    let c11 = chunk.iter().map(|r| r.disp_flag).collect::<Vec<i32>>();
+    let c12 = chunk.iter().map(|r| r.driver_cd).collect::<Vec<i32>>();
+    let c13 = chunk.iter().map(|r| r.gps_direction).collect::<Vec<f64>>();
+    let c14 = chunk.iter().map(|r| r.gps_enable).collect::<Vec<i32>>();
+    let c15 = chunk.iter().map(|r| r.gps_latitude).collect::<Vec<f64>>();
+    let c16 = chunk.iter().map(|r| r.gps_longitude).collect::<Vec<f64>>();
+    let c17 = chunk
+        .iter()
+        .map(|r| r.gps_satellite_num)
+        .collect::<Vec<i32>>();
+    let c18 = chunk
+        .iter()
+        .map(|r| r.operation_state)
+        .collect::<Vec<i32>>();
+    let c19 = chunk
+        .iter()
+        .map(|r| r.recive_event_type)
+        .collect::<Vec<i32>>();
+    let c20 = chunk
+        .iter()
+        .map(|r| r.recive_packet_type)
+        .collect::<Vec<i32>>();
+    let c21 = chunk.iter().map(|r| r.recive_work_cd).collect::<Vec<i32>>();
+    let c22 = chunk.iter().map(|r| r.revo).collect::<Vec<i32>>();
+    let c23 = chunk
+        .iter()
+        .map(|r| r.setting_temp.clone())
+        .collect::<Vec<String>>();
+    let c24 = chunk
+        .iter()
+        .map(|r| r.setting_temp1.clone())
+        .collect::<Vec<String>>();
+    let c25 = chunk
+        .iter()
+        .map(|r| r.setting_temp3.clone())
+        .collect::<Vec<String>>();
+    let c26 = chunk
+        .iter()
+        .map(|r| r.setting_temp4.clone())
+        .collect::<Vec<String>>();
+    let c27 = chunk.iter().map(|r| r.speed).collect::<Vec<f32>>();
+    let c28 = chunk.iter().map(|r| r.sub_driver_cd).collect::<Vec<i32>>();
+    let c29 = chunk.iter().map(|r| r.temp_state).collect::<Vec<i32>>();
+    let c30 = chunk
+        .iter()
+        .map(|r| r.vehicle_name.clone())
+        .collect::<Vec<String>>();
+    let c31 = chunk
+        .iter()
+        .map(|r| r.address_disp_c.clone())
+        .collect::<Vec<Option<String>>>();
+    let c32 = chunk
+        .iter()
+        .map(|r| r.address_disp_p.clone())
+        .collect::<Vec<Option<String>>>();
+    let c33 = chunk
+        .iter()
+        .map(|r| r.all_state.clone())
+        .collect::<Vec<Option<String>>>();
+    let c34 = chunk
+        .iter()
+        .map(|r| r.all_state_ex.clone())
+        .collect::<Vec<Option<String>>>();
+    let c35 = chunk
+        .iter()
+        .map(|r| r.all_state_font_color.clone())
+        .collect::<Vec<Option<String>>>();
+    let c36 = chunk
+        .iter()
+        .map(|r| r.comu_date_time.clone())
+        .collect::<Vec<Option<String>>>();
+    let c37 = chunk
+        .iter()
+        .map(|r| r.current_work_name.clone())
+        .collect::<Vec<Option<String>>>();
+    let c38 = chunk
+        .iter()
+        .map(|r| r.driver_name.clone())
+        .collect::<Vec<Option<String>>>();
+    let c39 = chunk
+        .iter()
+        .map(|r| r.event_val.clone())
+        .collect::<Vec<Option<String>>>();
+    let c40 = chunk
+        .iter()
+        .map(|r| r.gps_lati_and_long.clone())
+        .collect::<Vec<Option<String>>>();
+    let c41 = chunk
+        .iter()
+        .map(|r| r.odometer.clone())
+        .collect::<Vec<Option<String>>>();
+    let c42 = chunk
+        .iter()
+        .map(|r| r.recive_type_color_name.clone())
+        .collect::<Vec<Option<String>>>();
+    let c43 = chunk
+        .iter()
+        .map(|r| r.recive_type_name.clone())
+        .collect::<Vec<Option<String>>>();
+    let c44 = chunk
+        .iter()
+        .map(|r| r.start_work_date_time.clone())
+        .collect::<Vec<Option<String>>>();
+    let c45 = chunk
+        .iter()
+        .map(|r| r.state.clone())
+        .collect::<Vec<Option<String>>>();
+    let c46 = chunk
+        .iter()
+        .map(|r| r.state1.clone())
+        .collect::<Vec<Option<String>>>();
+    let c47 = chunk
+        .iter()
+        .map(|r| r.state2.clone())
+        .collect::<Vec<Option<String>>>();
+    let c48 = chunk
+        .iter()
+        .map(|r| r.state3.clone())
+        .collect::<Vec<Option<String>>>();
+    let c49 = chunk
+        .iter()
+        .map(|r| r.state_flag.clone())
+        .collect::<Vec<Option<String>>>();
+    let c50 = chunk
+        .iter()
+        .map(|r| r.temp1.clone())
+        .collect::<Vec<Option<String>>>();
+    let c51 = chunk
+        .iter()
+        .map(|r| r.temp2.clone())
+        .collect::<Vec<Option<String>>>();
+    let c52 = chunk
+        .iter()
+        .map(|r| r.temp3.clone())
+        .collect::<Vec<Option<String>>>();
+    let c53 = chunk
+        .iter()
+        .map(|r| r.temp4.clone())
+        .collect::<Vec<Option<String>>>();
+    let c54 = chunk
+        .iter()
+        .map(|r| r.vehicle_icon_color.clone())
+        .collect::<Vec<Option<String>>>();
+    let c55 = chunk
+        .iter()
+        .map(|r| r.vehicle_icon_label_for_datetime.clone())
+        .collect::<Vec<Option<String>>>();
+    let c56 = chunk
+        .iter()
+        .map(|r| r.vehicle_icon_label_for_driver.clone())
+        .collect::<Vec<Option<String>>>();
+    let c57 = chunk
+        .iter()
+        .map(|r| r.vehicle_icon_label_for_vehicle.clone())
+        .collect::<Vec<Option<String>>>();
+    let params: [(&(dyn tokio_postgres::types::ToSql + Sync), Type); 57] = [
+        (&tenant_id, Type::UUID),
+        (&c2, Type::TEXT_ARRAY),
+        (&c3, Type::INT4_ARRAY),
+        (&c4, Type::TEXT_ARRAY),
+        (&c5, Type::INT4_ARRAY),
+        (&c6, Type::TEXT_ARRAY),
+        (&c7, Type::INT4_ARRAY),
+        (&c8, Type::TEXT_ARRAY),
+        (&c9, Type::INT4_ARRAY),
+        (&c10, Type::INT4_ARRAY),
+        (&c11, Type::INT4_ARRAY),
+        (&c12, Type::INT4_ARRAY),
+        (&c13, Type::FLOAT8_ARRAY),
+        (&c14, Type::INT4_ARRAY),
+        (&c15, Type::FLOAT8_ARRAY),
+        (&c16, Type::FLOAT8_ARRAY),
+        (&c17, Type::INT4_ARRAY),
+        (&c18, Type::INT4_ARRAY),
+        (&c19, Type::INT4_ARRAY),
+        (&c20, Type::INT4_ARRAY),
+        (&c21, Type::INT4_ARRAY),
+        (&c22, Type::INT4_ARRAY),
+        (&c23, Type::TEXT_ARRAY),
+        (&c24, Type::TEXT_ARRAY),
+        (&c25, Type::TEXT_ARRAY),
+        (&c26, Type::TEXT_ARRAY),
+        (&c27, Type::FLOAT4_ARRAY),
+        (&c28, Type::INT4_ARRAY),
+        (&c29, Type::INT4_ARRAY),
+        (&c30, Type::TEXT_ARRAY),
+        (&c31, Type::TEXT_ARRAY),
+        (&c32, Type::TEXT_ARRAY),
+        (&c33, Type::TEXT_ARRAY),
+        (&c34, Type::TEXT_ARRAY),
+        (&c35, Type::TEXT_ARRAY),
+        (&c36, Type::TEXT_ARRAY),
+        (&c37, Type::TEXT_ARRAY),
+        (&c38, Type::TEXT_ARRAY),
+        (&c39, Type::TEXT_ARRAY),
+        (&c40, Type::TEXT_ARRAY),
+        (&c41, Type::TEXT_ARRAY),
+        (&c42, Type::TEXT_ARRAY),
+        (&c43, Type::TEXT_ARRAY),
+        (&c44, Type::TEXT_ARRAY),
+        (&c45, Type::TEXT_ARRAY),
+        (&c46, Type::TEXT_ARRAY),
+        (&c47, Type::TEXT_ARRAY),
+        (&c48, Type::TEXT_ARRAY),
+        (&c49, Type::TEXT_ARRAY),
+        (&c50, Type::TEXT_ARRAY),
+        (&c51, Type::TEXT_ARRAY),
+        (&c52, Type::TEXT_ARRAY),
+        (&c53, Type::TEXT_ARRAY),
+        (&c54, Type::TEXT_ARRAY),
+        (&c55, Type::TEXT_ARRAY),
+        (&c56, Type::TEXT_ARRAY),
+        (&c57, Type::TEXT_ARRAY),
+    ];
+    tx.execute_typed(sql::UPSERT_DTAKOLOGS, &params).await
+}
+
+/// [`sql::INSERT_DVR_NOTIFICATION`] と [`sql::SELECT_DVR_RETRY`] を 1 件ずつ流す (全部を 1 つの transaction で)。
+/// 作った行は `inserted` と `pending` に、既に在った行は `skipped` に数え、まだ取りに行くべき既存行だけ `pending` に再掲する。
+/// 入力の検査は呼び手 ([`crate::dvr::validate`]) が済ませておく。
+pub async fn dvr_ingest(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+    items: Vec<DvrNotificationCreate>,
+) -> Result<DvrIngestResponse, tokio_postgres::Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            let mut out = DvrIngestResponse {
+                inserted: 0,
+                skipped: 0,
+                pending: Vec::new(),
+            };
+            for item in items {
+                let params: [(&(dyn tokio_postgres::types::ToSql + Sync), Type); 9] = [
+                    (&tenant_id, Type::UUID),
+                    (&item.serial_no, Type::TEXT),
+                    (&item.file_name, Type::TEXT),
+                    (&item.vehicle_cd, Type::TEXT),
+                    (&item.vehicle_name, Type::TEXT),
+                    (&item.driver_name, Type::TEXT),
+                    (&item.event_type, Type::TEXT),
+                    (&item.dvr_datetime, Type::TIMESTAMPTZ),
+                    (&item.source_url, Type::TEXT),
+                ];
+                let created = tx
+                    .query_typed_opt(sql::INSERT_DVR_NOTIFICATION, &params)
+                    .await?;
+                let id = match created {
+                    Some(row) => {
+                        out.inserted += 1;
+                        Some(row.get(0))
+                    }
+                    None => {
+                        out.skipped += 1;
+                        let params: [(&(dyn tokio_postgres::types::ToSql + Sync), Type); 4] = [
+                            (&tenant_id, Type::UUID),
+                            (&item.serial_no, Type::TEXT),
+                            (&item.file_name, Type::TEXT),
+                            (&MAX_FILE_ATTEMPTS, Type::INT4),
+                        ];
+                        let retry = tx.query_typed_opt(sql::SELECT_DVR_RETRY, &params).await?;
+                        retry.map(|r| r.get(0))
+                    }
+                };
+                if let Some(id) = id {
+                    out.pending.push(DvrPendingItem {
+                        id,
+                        serial_no: item.serial_no,
+                        file_name: item.file_name,
+                    });
+                }
+            }
+            Ok(out)
+        })
+    })
+    .await
+}
+
+impl TxOutput for DvrIngestResponse {}
+
+/// [`sql::SELECT_DVR_FILE`] → `(serial_no, file_name)`。行が無い・別テナントの行なら `None`。
+pub async fn dvr_file(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+    id: Uuid,
+) -> Result<Option<(String, String)>, tokio_postgres::Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            let row = tx
+                .query_typed_opt(
+                    sql::SELECT_DVR_FILE,
+                    &[(&id, Type::UUID), (&tenant_id, Type::UUID)],
+                )
+                .await?;
+            Ok(row.map(|r| (r.get(0), r.get(1))))
+        })
+    })
+    .await
+}
+
+/// 実体の取得の失敗を残す ([`sql::RECORD_DVR_FAILURE`]、`file_status` を渡せば [`sql::RECORD_DVR_FAILURE_WITH_STATUS`])。
+/// `message` は呼び手が渡す固定の語 (生のエラー文を入れない)。返すのは更新した行数。
+pub async fn dvr_record_failure(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+    id: Uuid,
+    file_status: Option<String>,
+    message: String,
+) -> Result<u64, tokio_postgres::Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            match file_status {
+                Some(status) => {
+                    let params: [(&(dyn tokio_postgres::types::ToSql + Sync), Type); 4] = [
+                        (&id, Type::UUID),
+                        (&tenant_id, Type::UUID),
+                        (&message, Type::TEXT),
+                        (&status, Type::TEXT),
+                    ];
+                    tx.execute_typed(sql::RECORD_DVR_FAILURE_WITH_STATUS, &params)
+                        .await
+                }
+                None => {
+                    let params: [(&(dyn tokio_postgres::types::ToSql + Sync), Type); 3] = [
+                        (&id, Type::UUID),
+                        (&tenant_id, Type::UUID),
+                        (&message, Type::TEXT),
+                    ];
+                    tx.execute_typed(sql::RECORD_DVR_FAILURE, &params).await
+                }
+            }
+        })
+    })
+    .await
+}
+
+/// [`sql::MARK_DVR_STORED`]。返すのは更新した行数。
+pub async fn dvr_mark_stored(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+    id: Uuid,
+    r2_key: String,
+    size: i64,
+) -> Result<u64, tokio_postgres::Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            let params: [(&(dyn tokio_postgres::types::ToSql + Sync), Type); 4] = [
+                (&id, Type::UUID),
+                (&tenant_id, Type::UUID),
+                (&r2_key, Type::TEXT),
+                (&size, Type::INT8),
+            ];
+            tx.execute_typed(sql::MARK_DVR_STORED, &params).await
+        })
+    })
+    .await
 }

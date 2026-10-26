@@ -23,7 +23,7 @@ use uuid::Uuid;
 /// 表の所有者でない・NOBYPASSRLS のロール (`local_app_grants.sql` が権限を付ける)。
 pub const APP_ROLE: &str = "alc_api_app";
 /// この crate が読み書きする表 (全部 RLS が効く前提。所有者でないこと・テナントなしで読めないことを検査する)。
-pub const TABLES: [&str; 10] = [
+pub const TABLES: [&str; 12] = [
     "dtako_upload_history",
     "dtako_operations",
     "dtako_offices",
@@ -34,6 +34,9 @@ pub const TABLES: [&str; 10] = [
     "dtako_daily_work_segments",
     "dtako_daily_recalc_pending",
     "employees",
+    // 機械の取り込み (W5a)
+    "dtakologs",
+    "dvr_notifications",
 ];
 const SUPERUSER: &str = "postgres";
 const SOCKET_FILE: &str = ".s.PGSQL.5432";

@@ -14,6 +14,11 @@
 //! - `POST /split-csv-all` → 未分割の運行が在るテナントの、分割の元にできるアップロードを新しい順に
 //!   最大 [`SPLIT_CSV_ALL_LIMIT`] 件、1 件ずつ分割し直す。応答は `text/event-stream` (1 件ごとに `progress`、終わりに `done`)
 //!
+//! - `POST /dtako-logs/bulk` (JSON の配列) → 車両の現在地のログを一括 upsert する ([`crate::logs`]。応答は rust-alc-api と同じ形)
+//! - `POST /dvr/notifications` (JSON `{items}`) → DVR の動画通知を起票し、実体を取りに行くべき行を返す ([`crate::dvr`])
+//! - `POST /dvr/files/{id}` (生のバイト列) → `.vdf` を保存先に置き、行を `stored` にする
+//!   (この 3 つは機械の取り込み。失敗の応答は rust-alc-api と同じく status だけで本文は空)
+//!
 //! 認可は `TenantId` の Extension だけを見る (直下の worker が `alc_core_wasm::require_tenant_header` の layer で入れる。
 //! 役割は auth-worker の許可表が決める)。DB は、テナントを設定した接続で、テナントでも絞って引く。
 
@@ -38,7 +43,12 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
+use crate::dvr::{
+    r2_key, read_capped, validate, DvrFileStoredResponse, DvrIngestBody, DvrIngestResponse,
+    ReadError, ERROR_BODY_STREAM, ERROR_STORE, ERROR_TOO_LARGE, MAX_BATCH_ITEMS,
+};
 use crate::ingest::{ingest_upload, rerun_upload, IngestError, IngestLimits, IngestOutcome};
+use crate::logs::{BulkUpsertResponse, DtakologInput};
 use crate::pg::{self, PendingUploadRow, UploadRow};
 use crate::recalc::{next_recalc_event, recalc_pending, PendingOutcome, RecalcRun};
 use crate::split::{split_upload, LogLevel, LogSink, SplitError};
@@ -104,6 +114,15 @@ pub fn tenant_router_with(limits: IngestLimits) -> Router<DtakoState> {
         .route("/recalculate-driver", post(recalculate_driver))
         .route("/recalculate-drivers", post(recalculate_drivers))
         .route("/recalculate-pending", pending)
+        .route(
+            "/dtako-logs/bulk",
+            post(dtakologs_bulk).layer(DefaultBodyLimit::max(UPLOAD_BODY_LIMIT)),
+        )
+        .route(
+            "/dvr/notifications",
+            post(dvr_notifications).layer(DefaultBodyLimit::max(UPLOAD_BODY_LIMIT)),
+        )
+        .route("/dvr/files/{id}", post(dvr_file))
 }
 
 type ApiError = (StatusCode, Json<Value>);
@@ -630,4 +649,118 @@ async fn split_csv_all(
     };
     let events = stream::unfold(run, next_split_all_event);
     event_stream_response(events)
+}
+
+// ---- 機械の取り込み (W5a、Refs ippoan/rust-alc-api#680) ----
+
+/// 機械の取り込みの失敗 (status だけ。本文は空 — rust-alc-api の同じ口と同じ)。原因は `log` に段の名前と kind だけを出す。
+fn machine_db_failure(log: &LogSink, what: &str, e: &tokio_postgres::Error) -> StatusCode {
+    log(
+        LogLevel::Error,
+        &format!("{what} failed: db ({})", alc_worker_db::kind(e)),
+    );
+    StatusCode::INTERNAL_SERVER_ERROR
+}
+
+/// 車両の現在地のログの一括 upsert。空の配列は DB を引かずに 0 件で返す。
+async fn dtakologs_bulk(
+    State(state): State<DtakoState>,
+    Extension(TenantId(tenant_id)): Extension<TenantId>,
+    Json(records): Json<Vec<DtakologInput>>,
+) -> Result<Json<BulkUpsertResponse>, StatusCode> {
+    if records.is_empty() {
+        return Ok(Json(BulkUpsertResponse::empty()));
+    }
+    let total = records.len();
+    let affected = {
+        let mut client = state.pg.lock().await;
+        pg::dtakologs_bulk_upsert(&mut client, tenant_id, records).await
+    };
+    let affected = affected.map_err(|e| machine_db_failure(&state.log, "dtako-logs bulk", &e))?;
+    Ok(Json(BulkUpsertResponse::upserted(affected, total)))
+}
+
+/// DVR の動画通知のバッチの起票。空・[`MAX_BATCH_ITEMS`] 超・検査に通らない行が 1 つでも在れば 400 (何も書かない)。
+async fn dvr_notifications(
+    State(state): State<DtakoState>,
+    Extension(TenantId(tenant_id)): Extension<TenantId>,
+    Json(body): Json<DvrIngestBody>,
+) -> Result<Json<DvrIngestResponse>, StatusCode> {
+    let items = body.items;
+    if items.is_empty() || items.len() > MAX_BATCH_ITEMS || !items.iter().all(validate) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let out = {
+        let mut client = state.pg.lock().await;
+        pg::dvr_ingest(&mut client, tenant_id, items).await
+    };
+    let out = out.map_err(|e| machine_db_failure(&state.log, "dvr ingest", &e))?;
+    Ok(Json(out))
+}
+
+/// 失敗を行に残す (残せなくても応答は変えない。残せなかったことだけをログに出す)。
+async fn dvr_record_failure(
+    state: &DtakoState,
+    tenant_id: Uuid,
+    id: Uuid,
+    file_status: Option<&str>,
+    message: &str,
+) {
+    let recorded = {
+        let mut client = state.pg.lock().await;
+        let status = file_status.map(str::to_owned);
+        pg::dvr_record_failure(&mut client, tenant_id, id, status, message.to_owned()).await
+    };
+    if let Err(e) = recorded {
+        machine_db_failure(&state.log, "dvr record failure", &e);
+    }
+}
+
+/// `.vdf` の生のバイト列を受けて保存先に置く。**`{id}` はヘッダーのテナントと対で引く** (別テナントの行は 404。無いのと区別しない)。
+/// 大きすぎる = 413 (行は `failed`)、body が壊れた = 400、保存先に置けない = 502 (どれも試行回数を進めて理由を残す)。
+async fn dvr_file(
+    State(state): State<DtakoState>,
+    Extension(TenantId(tenant_id)): Extension<TenantId>,
+    Path(id): Path<Uuid>,
+    body: Body,
+) -> Result<Json<DvrFileStoredResponse>, StatusCode> {
+    let row = {
+        let mut client = state.pg.lock().await;
+        pg::dvr_file(&mut client, tenant_id, id).await
+    };
+    let row = row.map_err(|e| machine_db_failure(&state.log, "dvr lookup", &e))?;
+    let (serial_no, file_name) = row.ok_or(StatusCode::NOT_FOUND)?;
+    let bytes = match read_capped(body).await {
+        Ok(bytes) => bytes,
+        Err(ReadError::TooLarge) => {
+            dvr_record_failure(&state, tenant_id, id, Some("failed"), ERROR_TOO_LARGE).await;
+            return Err(StatusCode::PAYLOAD_TOO_LARGE);
+        }
+        Err(ReadError::Stream) => {
+            dvr_record_failure(&state, tenant_id, id, None, ERROR_BODY_STREAM).await;
+            return Err(StatusCode::BAD_REQUEST);
+        }
+    };
+    let key = r2_key(tenant_id, &serial_no, &file_name);
+    let size = bytes.len() as i64;
+    if let Err(e) = state
+        .store
+        .put(&key, bytes, "application/octet-stream")
+        .await
+    {
+        (state.log)(LogLevel::Error, &format!("dvr file failed: {e}"));
+        dvr_record_failure(&state, tenant_id, id, None, ERROR_STORE).await;
+        return Err(StatusCode::BAD_GATEWAY);
+    }
+    let stored = {
+        let mut client = state.pg.lock().await;
+        pg::dvr_mark_stored(&mut client, tenant_id, id, key.clone(), size).await
+    };
+    stored.map_err(|e| machine_db_failure(&state.log, "dvr stored", &e))?;
+    Ok(Json(DvrFileStoredResponse {
+        id,
+        file_status: "stored",
+        size,
+        r2_key: key,
+    }))
 }

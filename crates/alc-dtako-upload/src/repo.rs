@@ -279,4 +279,148 @@ pub mod sql {
 
     /// DB の今の時刻 (transaction の開始の時刻。再計算の口が運行を読み始めた時刻として、印を消す条件に使う)。
     pub const SELECT_NOW: &str = "SELECT now()";
+
+    // ---- 機械の取り込み (W5a、Refs ippoan/rust-alc-api#680) ----
+
+    /// 車両の現在地のログ (dtako-scraper-relay の `POST /dtako-logs/bulk`) の upsert。表は `dtakologs` (主キー
+    /// `(tenant_id, data_date_time, vehicle_cd)`)。**rust-alc-api の `PgDtakoLogsRepository::bulk_upsert` と同じ文**
+    /// (列ごとの配列を `UNNEST` する。$13 GPS の向きは FLOAT8[] で受けて INTEGER[] に cast する — 元の文のまま)。
+    /// $1 tenant_id / $2..$57 列ごとの配列 (並びと型は [`crate::pg::dtakologs_bulk_upsert`])。
+    pub const UPSERT_DTAKOLOGS: &str = r#"INSERT INTO alc_api.dtakologs (
+                tenant_id, data_date_time, vehicle_cd,
+                type, all_state_font_color_index, all_state_ryout_color,
+                branch_cd, branch_name, current_work_cd, data_filter_type,
+                disp_flag, driver_cd, gps_direction, gps_enable,
+                gps_latitude, gps_longitude, gps_satellite_num,
+                operation_state, recive_event_type, recive_packet_type,
+                recive_work_cd, revo, setting_temp, setting_temp1,
+                setting_temp3, setting_temp4, speed, sub_driver_cd,
+                temp_state, vehicle_name,
+                address_disp_c, address_disp_p, all_state, all_state_ex,
+                all_state_font_color, comu_date_time, current_work_name,
+                driver_name, event_val, gps_lati_and_long, odometer,
+                recive_type_color_name, recive_type_name,
+                start_work_date_time, state, state1, state2, state3,
+                state_flag, temp1, temp2, temp3, temp4,
+                vehicle_icon_color, vehicle_icon_label_for_datetime,
+                vehicle_icon_label_for_driver, vehicle_icon_label_for_vehicle
+            )
+            SELECT
+                $1::UUID,
+                UNNEST($2::TEXT[]), UNNEST($3::INTEGER[]),
+                UNNEST($4::TEXT[]), UNNEST($5::INTEGER[]), UNNEST($6::TEXT[]),
+                UNNEST($7::INTEGER[]), UNNEST($8::TEXT[]), UNNEST($9::INTEGER[]), UNNEST($10::INTEGER[]),
+                UNNEST($11::INTEGER[]), UNNEST($12::INTEGER[]), UNNEST($13::INTEGER[]), UNNEST($14::INTEGER[]),
+                UNNEST($15::INTEGER[]), UNNEST($16::INTEGER[]), UNNEST($17::INTEGER[]),
+                UNNEST($18::INTEGER[]), UNNEST($19::INTEGER[]), UNNEST($20::INTEGER[]),
+                UNNEST($21::INTEGER[]), UNNEST($22::INTEGER[]), UNNEST($23::TEXT[]), UNNEST($24::TEXT[]),
+                UNNEST($25::TEXT[]), UNNEST($26::TEXT[]), UNNEST($27::REAL[]), UNNEST($28::INTEGER[]),
+                UNNEST($29::INTEGER[]), UNNEST($30::TEXT[]),
+                UNNEST($31::TEXT[]), UNNEST($32::TEXT[]), UNNEST($33::TEXT[]), UNNEST($34::TEXT[]),
+                UNNEST($35::TEXT[]), UNNEST($36::TEXT[]), UNNEST($37::TEXT[]),
+                UNNEST($38::TEXT[]), UNNEST($39::TEXT[]), UNNEST($40::TEXT[]), UNNEST($41::TEXT[]),
+                UNNEST($42::TEXT[]), UNNEST($43::TEXT[]),
+                UNNEST($44::TEXT[]), UNNEST($45::TEXT[]), UNNEST($46::TEXT[]), UNNEST($47::TEXT[]), UNNEST($48::TEXT[]),
+                UNNEST($49::TEXT[]), UNNEST($50::TEXT[]), UNNEST($51::TEXT[]), UNNEST($52::TEXT[]), UNNEST($53::TEXT[]),
+                UNNEST($54::TEXT[]), UNNEST($55::TEXT[]),
+                UNNEST($56::TEXT[]), UNNEST($57::TEXT[])
+            ON CONFLICT (tenant_id, data_date_time, vehicle_cd) DO UPDATE SET
+                type = EXCLUDED.type,
+                all_state_font_color_index = EXCLUDED.all_state_font_color_index,
+                all_state_ryout_color = EXCLUDED.all_state_ryout_color,
+                branch_cd = EXCLUDED.branch_cd,
+                branch_name = EXCLUDED.branch_name,
+                current_work_cd = EXCLUDED.current_work_cd,
+                data_filter_type = EXCLUDED.data_filter_type,
+                disp_flag = EXCLUDED.disp_flag,
+                driver_cd = EXCLUDED.driver_cd,
+                gps_direction = EXCLUDED.gps_direction,
+                gps_enable = EXCLUDED.gps_enable,
+                gps_latitude = EXCLUDED.gps_latitude,
+                gps_longitude = EXCLUDED.gps_longitude,
+                gps_satellite_num = EXCLUDED.gps_satellite_num,
+                operation_state = EXCLUDED.operation_state,
+                recive_event_type = EXCLUDED.recive_event_type,
+                recive_packet_type = EXCLUDED.recive_packet_type,
+                recive_work_cd = EXCLUDED.recive_work_cd,
+                revo = EXCLUDED.revo,
+                setting_temp = EXCLUDED.setting_temp,
+                setting_temp1 = EXCLUDED.setting_temp1,
+                setting_temp3 = EXCLUDED.setting_temp3,
+                setting_temp4 = EXCLUDED.setting_temp4,
+                speed = EXCLUDED.speed,
+                sub_driver_cd = EXCLUDED.sub_driver_cd,
+                temp_state = EXCLUDED.temp_state,
+                vehicle_name = EXCLUDED.vehicle_name,
+                address_disp_c = EXCLUDED.address_disp_c,
+                address_disp_p = EXCLUDED.address_disp_p,
+                all_state = EXCLUDED.all_state,
+                all_state_ex = EXCLUDED.all_state_ex,
+                all_state_font_color = EXCLUDED.all_state_font_color,
+                comu_date_time = EXCLUDED.comu_date_time,
+                current_work_name = EXCLUDED.current_work_name,
+                driver_name = EXCLUDED.driver_name,
+                event_val = EXCLUDED.event_val,
+                gps_lati_and_long = EXCLUDED.gps_lati_and_long,
+                odometer = EXCLUDED.odometer,
+                recive_type_color_name = EXCLUDED.recive_type_color_name,
+                recive_type_name = EXCLUDED.recive_type_name,
+                start_work_date_time = EXCLUDED.start_work_date_time,
+                state = EXCLUDED.state,
+                state1 = EXCLUDED.state1,
+                state2 = EXCLUDED.state2,
+                state3 = EXCLUDED.state3,
+                state_flag = EXCLUDED.state_flag,
+                temp1 = EXCLUDED.temp1,
+                temp2 = EXCLUDED.temp2,
+                temp3 = EXCLUDED.temp3,
+                temp4 = EXCLUDED.temp4,
+                vehicle_icon_color = EXCLUDED.vehicle_icon_color,
+                vehicle_icon_label_for_datetime = EXCLUDED.vehicle_icon_label_for_datetime,
+                vehicle_icon_label_for_driver = EXCLUDED.vehicle_icon_label_for_driver,
+                vehicle_icon_label_for_vehicle = EXCLUDED.vehicle_icon_label_for_vehicle"#;
+
+    /// DVR (ドライブレコーダー) の動画通知 1 件を起票する (自然キーが既に在れば何もしない)。表は `dvr_notifications`。
+    /// $1 tenant_id / $2 serial_no / $3 file_name / $4 vehicle_cd / $5 vehicle_name / $6 driver_name / $7 event_type /
+    /// $8 dvr_datetime (NULL 可) / $9 source_url (NULL 可) → 作った行の id (既に在れば 0 行)。
+    pub const INSERT_DVR_NOTIFICATION: &str = r#"INSERT INTO alc_api.dvr_notifications (
+                tenant_id, serial_no, file_name, vehicle_cd, vehicle_name,
+                driver_name, event_type, dvr_datetime, source_url
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            ON CONFLICT (tenant_id, serial_no, file_name) DO NOTHING
+            RETURNING id"#;
+
+    /// 既に在る通知のうち、まだ実体を取りに行くべき行 (`file_status = 'pending'` で試行回数が上限未満)。
+    /// $1 tenant_id / $2 serial_no / $3 file_name / $4 試行回数の上限 → id (当たらなければ 0 行)。
+    pub const SELECT_DVR_RETRY: &str = r#"SELECT id
+              FROM alc_api.dvr_notifications
+             WHERE tenant_id = $1
+               AND serial_no = $2
+               AND file_name = $3
+               AND file_status = 'pending'
+               AND attempts < $4"#;
+
+    /// 通知 1 件の R2 の key の材料。$1 id / $2 tenant_id → serial_no, file_name (行が無い・別テナントなら 0 行)。
+    pub const SELECT_DVR_FILE: &str =
+        "SELECT serial_no, file_name FROM alc_api.dvr_notifications WHERE id = $1 AND tenant_id = $2";
+
+    /// 実体の取得の失敗を残す (試行回数 +1・`last_error`)。$1 id / $2 tenant_id / $3 last_error (固定の語)。
+    pub const RECORD_DVR_FAILURE: &str = r#"UPDATE alc_api.dvr_notifications
+                SET attempts = attempts + 1, last_error = $3, updated_at = now()
+              WHERE id = $1 AND tenant_id = $2"#;
+
+    /// [`RECORD_DVR_FAILURE`] に加えて `file_status` も変える (大きすぎる実体 = `failed`)。$4 file_status。
+    pub const RECORD_DVR_FAILURE_WITH_STATUS: &str = r#"UPDATE alc_api.dvr_notifications
+                SET attempts = attempts + 1, last_error = $3, file_status = $4, updated_at = now()
+              WHERE id = $1 AND tenant_id = $2"#;
+
+    /// 実体を保存先に置いた印。$1 id / $2 tenant_id / $3 r2_key / $4 size_bytes。
+    pub const MARK_DVR_STORED: &str = r#"UPDATE alc_api.dvr_notifications
+           SET file_status = 'stored',
+               r2_key      = $3,
+               size_bytes  = $4,
+               last_error  = NULL,
+               updated_at  = now()
+         WHERE id = $1 AND tenant_id = $2"#;
 }

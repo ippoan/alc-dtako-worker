@@ -3,7 +3,7 @@
 //! DB への経路 (staging = Workers VPC の先の PgBouncer、本番 = Hyperdrive) は [`db::connect`] の 1 か所で出し分ける。
 //! monolith と同じく `/api` 付きでも受ける。
 //!
-//! 口は 16 本 (勤怠向けの読み取りの `GET /dtako/events`・`GET /dtako/events/etags`、機械の取り込みの `POST /dtako-logs/bulk`・`POST /dvr/notifications`・`POST /dvr/files/{id}` と `POST /recalculate-pending` を含む): `POST /upload` (zip の取り込み)・`POST /internal/rerun/{upload_id}` (やり直し)・`POST /split-csv/{upload_id}` (分割 1 件)・
+//! 口は 36 本 (画面向けの読み取りと分類の更新の 20 口 (W5c-1、`alc_dtako_upload::screen`)、勤怠向けの読み取りの `GET /dtako/events`・`GET /dtako/events/etags`、機械の取り込みの `POST /dtako-logs/bulk`・`POST /dvr/notifications`・`POST /dvr/files/{id}` と `POST /recalculate-pending` を含む): `POST /upload` (zip の取り込み)・`POST /internal/rerun/{upload_id}` (やり直し)・`POST /split-csv/{upload_id}` (分割 1 件)・
 //! `POST /split-csv-all` (一括分割)・`POST /recalculate` (月の全員の再計算)・`POST /recalculate-driver`・`POST /recalculate-drivers`
 //! (乗務員ごとの再計算) と、履歴の読み取りの `GET /uploads`・`GET /internal/pending`・
 //! `GET /internal/download/{upload_id}`。

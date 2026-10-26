@@ -21,6 +21,8 @@ chrono = { version = "0.4", default-features = false }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# 車両の現在地のログのアーカイブ (gzip の JSON Lines) を読む (`screen`)。zip と同じ版・純 Rust の実装 (wasm32 に載る)
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 # `pg` が流す型付きの文の型 (`Type`)。接続は張らない (runtime の feature を付けない。
 # wasm 用の feature `js` は直下の worker と alc-worker-db が付ける)
 tokio-postgres = { version = "0.7", default-features = false, features = ["with-uuid-1", "with-chrono-0_4", "with-serde_json-1"] }

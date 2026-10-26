@@ -589,3 +589,24 @@ rust-alc-api から移した 2 口 (Refs ippoan/rust-alc-api#680)。呼び手は
 | `GET /dtako/events/etags?date_from=&date_to=` | CSV を読まずに、運行の在る日 (`{tenant}/unko/{YYMMDD}`) だけ LIST して運行NO → ETag (40 日まで)。LIST に無い運行は `etag: null`、未分割の運行は `unsplit` (500 件まで)・`unsplit_total`。**ETag は引用符の無い MD5 (R2 の binding の `etag()`)。勤怠の月の指紋の入力なので形を変えない** |
 
 保存先の同時の読みは Workers の同時接続の上限 (6) に合わせる (rust は 16)。失敗の本文は `internal error` (DB・LIST)、ログは `<段> failed: db (<kind>)`。
+
+## 画面向けの読み取りと分類の更新 (W5c-1)
+
+rust-alc-api から移した 20 口 (Refs ippoan/rust-alc-api#680)。呼び手は nuxt-dtako-admin などの画面 (auth-worker の画面用の proxy) と RPC。
+**応答の形・既定値・上限・並び・失敗の status は rust-alc-api の同じ口 (`alc_dtako::dtako_*`) と同じ**。実装は `crates/alc-dtako-upload/src/screen.rs`。
+
+| 口 | 中身 |
+|---|---|
+| `GET /drivers`・`GET /vehicles` | 運行の在る乗務員 (論理削除は除く、乗務員CD の順)・車両 (車両CD の順) |
+| `GET /work-times`・`GET /daily-hours` (`driver_id`・`date_from`・`date_to`・`page`・`per_page`) | 日別のセグメント・労働時間のページ (既定 50 件・上限 200、`page` は 1 未満を 1) |
+| `GET /daily-hours/{driver_id}/{date}/segments` | 1 日ぶんのセグメント (始まりの順) |
+| `GET /operations`・`GET /internal/operations` | 運行の一覧のページ (読取日の新しい順。`date_from`・`date_to`・`driver_cd`・`vehicle_cd`) |
+| `GET /operations/calendar?year=&month=` | 読取日ごとの運行の件数 (月が読めなければ 400) |
+| `GET /operations/{unko_no}`・`DELETE /operations/{unko_no}` | 運行の全欄 (crew_role の順。無ければ 404)・全 crew_role を消して、消す前の行を `manual_delete` で変更記録に残す (204 / 404) |
+| `GET /operations/{unko_no}/csv/{csv_type}` | 保存先の CSV (`kudguri`・`kudgivt`/`events`・`kudgfry`/`ferry`/`ferries`・`kudgsir`/`tolls`・`speed`/`sokudo`) を `{headers, rows}` に。種類が違えば 400、無い・読めないは 404 |
+| `GET /dtako/operation-changes?driver_cd=&from=&to=` | 乗務員の運行の変更記録 (期間は運行の日付で絞る)・記録を始めた時点 |
+| `GET /event-classifications`・`PUT /event-classifications/{id}` | イベントの分類の一覧と更新 (値が違えば 400 と文、無ければ 404 `Not found`) |
+| `GET /scraper/history`・`POST /scraper/history` | スクレイプの履歴の一覧 (新しい順、既定 50 件)・記録 (204) |
+| `GET /dtako-logs/{current,current/select,by-date,by-date-range}` | 車両の現在地のログ (画面の形 = PascalCase)。`by-date-range` は保存先のアーカイブ (`archive/alc_api/dtakologs/_manifest.json` の日付ごとの gzip の JSON Lines) も読み、日時・車両で 1 行にまとめる |
+
+DB はテナントでも絞って引く (RLS と同じ行)。失敗の本文に DB のエラー文を載せない (rust の `scraper/history` は載せていた。本文は `internal server error`)、ログは `<段> failed: db (<SQLSTATE>)`。

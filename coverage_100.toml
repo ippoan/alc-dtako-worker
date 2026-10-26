@@ -57,6 +57,10 @@ path = "crates/alc-dtako-upload/src/dvr.rs"
 [[files]]
 path = "crates/alc-dtako-upload/src/events.rs"
 
+# 画面向けの読み取りと分類の更新 (tests/screen_flow.rs が口から DB・偽の保存先まで通す。W5c-1)
+[[files]]
+path = "crates/alc-dtako-upload/src/screen.rs"
+
 # --- 共通の計算 crate 2 つ (正本はこの repo。ippoan/rust-alc-api 79029aa の coverage_100.toml から登録を写した。Refs ippoan/rust-alc-api#736) ---
 # 計測は crate ごとに別の回 (`cargo llvm-cov -p alc-compare` / `-p alc-csv-parser`。ci.yml)。crate 自身のテストだけで 100% にする。
 

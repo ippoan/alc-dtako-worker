@@ -484,4 +484,223 @@ pub mod sql {
                AND o.has_kudgivt = FALSE \
                AND d.driver_cd IS NOT NULL \
              ORDER BY o.unko_no";
+
+    // ---- 画面向けの読み取りと分類の更新 (W5c-1、Refs ippoan/rust-alc-api#680) ----
+    // **rust-alc-api の各 `PgDtako*Repository` の文と同じ結果を返す**。違いは 2 つ: RLS 任せだった文もテナントで絞る
+    // (`tenant_id = $1`。RLS と同じ行になる)・`SELECT *` は列を書き出す (型付きの文で列の並びを決めるため)。
+
+    /// 運行が 1 件でも在る乗務員 (論理削除済みは除く、乗務員CD の順)。$1 tenant_id → id, tenant_id, driver_cd, name。
+    pub const LIST_DRIVERS: &str = "SELECT DISTINCT e.id, e.tenant_id, e.driver_cd, e.name \
+             FROM alc_api.employees e \
+             INNER JOIN alc_api.dtako_operations op ON op.driver_id = e.id \
+             WHERE e.tenant_id = $1 AND e.deleted_at IS NULL \
+             ORDER BY e.driver_cd";
+
+    /// 車両 (車両CD の順)。$1 tenant_id → id, tenant_id, vehicle_cd, vehicle_name。
+    pub const LIST_VEHICLES: &str = "SELECT id, tenant_id, vehicle_cd, vehicle_name \
+             FROM alc_api.dtako_vehicles WHERE tenant_id = $1 ORDER BY vehicle_cd";
+
+    /// 日別のセグメントの件数。$1 tenant_id / $2 driver_id (NULL 可) / $3 日付の始め (NULL 可) / $4 日付の終わり (NULL 可)。
+    pub const COUNT_WORK_TIMES: &str = r#"SELECT COUNT(*)::BIGINT FROM alc_api.dtako_daily_work_segments
+               WHERE tenant_id = $1
+                 AND ($2::UUID IS NULL OR driver_id = $2)
+                 AND ($3::DATE IS NULL OR work_date >= $3)
+                 AND ($4::DATE IS NULL OR work_date <= $4)"#;
+
+    /// 日別のセグメントのページ (日付・乗務員CD・始まりの順)。$1〜$4 は [`COUNT_WORK_TIMES`] と同じ / $5 件数 / $6 飛ばす件数 →
+    /// id, driver_id, work_date, unko_no, segment_index, start_at, end_at, work_minutes, labor_minutes。
+    pub const LIST_WORK_TIMES: &str = r#"SELECT s.id, s.driver_id, s.work_date, s.unko_no, s.segment_index,
+                      s.start_at, s.end_at, s.work_minutes, s.labor_minutes
+               FROM alc_api.dtako_daily_work_segments s
+               JOIN alc_api.employees d ON d.id = s.driver_id
+               WHERE s.tenant_id = $1
+                 AND ($2::UUID IS NULL OR s.driver_id = $2)
+                 AND ($3::DATE IS NULL OR s.work_date >= $3)
+                 AND ($4::DATE IS NULL OR s.work_date <= $4)
+               ORDER BY s.work_date ASC, d.driver_cd, s.start_at
+               LIMIT $5 OFFSET $6"#;
+
+    /// 日別の労働時間の件数。$1〜$4 は [`COUNT_WORK_TIMES`] と同じ。
+    pub const COUNT_DAILY_HOURS: &str = r#"SELECT COUNT(*)::BIGINT FROM alc_api.dtako_daily_work_hours
+               WHERE tenant_id = $1
+                 AND ($2::UUID IS NULL OR driver_id = $2)
+                 AND ($3::DATE IS NULL OR work_date >= $3)
+                 AND ($4::DATE IS NULL OR work_date <= $4)"#;
+
+    /// 日別の労働時間のページ (日付の順)。$1〜$4 は [`COUNT_WORK_TIMES`] と同じ / $5 件数 / $6 飛ばす件数 → 列は rust-alc-api の `DtakoDailyWorkHours` の並び。
+    pub const LIST_DAILY_HOURS: &str = r#"SELECT id, tenant_id, driver_id, work_date, start_time,
+                      total_work_minutes, total_drive_minutes, total_rest_minutes,
+                      late_night_minutes, drive_minutes, cargo_minutes,
+                      overlap_drive_minutes, overlap_cargo_minutes, overlap_break_minutes,
+                      overlap_restraint_minutes, ot_late_night_minutes,
+                      total_distance, operation_count, unko_nos, created_at, updated_at
+               FROM alc_api.dtako_daily_work_hours
+               WHERE tenant_id = $1
+                 AND ($2::UUID IS NULL OR driver_id = $2)
+                 AND ($3::DATE IS NULL OR work_date >= $3)
+                 AND ($4::DATE IS NULL OR work_date <= $4)
+               ORDER BY work_date ASC
+               LIMIT $5 OFFSET $6"#;
+
+    /// 乗務員 1 人・1 日のセグメント (始まりの順)。$1 tenant_id / $2 driver_id / $3 日付 →
+    /// id, tenant_id, driver_id, work_date, unko_no, segment_index, start_at, end_at, work_minutes, labor_minutes,
+    /// late_night_minutes, drive_minutes, cargo_minutes, created_at。
+    pub const LIST_DAILY_SEGMENTS: &str = r#"SELECT id, tenant_id, driver_id, work_date, unko_no, segment_index,
+                      start_at, end_at, work_minutes, labor_minutes,
+                      late_night_minutes, drive_minutes, cargo_minutes, created_at
+               FROM alc_api.dtako_daily_work_segments
+               WHERE tenant_id = $1 AND driver_id = $2 AND work_date = $3
+               ORDER BY start_at"#;
+
+    /// 読取日ごとの運行の件数。$1 tenant_id / $2 日付の始め / $3 日付の終わり → reading_date, 件数 (読取日の順)。
+    pub const CALENDAR_DATES: &str = r#"SELECT reading_date, COUNT(*)::BIGINT
+               FROM alc_api.dtako_operations
+               WHERE tenant_id = $1 AND reading_date >= $2 AND reading_date <= $3
+               GROUP BY reading_date
+               ORDER BY reading_date"#;
+
+    /// 運行の一覧の件数。$1 tenant_id / $2 読取日の始め (NULL 可) / $3 読取日の終わり (NULL 可) / $4 乗務員CD (NULL 可) /
+    /// $5 車両CD (NULL 可)。
+    pub const COUNT_OPERATIONS: &str = r#"SELECT COUNT(*)::BIGINT FROM alc_api.dtako_operations o
+               LEFT JOIN alc_api.employees d ON o.driver_id = d.id
+               LEFT JOIN alc_api.dtako_vehicles v ON o.vehicle_id = v.id
+               WHERE o.tenant_id = $1
+                 AND ($2::DATE IS NULL OR o.reading_date >= $2)
+                 AND ($3::DATE IS NULL OR o.reading_date <= $3)
+                 AND ($4::TEXT IS NULL OR d.driver_cd = $4)
+                 AND ($5::TEXT IS NULL OR v.vehicle_cd = $5)"#;
+
+    /// 運行の一覧のページ (読取日の新しい順・運行NO の順)。$1〜$5 は [`COUNT_OPERATIONS`] と同じ / $6 件数 / $7 飛ばす件数 →
+    /// id, unko_no, crew_role, reading_date, operation_date, driver_name, vehicle_name, vehicle_cd, total_distance,
+    /// safety_score, economy_score, total_score, has_kudgivt。
+    pub const LIST_OPERATIONS: &str = r#"SELECT o.id, o.unko_no, o.crew_role, o.reading_date, o.operation_date,
+                      d.name AS driver_name, v.vehicle_name, v.vehicle_cd,
+                      o.total_distance, o.safety_score, o.economy_score, o.total_score,
+                      o.has_kudgivt
+               FROM alc_api.dtako_operations o
+               LEFT JOIN alc_api.employees d ON o.driver_id = d.id
+               LEFT JOIN alc_api.dtako_vehicles v ON o.vehicle_id = v.id
+               WHERE o.tenant_id = $1
+                 AND ($2::DATE IS NULL OR o.reading_date >= $2)
+                 AND ($3::DATE IS NULL OR o.reading_date <= $3)
+                 AND ($4::TEXT IS NULL OR d.driver_cd = $4)
+                 AND ($5::TEXT IS NULL OR v.vehicle_cd = $5)
+               ORDER BY o.reading_date DESC, o.unko_no
+               LIMIT $6 OFFSET $7"#;
+
+    /// 運行NO の行 (crew_role の順)。$1 tenant_id / $2 unko_no → 列は rust-alc-api の `DtakoOperation` の並び
+    /// (id, tenant_id, unko_no, crew_role, reading_date, operation_date, office_id, vehicle_id, driver_id, departure_at, return_at,
+    /// garage_out_at, garage_in_at, meter_start, meter_end, total_distance, drive_time_general, drive_time_highway,
+    /// drive_time_bypass, safety_score, economy_score, total_score, raw_data, r2_key_prefix, uploaded_at, has_kudgivt)。
+    pub const SELECT_OPERATIONS_BY_UNKO_NO: &str = r#"SELECT id, tenant_id, unko_no, crew_role, reading_date, operation_date,
+                      office_id, vehicle_id, driver_id, departure_at, return_at, garage_out_at, garage_in_at,
+                      meter_start, meter_end, total_distance, drive_time_general, drive_time_highway, drive_time_bypass,
+                      safety_score, economy_score, total_score, raw_data, r2_key_prefix, uploaded_at, has_kudgivt
+               FROM alc_api.dtako_operations
+               WHERE tenant_id = $1 AND unko_no = $2
+               ORDER BY crew_role"#;
+
+    /// 運行NO の行を全 crew_role まとめて消す (手で消す口)。$1 tenant_id / $2 unko_no。
+    pub const DELETE_OPERATIONS_BY_UNKO_NO: &str =
+        "DELETE FROM alc_api.dtako_operations WHERE tenant_id = $1 AND unko_no = $2";
+
+    /// 乗務員の運行の変更記録 (運行NO・crew_role・記録の順)。$1 tenant_id / $2 driver_cd →
+    /// unko_no, crew_role, recorded_at, reason, before, after。
+    pub const LIST_OPERATION_CHANGES: &str = r#"SELECT unko_no, crew_role, recorded_at, reason, before, after
+                 FROM alc_api.dtako_operation_changes
+                WHERE tenant_id = $1
+                  AND (driver_cd = $2 OR before->>'driver_cd' = $2 OR after->>'driver_cd' = $2)
+                ORDER BY unko_no, crew_role, recorded_at"#;
+
+    /// 変更記録の最古の記録時刻 (記録が無ければ NULL)。$1 tenant_id。
+    pub const SELECT_OPERATION_CHANGES_SINCE: &str =
+        "SELECT MIN(recorded_at) FROM alc_api.dtako_operation_changes WHERE tenant_id = $1";
+
+    /// 運行の CSV の保存先の接頭辞 (無ければ 0 行、在っても NULL があり得る)。$1 tenant_id / $2 unko_no → r2_key_prefix。
+    pub const SELECT_R2_KEY_PREFIX: &str = "SELECT r2_key_prefix FROM alc_api.dtako_operations \
+             WHERE tenant_id = $1 AND unko_no = $2 LIMIT 1";
+
+    /// イベントの分類の一覧 (イベントCD の順)。$1 tenant_id → id, tenant_id, event_cd, event_name, classification, created_at。
+    pub const LIST_EVENT_CLASSIFICATIONS: &str =
+        "SELECT id, tenant_id, event_cd, event_name, classification, created_at \
+             FROM alc_api.dtako_event_classifications WHERE tenant_id = $1 ORDER BY event_cd";
+
+    /// イベントの分類を 1 件変える (無ければ 0 行)。$1 tenant_id / $2 id / $3 classification → 列は [`LIST_EVENT_CLASSIFICATIONS`] と同じ。
+    pub const UPDATE_EVENT_CLASSIFICATION: &str =
+        "UPDATE alc_api.dtako_event_classifications SET classification = $3 \
+             WHERE tenant_id = $1 AND id = $2 \
+             RETURNING id, tenant_id, event_cd, event_name, classification, created_at";
+
+    /// スクレイプの履歴を 1 件足す。$1 tenant_id / $2 target_date / $3 comp_id / $4 status / $5 message (NULL 可)。
+    pub const INSERT_SCRAPE_HISTORY: &str = r#"INSERT INTO alc_api.dtako_scrape_history (tenant_id, target_date, comp_id, status, message)
+               VALUES ($1, $2, $3, $4, $5)"#;
+
+    /// スクレイプの履歴 (新しい順)。$1 tenant_id / $2 件数 / $3 飛ばす件数 →
+    /// id, target_date, comp_id, status, message, created_at。
+    pub const LIST_SCRAPE_HISTORY: &str = r#"SELECT id, target_date, comp_id, status, message, created_at
+               FROM alc_api.dtako_scrape_history
+               WHERE tenant_id = $1
+               ORDER BY created_at DESC
+               LIMIT $2 OFFSET $3"#;
+
+    // ---- 車両の現在地のログの読み取り (`/dtako-logs/*`)。列は rust-alc-api の `DtakologRow` の並び ----
+
+    /// 車両ごとの最新の 1 行 (車両CD の順)。$1 tenant_id。
+    pub const DTAKOLOGS_CURRENT: &str = r#"SELECT d.gps_direction, d.gps_latitude, d.gps_longitude, d.vehicle_cd,
+                      d.vehicle_name, d.driver_name, d.address_disp_c, d.data_date_time,
+                      d.address_disp_p, d.sub_driver_cd, d.all_state, d.recive_type_color_name,
+                      d.all_state_ex, d.state2, d.all_state_font_color, d.speed
+               FROM alc_api.dtakologs d
+               INNER JOIN (
+                   SELECT vehicle_cd, MAX(data_date_time) AS max_dt
+                   FROM alc_api.dtakologs
+                   WHERE tenant_id = $1
+                   GROUP BY vehicle_cd
+               ) latest ON d.vehicle_cd = latest.vehicle_cd
+                       AND d.data_date_time = latest.max_dt
+               WHERE d.tenant_id = $1
+               ORDER BY d.vehicle_cd"#;
+
+    /// 車両ごとの最新の 1 行を、地域・営業所・車両で絞る (車両CD の順)。$1 tenant_id / $2 address_disp_p (NULL 可) /
+    /// $3 branch_cd (NULL 可) / $4 車両CD の配列 (NULL なら絞らない)。
+    pub const DTAKOLOGS_CURRENT_SELECT: &str = r#"SELECT d.gps_direction, d.gps_latitude, d.gps_longitude, d.vehicle_cd,
+                      d.vehicle_name, d.driver_name, d.address_disp_c, d.data_date_time,
+                      d.address_disp_p, d.sub_driver_cd, d.all_state, d.recive_type_color_name,
+                      d.all_state_ex, d.state2, d.all_state_font_color, d.speed
+               FROM alc_api.dtakologs d
+               INNER JOIN (
+                   SELECT vehicle_cd, MAX(data_date_time) AS max_dt
+                   FROM alc_api.dtakologs
+                   WHERE tenant_id = $1
+                   GROUP BY vehicle_cd
+               ) latest ON d.vehicle_cd = latest.vehicle_cd
+                       AND d.data_date_time = latest.max_dt
+               WHERE d.tenant_id = $1
+                 AND ($2::TEXT IS NULL OR d.address_disp_p = $2)
+                 AND ($3::INTEGER IS NULL OR d.branch_cd = $3)
+                 AND ($4::INTEGER[] IS NULL OR array_length($4, 1) IS NULL OR d.vehicle_cd = ANY($4))
+               ORDER BY d.vehicle_cd"#;
+
+    /// ある日時の行 (車両CD で絞れる)。$1 tenant_id / $2 data_date_time / $3 車両CD (NULL 可)。
+    pub const DTAKOLOGS_AT: &str = r#"SELECT gps_direction, gps_latitude, gps_longitude, vehicle_cd,
+                      vehicle_name, driver_name, address_disp_c, data_date_time,
+                      address_disp_p, sub_driver_cd, all_state, recive_type_color_name,
+                      all_state_ex, state2, all_state_font_color, speed
+               FROM alc_api.dtakologs
+               WHERE tenant_id = $1 AND data_date_time = $2
+                 AND ($3::INTEGER IS NULL OR vehicle_cd = $3)
+               ORDER BY data_date_time DESC"#;
+
+    /// 日時の範囲の行 (新しい順)。$1 tenant_id / $2 始め / $3 終わり (どちらも timestamptz として読める文字列) /
+    /// $4 車両CD (NULL 可)。
+    pub const DTAKOLOGS_RANGE: &str = r#"SELECT gps_direction, gps_latitude, gps_longitude, vehicle_cd,
+                      vehicle_name, driver_name, address_disp_c, data_date_time,
+                      address_disp_p, sub_driver_cd, all_state, recive_type_color_name,
+                      all_state_ex, state2, all_state_font_color, speed
+               FROM alc_api.dtakologs
+               WHERE tenant_id = $1
+                 AND data_date_time::timestamptz >= $2::timestamptz
+                 AND data_date_time::timestamptz <= $3::timestamptz
+                 AND ($4::INTEGER IS NULL OR vehicle_cd = $4)
+               ORDER BY data_date_time DESC"#;
 }

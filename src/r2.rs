@@ -10,7 +10,7 @@
 
 use std::time::Duration;
 
-use alc_dtako_upload::store::{ObjectStore, Sleeper, StoreError};
+use alc_dtako_upload::store::{ListedObject, ObjectStore, Sleeper, StoreError};
 use futures_util::future::BoxFuture;
 use worker::send::{SendFuture, SendWrapper};
 use worker::{Bucket, Delay, HttpMetadata};
@@ -58,6 +58,31 @@ impl ObjectStore for R2Store {
                 .execute()
                 .await;
             put.map(|_| ()).map_err(|_| StoreError::new("put"))
+        }))
+    }
+
+    fn list<'a>(&'a self, prefix: &'a str) -> BoxFuture<'a, Result<Vec<ListedObject>, StoreError>> {
+        Box::pin(SendFuture::new(async move {
+            let mut out = Vec::new();
+            let mut cursor: Option<String> = None;
+            loop {
+                let mut list = self.0.list().prefix(prefix);
+                if let Some(c) = cursor.take() {
+                    list = list.cursor(c);
+                }
+                let page = list.execute().await.map_err(|_| StoreError::new("list"))?;
+                for object in page.objects() {
+                    // 囲みの `"` の無い ETag (`http_etag()` は引用符付き)
+                    out.push(ListedObject {
+                        key: object.key(),
+                        etag: Some(object.etag()),
+                    });
+                }
+                match (page.truncated(), page.cursor()) {
+                    (true, Some(c)) => cursor = Some(c),
+                    _ => return Ok(out),
+                }
+            }
         }))
     }
 }

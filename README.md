@@ -4,9 +4,9 @@
 rust-alc-api を Cloudflare Workers へ段階移行する 2 本目 (Refs ippoan/rust-alc-api#725) で、型は 1 本目の
 ippoan/alc-vein-worker に合わせている。
 
-口は 14 本 (どれも `/api` 付きでも受ける): **`POST /upload`** (zip の取り込み)・**`POST /internal/rerun/{upload_id}`** (やり直し)・**`POST /split-csv/{upload_id}`** (アップロード 1 件の分割)・
+口は 16 本 (どれも `/api` 付きでも受ける): **`POST /upload`** (zip の取り込み)・**`POST /internal/rerun/{upload_id}`** (やり直し)・**`POST /split-csv/{upload_id}`** (アップロード 1 件の分割)・
 **`POST /split-csv-all`** (一括分割)・**`POST /recalculate`** (月の全員の再計算)・**`POST /recalculate-driver`** (乗務員 1 人の再計算)・
-**`POST /recalculate-drivers`** (乗務員の一括の再計算)・**`POST /recalculate-pending`** (日別の要再計算の印の付いた 乗務員 × 月 の再計算) と、履歴の読み取りの **`GET /uploads`**・**`GET /internal/pending`**・**`GET /internal/download/{upload_id}`**、機械の取り込みの **`POST /dtako-logs/bulk`**・**`POST /dvr/notifications`**・**`POST /dvr/files/{id}`** (W5a。下の「機械の取り込み」)。それ以外の path は、
+**`POST /recalculate-drivers`** (乗務員の一括の再計算)・**`POST /recalculate-pending`** (日別の要再計算の印の付いた 乗務員 × 月 の再計算) と、履歴の読み取りの **`GET /uploads`**・**`GET /internal/pending`**・**`GET /internal/download/{upload_id}`**、機械の取り込みの **`POST /dtako-logs/bulk`**・**`POST /dvr/notifications`**・**`POST /dvr/files/{id}`** (W5a。下の「機械の取り込み」)、勤怠向けの読み取りの **`GET /dtako/events`**・**`GET /dtako/events/etags`** (W5b。下の「勤怠向けの読み取り」)。それ以外の path は、
 tenant ヘッダー無しが 401・有りが 404 (どのリクエストも、その前に DB へ繋ぐので、繋げなければ 503 / 500)。
 アップロード (`/upload`)・分割の 2 口・やり直しの口・履歴の読み取りの 3 口・印の再計算の口 (`/api/recalculate-pending`。ippoan/auth-worker#617) は、
 auth-worker の振り分けから呼ばれる。再計算の 3 口は、まだ振り分けに無い (呼ばれない)。
@@ -576,3 +576,16 @@ rust-alc-api から移した 3 口 (Refs ippoan/rust-alc-api#680)。**入力・�
 | `POST /dtako-logs/bulk` | nuxt-dtako-admin の dtako-scraper-relay (RPC `forwardAlcTenantData`) | 車両の現在地のログ (PascalCase の JSON の配列) を `dtakologs` に upsert。500 行ずつ、全部を 1 つの transaction で。空の配列は 0 件で返す。応答 `{success, records_added, total_records, message}` |
 | `POST /dvr/notifications` | 同 relay (内部用 proxy、shared-secret) | DVR の動画通知 (`{items}`、1〜200 件) を `dvr_notifications` に起票。検査に通らない行が 1 つでも在れば 400。応答 `{inserted, skipped, pending}` (`pending` = 実体をまだ取りに行くべき行) |
 | `POST /dvr/files/{id}` | 同上 | `.vdf` の生のバイト列 (32MB まで) を `{tenant_id}/dvr/{serial_no}/{file_name}` に置き、行を `stored` にする。`{id}` はヘッダーのテナントの行だけ (違えば 404)。大きすぎる = 413 (`failed`)・body が壊れた = 400・置けない = 502 (どれも試行回数を進め、固定の語を `last_error` に残す) |
+
+## 勤怠向けの読み取り (W5b)
+
+rust-alc-api から移した 2 口 (Refs ippoan/rust-alc-api#680)。呼び手は rust-ichibanboshi の勤怠 Worker (auth-worker の `KintaiAlcEntrypoint` の RPC)。
+**応答の形・status・本文・期間の上限・ページの大きさ・並び・ETag の形は rust-alc-api の `alc_dtako::dtako_events` と同じ**。
+
+| 口 | 中身 |
+|---|---|
+| `GET /dtako/events?driver_cd=&date_from=&date_to=` | 乗務員 1 人 (期間 366 日まで)。期間を前後 1 日広げた分割済みの運行 (同じ運行NO は crew_role の小さい方) の KUDGIVT.csv を `{headers, rows}` のまま返す。読めない運行は `warnings` |
+| `GET /dtako/events?date_from=&date_to=[&page_size=&after_driver_cd=]` | 全乗務員 (31 日まで)。乗務員CD の keyset のページ (既定 25・1〜50)。相乗りの運行の実体は 1 回だけ読む |
+| `GET /dtako/events/etags?date_from=&date_to=` | CSV を読まずに、運行の在る日 (`{tenant}/unko/{YYMMDD}`) だけ LIST して運行NO → ETag (40 日まで)。LIST に無い運行は `etag: null`、未分割の運行は `unsplit` (500 件まで)・`unsplit_total`。**ETag は引用符の無い MD5 (R2 の binding の `etag()`)。勤怠の月の指紋の入力なので形を変えない** |
+
+保存先の同時の読みは Workers の同時接続の上限 (6) に合わせる (rust は 16)。失敗の本文は `internal error` (DB・LIST)、ログは `<段> failed: db (<kind>)`。

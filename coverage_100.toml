@@ -46,6 +46,13 @@ path = "crates/alc-dtako-upload/src/timing.rs"
 [[files]]
 path = "crates/alc-dtako-upload/src/routes.rs"
 
+# 機械の取り込みの入力の型と応答 (車両の現在地のログ) と、DVR の検査・body の読み (tests/machine_flow.rs が口から通す。W5a)
+[[files]]
+path = "crates/alc-dtako-upload/src/logs.rs"
+
+[[files]]
+path = "crates/alc-dtako-upload/src/dvr.rs"
+
 # --- 共通の計算 crate 2 つ (正本はこの repo。ippoan/rust-alc-api 79029aa の coverage_100.toml から登録を写した。Refs ippoan/rust-alc-api#736) ---
 # 計測は crate ごとに別の回 (`cargo llvm-cov -p alc-compare` / `-p alc-csv-parser`。ci.yml)。crate 自身のテストだけで 100% にする。
 

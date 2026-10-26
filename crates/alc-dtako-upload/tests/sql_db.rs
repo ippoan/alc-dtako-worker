@@ -220,6 +220,8 @@ async fn connection_without_tenant_reads_no_rows() {
         "INSERT INTO dtako_daily_work_hours (tenant_id, driver_id, work_date) SELECT $1, id, DATE '2026-03-02' FROM employees WHERE tenant_id = $1",
         "INSERT INTO dtako_daily_work_segments (tenant_id, driver_id, work_date, unko_no, start_at, end_at, work_minutes) SELECT $1, id, DATE '2026-03-02', '3001', now(), now(), 0 FROM employees WHERE tenant_id = $1",
         "INSERT INTO dtako_daily_recalc_pending (tenant_id, driver_id, month) SELECT $1, id, DATE '2026-03-01' FROM employees WHERE tenant_id = $1",
+        "INSERT INTO dtakologs (tenant_id, data_date_time, vehicle_cd) VALUES ($1, '2026-03-02T09:00:00+09:00', 1)",
+        "INSERT INTO dvr_notifications (tenant_id, serial_no, file_name) VALUES ($1, 'SN-1', 'a.vdf')",
     ] {
         assert_eq!(exec(c, t, insert).await, 1);
     }

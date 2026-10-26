@@ -14,6 +14,8 @@
 //! - `POST /split-csv-all` → 未分割の運行が在るテナントの、分割の元にできるアップロードを新しい順に
 //!   最大 [`SPLIT_CSV_ALL_LIMIT`] 件、1 件ずつ分割し直す。応答は `text/event-stream` (1 件ごとに `progress`、終わりに `done`)
 //!
+//! - `GET /dtako/events` → 期間内の分割済みの運行の KUDGIVT.csv を `{headers, rows}` のまま返す (乗務員 1 人 / 全乗務員の keyset のページ)
+//! - `GET /dtako/events/etags` → CSV を読まずに LIST だけで運行NO → ETag の一覧 ([`crate::events`]。この 2 つは失敗の本文が文字列)
 //! - `POST /dtako-logs/bulk` (JSON の配列) → 車両の現在地のログを一括 upsert する ([`crate::logs`]。応答は rust-alc-api と同じ形)
 //! - `POST /dvr/notifications` (JSON `{items}`) → DVR の動画通知を起票し、実体を取りに行くべき行を返す ([`crate::dvr`])
 //! - `POST /dvr/files/{id}` (生のバイト列) → `.vdf` を保存先に置き、行を `stored` にする
@@ -47,6 +49,7 @@ use crate::dvr::{
     r2_key, read_capped, validate, DvrFileStoredResponse, DvrIngestBody, DvrIngestResponse,
     ReadError, ERROR_BODY_STREAM, ERROR_STORE, ERROR_TOO_LARGE, MAX_BATCH_ITEMS,
 };
+use crate::events::{collect_etags, collect_events, EtagsQuery, EventsError, EventsQuery};
 use crate::ingest::{ingest_upload, rerun_upload, IngestError, IngestLimits, IngestOutcome};
 use crate::logs::{BulkUpsertResponse, DtakologInput};
 use crate::pg::{self, PendingUploadRow, UploadRow};
@@ -123,6 +126,8 @@ pub fn tenant_router_with(limits: IngestLimits) -> Router<DtakoState> {
             post(dvr_notifications).layer(DefaultBodyLimit::max(UPLOAD_BODY_LIMIT)),
         )
         .route("/dvr/files/{id}", post(dvr_file))
+        .route("/dtako/events", get(dtako_events))
+        .route("/dtako/events/etags", get(dtako_events_etags))
 }
 
 type ApiError = (StatusCode, Json<Value>);
@@ -763,4 +768,40 @@ async fn dvr_file(
         size,
         r2_key: key,
     }))
+}
+
+// ---- 勤怠向けの読み取り (W5b、Refs ippoan/rust-alc-api#680) ----
+
+/// rust-alc-api の `compute_error_to_response` と同じ (status と本文の文字列)。
+fn events_error(e: EventsError) -> (StatusCode, String) {
+    match e {
+        EventsError::BadRequest(m) => (StatusCode::BAD_REQUEST, m),
+        EventsError::NotFound(m) => (StatusCode::NOT_FOUND, m),
+        EventsError::Internal => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal error".to_owned(),
+        ),
+    }
+}
+
+async fn dtako_events(
+    State(state): State<DtakoState>,
+    Extension(TenantId(tenant_id)): Extension<TenantId>,
+    Query(q): Query<EventsQuery>,
+) -> Result<Response, (StatusCode, String)> {
+    let resp = collect_events(&state, tenant_id, q)
+        .await
+        .map_err(events_error)?;
+    Ok(Json(resp).into_response())
+}
+
+async fn dtako_events_etags(
+    State(state): State<DtakoState>,
+    Extension(TenantId(tenant_id)): Extension<TenantId>,
+    Query(q): Query<EtagsQuery>,
+) -> Result<Response, (StatusCode, String)> {
+    let resp = collect_etags(&state, tenant_id, q)
+        .await
+        .map_err(events_error)?;
+    Ok(Json(resp).into_response())
 }

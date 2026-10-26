@@ -1572,3 +1572,182 @@ pub async fn dvr_mark_stored(
     })
     .await
 }
+
+// ---- 勤怠向けの読み取り (W5b、Refs ippoan/rust-alc-api#680) ----
+
+/// 期間内に運行が在る乗務員 1 人 ([`sql::LIST_EVENTS_DRIVERS`])。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventsDriver {
+    pub driver_id: Uuid,
+    pub driver_cd: String,
+    pub driver_name: String,
+}
+
+impl TxOutput for EventsDriver {}
+
+/// 分割済みの運行 1 行 ([`sql::LIST_EVENTS_OPERATIONS`]・[`sql::LIST_EVENTS_OPERATIONS_FOR_DRIVERS`])。
+/// 乗務員 1 人の版では `driver_id` は呼び手が渡した値。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventsOperation {
+    pub driver_id: Uuid,
+    pub unko_no: String,
+    pub crew_role: i32,
+    pub departure_at: Option<DateTime<Utc>>,
+    pub return_at: Option<DateTime<Utc>>,
+    pub r2_key_prefix: Option<String>,
+}
+
+impl TxOutput for EventsOperation {}
+
+/// 未分割の運行 1 行 ([`sql::LIST_UNSPLIT_OPERATIONS`])。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnsplitRow {
+    pub unko_no: String,
+    pub driver_cd: String,
+    pub reading_date: NaiveDate,
+}
+
+impl TxOutput for UnsplitRow {}
+
+/// [`sql::SELECT_EVENTS_DRIVER`] → `(id, name)`。
+pub async fn events_driver(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+    driver_cd: String,
+) -> Result<Option<(Uuid, String)>, tokio_postgres::Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            let row = tx
+                .query_typed_opt(
+                    sql::SELECT_EVENTS_DRIVER,
+                    &[(&tenant_id, Type::UUID), (&driver_cd, Type::TEXT)],
+                )
+                .await?;
+            Ok(row.map(|r| (r.get(0), r.get(1))))
+        })
+    })
+    .await
+}
+
+fn events_operation(driver_id: Uuid, r: &tokio_postgres::Row, at: usize) -> EventsOperation {
+    EventsOperation {
+        driver_id,
+        unko_no: r.get(at),
+        crew_role: r.get(at + 1),
+        departure_at: r.get(at + 2),
+        return_at: r.get(at + 3),
+        r2_key_prefix: r.get(at + 4),
+    }
+}
+
+/// [`sql::LIST_EVENTS_OPERATIONS`]。`from`・`to` は広げた後の期間。
+pub async fn events_operations(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+    driver_id: Uuid,
+    from: NaiveDate,
+    to: NaiveDate,
+) -> Result<Vec<EventsOperation>, tokio_postgres::Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            let params: [(&(dyn tokio_postgres::types::ToSql + Sync), Type); 4] = [
+                (&tenant_id, Type::UUID),
+                (&driver_id, Type::UUID),
+                (&from, Type::DATE),
+                (&to, Type::DATE),
+            ];
+            let rows = tx.query_typed(sql::LIST_EVENTS_OPERATIONS, &params).await?;
+            Ok(rows
+                .iter()
+                .map(|r| events_operation(driver_id, r, 0))
+                .collect())
+        })
+    })
+    .await
+}
+
+/// [`sql::LIST_EVENTS_DRIVERS`]。`from`・`to` は広げた後の期間。
+pub async fn events_drivers(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+    from: NaiveDate,
+    to: NaiveDate,
+    after_driver_cd: Option<String>,
+    limit: i64,
+) -> Result<Vec<EventsDriver>, tokio_postgres::Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            let params: [(&(dyn tokio_postgres::types::ToSql + Sync), Type); 5] = [
+                (&tenant_id, Type::UUID),
+                (&from, Type::DATE),
+                (&to, Type::DATE),
+                (&after_driver_cd, Type::TEXT),
+                (&limit, Type::INT8),
+            ];
+            let rows = tx.query_typed(sql::LIST_EVENTS_DRIVERS, &params).await?;
+            let row = |r: tokio_postgres::Row| EventsDriver {
+                driver_id: r.get(0),
+                driver_cd: r.get(1),
+                driver_name: r.get(2),
+            };
+            Ok(rows.into_iter().map(row).collect())
+        })
+    })
+    .await
+}
+
+/// [`sql::LIST_EVENTS_OPERATIONS_FOR_DRIVERS`]。`from`・`to` は広げた後の期間。
+pub async fn events_operations_for_drivers(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+    driver_ids: Vec<Uuid>,
+    from: NaiveDate,
+    to: NaiveDate,
+) -> Result<Vec<EventsOperation>, tokio_postgres::Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            let params: [(&(dyn tokio_postgres::types::ToSql + Sync), Type); 4] = [
+                (&tenant_id, Type::UUID),
+                (&driver_ids, Type::UUID_ARRAY),
+                (&from, Type::DATE),
+                (&to, Type::DATE),
+            ];
+            let rows = tx
+                .query_typed(sql::LIST_EVENTS_OPERATIONS_FOR_DRIVERS, &params)
+                .await?;
+            Ok(rows
+                .iter()
+                .map(|r| events_operation(r.get(0), r, 1))
+                .collect())
+        })
+    })
+    .await
+}
+
+/// [`sql::LIST_UNSPLIT_OPERATIONS`]。`from`・`to` は広げた後の期間。
+pub async fn unsplit_operations(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+    from: NaiveDate,
+    to: NaiveDate,
+) -> Result<Vec<UnsplitRow>, tokio_postgres::Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            let params: [(&(dyn tokio_postgres::types::ToSql + Sync), Type); 3] = [
+                (&tenant_id, Type::UUID),
+                (&from, Type::DATE),
+                (&to, Type::DATE),
+            ];
+            let rows = tx
+                .query_typed(sql::LIST_UNSPLIT_OPERATIONS, &params)
+                .await?;
+            let row = |r: tokio_postgres::Row| UnsplitRow {
+                unko_no: r.get(0),
+                driver_cd: r.get(1),
+                reading_date: r.get(2),
+            };
+            Ok(rows.into_iter().map(row).collect())
+        })
+    })
+    .await
+}

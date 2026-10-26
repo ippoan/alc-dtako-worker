@@ -423,4 +423,65 @@ pub mod sql {
                last_error  = NULL,
                updated_at  = now()
          WHERE id = $1 AND tenant_id = $2"#;
+
+    // ---- 勤怠向けの読み取り `GET /dtako/events`・`GET /dtako/events/etags` (W5b、Refs ippoan/rust-alc-api#680) ----
+    // **rust-alc-api の `PgDtakoYTimeExportRepository` の 5 つの文と同じ** (期間は呼び手が ±1 日広げて渡す)。
+
+    /// 乗務員CD → 乗務員 (論理削除済みは除く)。$1 tenant_id / $2 driver_cd → id, name (無ければ 0 行)。
+    pub const SELECT_EVENTS_DRIVER: &str = "SELECT id, name FROM alc_api.employees \
+             WHERE tenant_id = $1 AND driver_cd = $2 AND deleted_at IS NULL \
+             LIMIT 1";
+
+    /// 乗務員 1 人の、期間内の分割済みの運行 (同じ運行NO が運転手と副運転手の両方に在れば crew_role の小さい方を 1 行)。
+    /// $1 tenant_id / $2 driver_id / $3 期間の始め / $4 期間の終わり → unko_no, crew_role, departure_at, return_at, r2_key_prefix。
+    pub const LIST_EVENTS_OPERATIONS: &str = "SELECT DISTINCT ON (unko_no) \
+                    unko_no, crew_role, departure_at, return_at, r2_key_prefix \
+             FROM alc_api.dtako_operations \
+             WHERE tenant_id = $1 \
+               AND driver_id = $2 \
+               AND (reading_date BETWEEN $3 AND $4 \
+                    OR operation_date BETWEEN $3 AND $4) \
+               AND has_kudgivt = TRUE \
+             ORDER BY unko_no, crew_role ASC, departure_at NULLS LAST";
+
+    /// 期間内に分割済みの運行が在る乗務員 (乗務員CD の順、keyset のページ)。
+    /// $1 tenant_id / $2 期間の始め / $3 期間の終わり / $4 この乗務員CD より後ろ (NULL 可) / $5 件数 → driver_id, driver_cd, driver_name。
+    pub const LIST_EVENTS_DRIVERS: &str =
+        "SELECT DISTINCT d.id AS driver_id, d.driver_cd, d.name AS driver_name \
+             FROM alc_api.dtako_operations o \
+             JOIN alc_api.employees d ON o.driver_id = d.id \
+             WHERE o.tenant_id = $1 \
+               AND (o.reading_date BETWEEN $2 AND $3 \
+                    OR o.operation_date BETWEEN $2 AND $3) \
+               AND o.has_kudgivt = TRUE \
+               AND d.deleted_at IS NULL \
+               AND d.driver_cd IS NOT NULL \
+               AND ($4::TEXT IS NULL OR d.driver_cd > $4) \
+             ORDER BY d.driver_cd \
+             LIMIT $5";
+
+    /// 乗務員たちの、期間内の分割済みの運行 (乗務員ごとに [`LIST_EVENTS_OPERATIONS`] と同じまとめ方)。
+    /// $1 tenant_id / $2 driver_id の配列 / $3 期間の始め / $4 期間の終わり →
+    /// driver_id, unko_no, crew_role, departure_at, return_at, r2_key_prefix。
+    pub const LIST_EVENTS_OPERATIONS_FOR_DRIVERS: &str = "SELECT DISTINCT ON (driver_id, unko_no) \
+                    driver_id, unko_no, crew_role, departure_at, return_at, r2_key_prefix \
+             FROM alc_api.dtako_operations \
+             WHERE tenant_id = $1 \
+               AND driver_id = ANY($2) \
+               AND (reading_date BETWEEN $3 AND $4 \
+                    OR operation_date BETWEEN $3 AND $4) \
+               AND has_kudgivt = TRUE \
+             ORDER BY driver_id, unko_no, crew_role ASC, departure_at NULLS LAST";
+
+    /// 期間内の、まだ分割されていない運行 (運行NO の順)。$1 tenant_id / $2 期間の始め / $3 期間の終わり →
+    /// unko_no, driver_cd, reading_date。
+    pub const LIST_UNSPLIT_OPERATIONS: &str = "SELECT o.unko_no, d.driver_cd, o.reading_date \
+             FROM alc_api.dtako_operations o \
+             JOIN alc_api.employees d ON o.driver_id = d.id \
+             WHERE o.tenant_id = $1 \
+               AND (o.reading_date BETWEEN $2 AND $3 \
+                    OR o.operation_date BETWEEN $2 AND $3) \
+               AND o.has_kudgivt = FALSE \
+               AND d.driver_cd IS NOT NULL \
+             ORDER BY o.unko_no";
 }

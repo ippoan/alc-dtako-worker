@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use alc_dtako_upload::split::{LogLevel, LogSink};
-use alc_dtako_upload::store::{ObjectStore, Sleeper, StoreError};
+use alc_dtako_upload::store::{ListedObject, ObjectStore, Sleeper, StoreError};
 use alc_dtako_upload::timing::Clock;
 use futures_util::future::BoxFuture;
 
@@ -33,6 +33,18 @@ pub struct FakeStore {
     get_fail_patterns: Mutex<Vec<(String, u32)>>,
     /// (key の一部, あと何回 PUT を失敗させるか)
     put_fail_patterns: Mutex<Vec<(String, u32)>>,
+    /// (prefix の一部, あと何回 LIST を失敗させるか)
+    list_fail_patterns: Mutex<Vec<(String, u32)>>,
+    /// LIST が呼ばれた prefix (呼ばれた順)
+    list_calls: Mutex<Vec<String>>,
+}
+
+/// 偽の保存先の ETag (中身から決まる値。R2 の ETag = 中身の MD5 の代わり)。
+pub fn fake_etag(bytes: &[u8]) -> String {
+    let sum = bytes.iter().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
+        (h ^ u64::from(*b)).wrapping_mul(0x100_0000_01b3)
+    });
+    format!("{sum:016x}")
 }
 
 /// `key` が当たる pattern のうち、回数が残っている最初のものを 1 回ぶん減らす。減らしたら true (= 今回は失敗させる)。
@@ -51,6 +63,19 @@ impl FakeStore {
             this.fail_puts(key, *n);
         }
         this
+    }
+
+    /// prefix に `needle` を含む LIST を、あと `n` 回失敗させる。
+    pub fn fail_lists_containing(&self, needle: &str, n: u32) {
+        self.list_fail_patterns
+            .lock()
+            .unwrap()
+            .push((needle.to_owned(), n));
+    }
+
+    /// LIST が呼ばれた prefix (呼ばれた順)。
+    pub fn list_calls(&self) -> Vec<String> {
+        self.list_calls.lock().unwrap().clone()
     }
 
     /// `key` への PUT を、あと `n` 回失敗させる。
@@ -186,6 +211,25 @@ impl ObjectStore for FakeStore {
             }
             self.seed(key, bytes, content_type);
             Ok(())
+        })
+    }
+
+    fn list<'a>(&'a self, prefix: &'a str) -> BoxFuture<'a, Result<Vec<ListedObject>, StoreError>> {
+        Box::pin(async move {
+            self.list_calls.lock().unwrap().push(prefix.to_owned());
+            if take_failure(&self.list_fail_patterns, prefix) {
+                return Err(StoreError::new("list"));
+            }
+            let objects = self.objects.lock().unwrap();
+            let listed = objects
+                .iter()
+                .filter(|(key, _)| key.starts_with(prefix))
+                .map(|(key, (bytes, _))| ListedObject {
+                    key: key.clone(),
+                    etag: Some(fake_etag(bytes)),
+                })
+                .collect();
+            Ok(listed)
         })
     }
 }

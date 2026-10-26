@@ -7,12 +7,14 @@
 //! - [`recalc`]: 再計算の流れ (月の全員・乗務員ごと)。分割の出力やアップロードの zip を読み、日別を計算し直して乗務員ごとに保存する (axum に依らない) と、その event
 //! - [`timing`]: 段ごとの所要を測って `Server-Timing` に載せる形にする (時計は差し込む)
 //! - [`store`]: 保存先 (R2) の抽象と PUT のやり直し (R2 を包む実装は直下の worker)
+//! - [`events`] (W5b): 勤怠向けの読み取り `GET /dtako/events`・`GET /dtako/events/etags` の組み立て
 //! - [`logs`] / [`dvr`]: 機械の取り込み (車両の現在地のログの一括 upsert・DVR の動画通知と実体) の入力の型・検査・応答の形 (W5a)
 //!
 //! tenant ヘッダーの layer (`alc_core_wasm::require_tenant_header`) は載せる側 (直下の worker) が掛ける。
 
 mod archive;
 pub mod dvr;
+pub mod events;
 pub mod ingest;
 pub mod logs;
 pub mod pg;

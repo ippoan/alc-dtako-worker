@@ -48,6 +48,14 @@ impl fmt::Display for StoreError {
 
 impl std::error::Error for StoreError {}
 
+/// LIST の 1 件。`etag` は囲みの `"` の無い生の ETag (単一パートの PUT なら中身の MD5。R2 の binding の `etag()`)。
+/// rust-alc-api の `alc_core::storage::ListedObject` と同じ形 (勤怠の月の指紋の入力になるので、形を変えない)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListedObject {
+    pub key: String,
+    pub etag: Option<String>,
+}
+
 /// 保存先 (key → bytes)。
 pub trait ObjectStore: Send + Sync {
     /// object を読む。無ければ `Ok(None)`。
@@ -60,6 +68,9 @@ pub trait ObjectStore: Send + Sync {
         bytes: Vec<u8>,
         content_type: &'a str,
     ) -> BoxFuture<'a, Result<(), StoreError>>;
+
+    /// `prefix` で始まる object を全部並べる (続きのページも辿る)。
+    fn list<'a>(&'a self, prefix: &'a str) -> BoxFuture<'a, Result<Vec<ListedObject>, StoreError>>;
 }
 
 /// 待ち (worker では `worker::Delay`、テストでは待たずに値を記録する偽物)。

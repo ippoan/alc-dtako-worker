@@ -610,3 +610,15 @@ rust-alc-api から移した 20 口 (Refs ippoan/rust-alc-api#680)。呼び手�
 | `GET /dtako-logs/{current,current/select,by-date,by-date-range}` | 車両の現在地のログ (画面の形 = PascalCase)。`by-date-range` は保存先のアーカイブ (`archive/alc_api/dtakologs/_manifest.json` の日付ごとの gzip の JSON Lines) も読み、日時・車両で 1 行にまとめる |
 
 DB はテナントでも絞って引く (RLS と同じ行)。失敗の本文に DB のエラー文を載せない (rust の `scraper/history` は載せていた。本文は `internal server error`)、ログは `<段> failed: db (<SQLSTATE>)`。
+
+## Y時間 export (W5c-2)
+
+rust-alc-api から移した 2 口 (Refs ippoan/rust-alc-api#680)。呼び手は nuxt-dtako-admin (Y時間 のページ・勤怠の行の組み立て)。
+**応答の形・status・本文・行の組み立ての規則は rust-alc-api の `alc_dtako::dtako_y_time_export` と同じ** (`builder`・`from_shifts`・`models`・`segments` は単体テストごと写した)。
+
+| 口 | 中身 |
+|---|---|
+| `GET /dtako/y-time-export?driver_cd=&from=&to=` | 乗務員 1 人の期間の Y時間 シートの行。期間を前後 1 日広げた分割済みの運行の KUDGIVT.csv を読み、休息で区切って 1 暦日 2 始業の規則で行にする。乗務員CD が無ければ 404、期間が逆なら 400。読めない運行・出発/帰着の欠けた運行は `warnings` |
+| `POST /dtako/y-time-rows` | 勤怠の勤務の列 (始業・終業 + 実働でない区間) から同じ行を返す計算だけの口 (DB も保存先も読まない)。検証の破れ・読めない body は 400。body の上限は 20MB |
+
+rust との違いは 2 つ: 保存先の同時の読みが 6 (rust は 16)・読めない運行の warning の括弧の中が固定の語 (`storage error: not found` など)。

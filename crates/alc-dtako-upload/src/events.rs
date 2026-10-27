@@ -158,7 +158,7 @@ pub fn validate_range(from: NaiveDate, to: NaiveDate, max_days: i64) -> Result<(
 }
 
 /// 運行の列挙は暦日を跨ぐ運行を落とさないよう前後 1 日ずつ広げる (rust の repo と同じ)。
-fn widened(from: NaiveDate, to: NaiveDate) -> (NaiveDate, NaiveDate) {
+pub(crate) fn widened(from: NaiveDate, to: NaiveDate) -> (NaiveDate, NaiveDate) {
     (from - Duration::days(1), to + Duration::days(1))
 }
 
@@ -215,7 +215,10 @@ struct PlannedOp {
 }
 
 /// key を同時 [`GET_CONCURRENCY`] 本で読む。戻りは入力と同じ順で、読めない理由は固定の語。
-async fn fetch_all(state: &DtakoState, keys: Vec<String>) -> Vec<Result<Vec<u8>, String>> {
+pub(crate) async fn fetch_all(
+    state: &DtakoState,
+    keys: Vec<String>,
+) -> Vec<Result<Vec<u8>, String>> {
     let store = &state.store;
     let mut fetched: Vec<(usize, Result<Vec<u8>, String>)> =
         stream::iter(keys.into_iter().enumerate())

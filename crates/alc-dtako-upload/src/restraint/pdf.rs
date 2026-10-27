@@ -1,11 +1,12 @@
 //! 拘束時間管理表の PDF (W5c-4、Refs ippoan/rust-alc-api#680)。
 //!
-//! - `GET /restraint-report/pdf?year=&month=&driver_id=` → PDF (`application/pdf`、添付)。`driver_id` が無ければ削除されていない全員
-//!   1. 乗務員を読み ([`pg::restraint_pdf_drivers`])、0 人なら 404 `ドライバーが見つかりません`
+//! - `GET /restraint-report/pdf?year=&month=&driver_id=` → PDF (`application/pdf`、添付)。`driver_id` が無ければ、その月に運行のある乗務員
+//!   (社員の全員ではない。乗務しない社員まで入れると約 400 人で Worker のメモリに収まらない)
+//!   1. 年月が日付にならなければ 400 `invalid year/month`。乗務員を読み ([`pg::restraint_pdf_drivers`])、0 人なら 404 `ドライバーが見つかりません`
 //!   2. 名前の空の乗務員を飛ばし、1 人ずつ帳票を組み立て (W5c-3 の [`super::report_for`]。失敗はその status と本文で返す)
 //!   3. まとめて描画する ([`alc_pdf::generate_pdf`])
-//! - `GET /restraint-report/pdf-stream?year=&month=` → event-stream。全員ぶんの進み具合 (`progress`) と、最後に PDF を base64 で
-//!   載せた `done` (乗務員を読めなければ `error` 1 つ)。帳票を組み立てられなかった乗務員は飛ばす
+//! - `GET /restraint-report/pdf-stream?year=&month=` → event-stream。その月に運行のある乗務員ぶんの進み具合 (`progress`) と、
+//!   最後に PDF を base64 で載せた `done` (年月の誤り・乗務員を読めなければ `error` 1 つ)。帳票を組み立てられなかった乗務員は飛ばす
 //!
 //! 形・status・本文・event の欄は rust-alc-api の `alc_dtako::dtako_restraint_report_pdf` と同じ (画面がそのまま読む)。
 //! rust は乗務員の列名 `name` を欄 `driver_name` で読もうとして常に 500 だった — ここは列を位置で読む。
@@ -23,6 +24,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::models::{DriverWithCd, RestraintReportResponse};
+use super::report::MonthRange;
 use super::{db_failed, report_for, ApiError};
 use crate::pg;
 use crate::routes::DtakoState;
@@ -73,9 +75,12 @@ pub(super) async fn restraint_report_pdf(
     Extension(TenantId(tenant_id)): Extension<TenantId>,
     Query(filter): Query<PdfFilter>,
 ) -> Result<Response, ApiError> {
+    let Some(range) = MonthRange::new(filter.year, filter.month) else {
+        return Err((StatusCode::BAD_REQUEST, "invalid year/month".to_owned()));
+    };
     let drivers = {
         let mut client = state.pg.lock().await;
-        pg::restraint_pdf_drivers(&mut client, tenant_id, filter.driver_id)
+        pg::restraint_pdf_drivers(&mut client, tenant_id, filter.driver_id, range)
             .await
             .map_err(|e| db_failed(&state, "pdf drivers", &e))?
     };
@@ -169,9 +174,15 @@ impl StreamRun {
     /// 次の 1 件を作る (出し終えたら `None`)。
     async fn step(&mut self) -> Option<PdfProgressEvent> {
         if let Phase::Start = self.phase {
+            let Some(range) = MonthRange::new(self.year, self.month) else {
+                self.phase = Phase::Finished;
+                let mut evt = PdfProgressEvent::new("error");
+                evt.message = Some("invalid year/month".to_owned());
+                return Some(evt);
+            };
             let read = {
                 let mut client = self.state.pg.lock().await;
-                pg::restraint_pdf_drivers(&mut client, self.tenant_id, None).await
+                pg::restraint_pdf_drivers(&mut client, self.tenant_id, None, range).await
             };
             match read {
                 Ok(drivers) => {

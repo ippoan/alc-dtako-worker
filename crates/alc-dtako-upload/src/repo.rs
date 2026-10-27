@@ -758,9 +758,13 @@ pub mod sql {
     /// 乗務員CD の在る乗務員 (論理削除済みは除く)。$1 tenant_id → id, driver_cd, name。
     pub const LIST_RESTRAINT_DRIVERS_WITH_CD: &str = "SELECT id, driver_cd, name FROM alc_api.employees WHERE tenant_id = $1 AND driver_cd IS NOT NULL AND deleted_at IS NULL";
 
-    /// PDF の乗務員の一覧。$1 tenant_id → id, driver_cd, name (乗務員CD 順)。
+    /// PDF の乗務員の一覧 = その月に運行のある乗務員。$1 tenant_id / $2 月初 / $3 月末 → id, driver_cd, name (乗務員CD 順)。
+    /// 社員の全員 (約 400 人。乗務しない社員を含む) を 1 ファイルにすると Worker のメモリ 128 MB に収まらず、空のページも出る。
     /// soft-delete 済み (重複統合で畳まれた敗者・退職者) を一覧に出さない (Refs ippoan/rust-alc-api#669)。
-    pub const LIST_RESTRAINT_PDF_DRIVERS: &str = "SELECT id, driver_cd, name FROM alc_api.employees WHERE tenant_id = $1 AND deleted_at IS NULL ORDER BY driver_cd";
+    pub const LIST_RESTRAINT_PDF_DRIVERS: &str = "SELECT DISTINCT e.id, e.driver_cd, e.name FROM alc_api.employees e \
+             INNER JOIN alc_api.dtako_operations op ON op.driver_id = e.id \
+             WHERE e.tenant_id = $1 AND e.deleted_at IS NULL AND op.operation_date BETWEEN $2 AND $3 \
+             ORDER BY e.driver_cd";
 
     /// PDF の乗務員 1 人。$1 tenant_id / $2 id → id, driver_cd, name。
     /// soft-delete 済みでも返す (退職者の過去の帳票を出し直せるように)。

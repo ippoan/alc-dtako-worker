@@ -223,6 +223,7 @@ async fn connection_without_tenant_reads_no_rows() {
         "INSERT INTO dtakologs (tenant_id, data_date_time, vehicle_cd) VALUES ($1, '2026-03-02T09:00:00+09:00', 1)",
         "INSERT INTO dvr_notifications (tenant_id, serial_no, file_name) VALUES ($1, 'SN-1', 'a.vdf')",
         "INSERT INTO dtako_scrape_history (tenant_id, target_date, comp_id) VALUES ($1, DATE '2026-03-02', 'C1')",
+        "INSERT INTO dtako_tickets (tenant_id, source_email_received_at, vehicle_name, error_kind, close_token) VALUES ($1, now(), 'TEST', 'TEST', 'TEST-TOKEN')",
     ] {
         assert_eq!(exec(c, t, insert).await, 1);
     }

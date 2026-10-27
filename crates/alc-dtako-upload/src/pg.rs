@@ -44,6 +44,7 @@ use crate::restraint::models::{
     DailyWorkHoursRow, DriverWithCd, OpTimesRow, ReportInputs, SegmentRow,
 };
 use crate::restraint::report::MonthRange;
+use crate::tickets::{Ticket, TicketCreate, TicketScrapedPatch};
 
 /// [`sql::SELECT_UPLOAD_ZIP_KEY`]。行が無い・`r2_zip_key` が NULL は、どちらも `Ok(None)`。
 pub async fn upload_zip_key(
@@ -2771,6 +2772,164 @@ pub async fn restraint_drivers_with_cd(
                     name: r.get(2),
                 })
                 .collect())
+        })
+    })
+    .await
+}
+
+// ---- 車両のエラーの起票 (`/dtako/tickets*`、W5c-5) ----
+
+impl TxOutput for Ticket {}
+
+/// 起票 1 行を位置で読む (列の並びは [`sql::SELECT_TICKET`])。
+fn ticket(r: tokio_postgres::Row) -> Ticket {
+    Ticket {
+        id: r.get(0),
+        tenant_id: r.get(1),
+        source: r.get(2),
+        source_email_subject: r.get(3),
+        source_email_from: r.get(4),
+        source_email_message_id: r.get(5),
+        source_email_received_at: r.get(6),
+        vehicle_name: r.get(7),
+        vehicle_code: r.get(8),
+        error_kind: r.get(9),
+        status: r.get(10),
+        comp_id: r.get(11),
+        unko_no: r.get(12),
+        operation_started_at: r.get(13),
+        operation_ended_at: r.get(14),
+        scraped_payload: r.get(15),
+        settings_zip_r2_key: r.get(16),
+        close_token: r.get(17),
+        closed_at: r.get(18),
+        closed_by: r.get(19),
+        raw_email_text: r.get(20),
+        created_at: r.get(21),
+        updated_at: r.get(22),
+    }
+}
+
+/// [`sql::INSERT_TICKET`]。
+pub async fn insert_ticket(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+    input: TicketCreate,
+) -> Result<Ticket, tokio_postgres::Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            let params: [Param; 10] = [
+                (&tenant_id, Type::UUID),
+                (&input.source, Type::TEXT),
+                (&input.source_email_subject, Type::TEXT),
+                (&input.source_email_from, Type::TEXT),
+                (&input.source_email_message_id, Type::TEXT),
+                (&input.source_email_received_at, Type::TIMESTAMPTZ),
+                (&input.vehicle_name, Type::TEXT),
+                (&input.vehicle_code, Type::TEXT),
+                (&input.error_kind, Type::TEXT),
+                (&input.raw_email_text, Type::TEXT),
+            ];
+            let row = tx.query_typed_one(sql::INSERT_TICKET, &params).await?;
+            Ok(ticket(row))
+        })
+    })
+    .await
+}
+
+/// [`sql::UPDATE_TICKET_SCRAPED`]。無ければ `Ok(None)`。
+pub async fn update_ticket_scraped(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+    id: Uuid,
+    input: TicketScrapedPatch,
+) -> Result<Option<Ticket>, tokio_postgres::Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            let params: [Param; 8] = [
+                (&tenant_id, Type::UUID),
+                (&id, Type::UUID),
+                (&input.comp_id, Type::TEXT),
+                (&input.unko_no, Type::TEXT),
+                (&input.operation_started_at, Type::TIMESTAMPTZ),
+                (&input.operation_ended_at, Type::TIMESTAMPTZ),
+                (&input.settings_zip_r2_key, Type::TEXT),
+                (&input.scraped_payload, Type::JSONB),
+            ];
+            let row = tx
+                .query_typed_opt(sql::UPDATE_TICKET_SCRAPED, &params)
+                .await?;
+            Ok(row.map(ticket))
+        })
+    })
+    .await
+}
+
+/// [`sql::COUNT_TICKETS`] と [`sql::LIST_TICKETS`] (同じ transaction で)。返すのは (総数, 1 ページぶん)。
+pub async fn list_tickets(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+    status: Option<String>,
+    vehicle_name: Option<String>,
+    limit: i64,
+    offset: i64,
+) -> Result<(i64, Vec<Ticket>), tokio_postgres::Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            let filter: [Param; 3] = [
+                (&tenant_id, Type::UUID),
+                (&status, Type::TEXT),
+                (&vehicle_name, Type::TEXT),
+            ];
+            let total: i64 = tx
+                .query_typed_one(sql::COUNT_TICKETS, &filter)
+                .await?
+                .get(0);
+            let params: [Param; 5] = [
+                (&tenant_id, Type::UUID),
+                (&status, Type::TEXT),
+                (&vehicle_name, Type::TEXT),
+                (&limit, Type::INT8),
+                (&offset, Type::INT8),
+            ];
+            let rows = tx.query_typed(sql::LIST_TICKETS, &params).await?;
+            Ok((total, rows.into_iter().map(ticket).collect()))
+        })
+    })
+    .await
+}
+
+/// [`sql::SELECT_TICKET`]。無ければ `Ok(None)`。
+pub async fn get_ticket(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+    id: Uuid,
+) -> Result<Option<Ticket>, tokio_postgres::Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            let params: [Param; 2] = [(&tenant_id, Type::UUID), (&id, Type::UUID)];
+            let row = tx.query_typed_opt(sql::SELECT_TICKET, &params).await?;
+            Ok(row.map(ticket))
+        })
+    })
+    .await
+}
+
+/// [`sql::CLOSE_TICKET_BY_TOKEN`]。token が無い・閉じ済みなら `Ok(None)`。
+/// transaction のテナントは呼び手のもの (関数が token から逆引きするので、絞りには使わない)。
+pub async fn close_ticket_by_token(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+    close_token: String,
+    closed_by: Option<String>,
+) -> Result<Option<Uuid>, tokio_postgres::Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            let params: [Param; 2] = [(&close_token, Type::TEXT), (&closed_by, Type::TEXT)];
+            let row = tx
+                .query_typed_one(sql::CLOSE_TICKET_BY_TOKEN, &params)
+                .await?;
+            Ok(row.get(0))
         })
     })
     .await

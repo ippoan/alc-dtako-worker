@@ -770,4 +770,90 @@ pub mod sql {
     /// soft-delete 済みでも返す (退職者の過去の帳票を出し直せるように)。
     pub const SELECT_RESTRAINT_PDF_DRIVER: &str =
         "SELECT id, driver_cd, name FROM alc_api.employees WHERE tenant_id = $1 AND id = $2";
+
+    // ---- 車両のエラーの起票 (`/dtako/tickets*`、W5c-5)。表は migration 115 の `dtako_tickets` ----
+    // 列は rust-alc-api の `DtakoTicket` の並び (crate::pg::ticket が位置で読む)
+
+    /// 起票。$1 tenant_id / $2 source / $3 件名 / $4 差出人 / $5 Message-ID / $6 受信日時 / $7 車両名 / $8 車両CD /
+    /// $9 エラーの種類 / $10 メールの本文 → 1 行。close_token は推測できない 64 桁の hex をここで作る
+    /// (`gen_random_uuid` は強い乱数。2 つを SHA-256 に通す。rust-alc-api は 32 byte の乱数の hex で、長さと字種は同じ)。
+    pub const INSERT_TICKET: &str = r#"INSERT INTO alc_api.dtako_tickets (
+                   tenant_id, source,
+                   source_email_subject, source_email_from, source_email_message_id,
+                   source_email_received_at,
+                   vehicle_name, vehicle_code, error_kind,
+                   raw_email_text, close_token)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+                   encode(sha256(convert_to(gen_random_uuid()::text || gen_random_uuid()::text, 'UTF8')), 'hex'))
+               RETURNING id, tenant_id, source,
+                   source_email_subject, source_email_from, source_email_message_id,
+                   source_email_received_at,
+                   vehicle_name, vehicle_code, error_kind, status,
+                   comp_id, unko_no,
+                   operation_started_at, operation_ended_at,
+                   scraped_payload, settings_zip_r2_key,
+                   close_token, closed_at, closed_by,
+                   raw_email_text, created_at, updated_at"#;
+
+    /// スクレイプの結果を反映し、`scraped` に進める (NULL の欄は変えない。無ければ 0 行)。
+    /// $1 tenant_id / $2 id / $3 comp_id / $4 unko_no / $5 運行の開始 / $6 運行の終了 / $7 設定 ZIP の key / $8 結果 (JSONB) → 1 行。
+    pub const UPDATE_TICKET_SCRAPED: &str = r#"UPDATE alc_api.dtako_tickets
+               SET comp_id              = COALESCE($3, comp_id),
+                   unko_no              = COALESCE($4, unko_no),
+                   operation_started_at = COALESCE($5, operation_started_at),
+                   operation_ended_at   = COALESCE($6, operation_ended_at),
+                   settings_zip_r2_key  = COALESCE($7, settings_zip_r2_key),
+                   scraped_payload      = COALESCE($8, scraped_payload),
+                   status               = 'scraped',
+                   updated_at           = now()
+               WHERE tenant_id = $1 AND id = $2
+               RETURNING id, tenant_id, source,
+                   source_email_subject, source_email_from, source_email_message_id,
+                   source_email_received_at,
+                   vehicle_name, vehicle_code, error_kind, status,
+                   comp_id, unko_no,
+                   operation_started_at, operation_ended_at,
+                   scraped_payload, settings_zip_r2_key,
+                   close_token, closed_at, closed_by,
+                   raw_email_text, created_at, updated_at"#;
+
+    /// 一覧の件数。$1 tenant_id / $2 status (NULL なら絞らない) / $3 車両名の部分一致 (NULL なら絞らない)。
+    pub const COUNT_TICKETS: &str = r#"SELECT COUNT(*) FROM alc_api.dtako_tickets
+               WHERE tenant_id = $1
+                 AND ($2::text IS NULL OR status = $2)
+                 AND ($3::text IS NULL OR vehicle_name ILIKE '%' || $3 || '%')"#;
+
+    /// 一覧 (受信の新しい順)。$1〜$3 は [`COUNT_TICKETS`] と同じ / $4 件数 / $5 飛ばす件数。
+    pub const LIST_TICKETS: &str = r#"SELECT id, tenant_id, source,
+                   source_email_subject, source_email_from, source_email_message_id,
+                   source_email_received_at,
+                   vehicle_name, vehicle_code, error_kind, status,
+                   comp_id, unko_no,
+                   operation_started_at, operation_ended_at,
+                   scraped_payload, settings_zip_r2_key,
+                   close_token, closed_at, closed_by,
+                   raw_email_text, created_at, updated_at
+               FROM alc_api.dtako_tickets
+               WHERE tenant_id = $1
+                 AND ($2::text IS NULL OR status = $2)
+                 AND ($3::text IS NULL OR vehicle_name ILIKE '%' || $3 || '%')
+               ORDER BY source_email_received_at DESC, id DESC
+               LIMIT $4 OFFSET $5"#;
+
+    /// 1 件。$1 tenant_id / $2 id → 1 行 (無ければ 0 行)。
+    pub const SELECT_TICKET: &str = r#"SELECT id, tenant_id, source,
+                   source_email_subject, source_email_from, source_email_message_id,
+                   source_email_received_at,
+                   vehicle_name, vehicle_code, error_kind, status,
+                   comp_id, unko_no,
+                   operation_started_at, operation_ended_at,
+                   scraped_payload, settings_zip_r2_key,
+                   close_token, closed_at, closed_by,
+                   raw_email_text, created_at, updated_at
+               FROM alc_api.dtako_tickets
+               WHERE tenant_id = $1 AND id = $2"#;
+
+    /// close_token で閉じる。$1 close_token / $2 閉じた人 (NULL 可) → 閉じた起票の id (無い・閉じ済みなら NULL)。
+    /// SECURITY DEFINER の関数 (migration 115) が token からテナントを逆引きする (呼び手のテナントでは絞らない。rust-alc-api と同じ)。
+    pub const CLOSE_TICKET_BY_TOKEN: &str = "SELECT alc_api.close_dtako_ticket_by_token($1, $2)";
 }

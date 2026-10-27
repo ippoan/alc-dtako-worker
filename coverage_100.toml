@@ -77,6 +77,17 @@ path = "crates/alc-dtako-upload/src/ytime/models.rs"
 [[files]]
 path = "crates/alc-dtako-upload/src/ytime/segments.rs"
 
+# 拘束時間の帳票の口・組み立て・CSV 比較 (tests/restraint_flow.rs が口から DB まで通し、組み立ての場合分けは単体テストが縛る。W5c-3)。
+# models.rs は型だけで実行行が無いので登録しない
+[[files]]
+path = "crates/alc-dtako-upload/src/restraint/mod.rs"
+
+[[files]]
+path = "crates/alc-dtako-upload/src/restraint/report.rs"
+
+[[files]]
+path = "crates/alc-dtako-upload/src/restraint/compare.rs"
+
 # --- 共通の計算 crate 2 つ (正本はこの repo。ippoan/rust-alc-api 79029aa の coverage_100.toml から登録を写した。Refs ippoan/rust-alc-api#736) ---
 # 計測は crate ごとに別の回 (`cargo llvm-cov -p alc-compare` / `-p alc-csv-parser`。ci.yml)。crate 自身のテストだけで 100% にする。
 

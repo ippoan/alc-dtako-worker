@@ -40,6 +40,10 @@ use uuid::Uuid;
 use crate::dvr::{DvrIngestResponse, DvrNotificationCreate, DvrPendingItem, MAX_FILE_ATTEMPTS};
 use crate::logs::{DtakologInput, CHUNK_SIZE, DEFAULT_DATA_DATE_TIME};
 use crate::repo::sql;
+use crate::restraint::models::{
+    DailyWorkHoursRow, DriverWithCd, OpTimesRow, ReportInputs, SegmentRow,
+};
+use crate::restraint::report::MonthRange;
 
 /// [`sql::SELECT_UPLOAD_ZIP_KEY`]。行が無い・`r2_zip_key` が NULL は、どちらも `Ok(None)`。
 pub async fn upload_zip_key(
@@ -2571,6 +2575,159 @@ pub async fn dtakologs(
                 }
             };
             Ok(rows.into_iter().map(dtakolog).collect())
+        })
+    })
+    .await
+}
+
+// ---- 拘束時間の帳票 (W5c-3、Refs ippoan/rust-alc-api#680) ----
+
+/// [`sql::SELECT_RESTRAINT_DRIVER_NAME`]。乗務員が無ければ `Ok(None)`。
+pub async fn restraint_driver_name(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+    driver_id: Uuid,
+) -> Result<Option<String>, tokio_postgres::Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            let row = tx
+                .query_typed_opt(
+                    sql::SELECT_RESTRAINT_DRIVER_NAME,
+                    &[(&driver_id, Type::UUID), (&tenant_id, Type::UUID)],
+                )
+                .await?;
+            Ok(row.map(|r| r.get(0)))
+        })
+    })
+    .await
+}
+
+/// 帳票 1 か月ぶんの入力 (区間・日別・前日の運転・年度の累計・運行日ごとの始業と終業) を 1 つの transaction で読む。
+/// 年度の累計は `range.fiscal` が無い (4 月) と読まずに 0。
+pub async fn restraint_inputs(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+    driver_id: Uuid,
+    range: MonthRange,
+) -> Result<ReportInputs, tokio_postgres::Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            let MonthRange {
+                month_start,
+                month_end,
+                prev_day,
+                fiscal,
+            } = range;
+            let month: [Param; 4] = [
+                (&tenant_id, Type::UUID),
+                (&driver_id, Type::UUID),
+                (&month_start, Type::DATE),
+                (&month_end, Type::DATE),
+            ];
+            let segments = tx
+                .query_typed(sql::LIST_RESTRAINT_SEGMENTS, &month)
+                .await?
+                .iter()
+                .map(|r| SegmentRow {
+                    work_date: r.get(0),
+                    unko_no: r.get(1),
+                    start_at: r.get(2),
+                    end_at: r.get(3),
+                    work_minutes: r.get(4),
+                    drive_minutes: r.get(5),
+                    cargo_minutes: r.get(6),
+                })
+                .collect();
+            let daily_work_hours = tx
+                .query_typed(sql::LIST_RESTRAINT_DAILY_WORK_HOURS, &month)
+                .await?
+                .iter()
+                .map(|r| DailyWorkHoursRow {
+                    work_date: r.get(0),
+                    start_time: r.get(1),
+                    total_work_minutes: r.get(2),
+                    total_rest_minutes: r.get(3),
+                    late_night_minutes: r.get(4),
+                    drive_minutes: r.get(5),
+                    cargo_minutes: r.get(6),
+                    overlap_drive_minutes: r.get(7),
+                    overlap_cargo_minutes: r.get(8),
+                    overlap_break_minutes: r.get(9),
+                    overlap_restraint_minutes: r.get(10),
+                    ot_late_night_minutes: r.get(11),
+                })
+                .collect();
+            let prev_day_drive = tx
+                .query_typed_opt(
+                    sql::SELECT_RESTRAINT_PREV_DAY_DRIVE,
+                    &[
+                        (&tenant_id, Type::UUID),
+                        (&driver_id, Type::UUID),
+                        (&prev_day, Type::DATE),
+                    ],
+                )
+                .await?
+                .map(|r| r.get(0));
+            let fiscal_cumulative = match fiscal {
+                Some((from, to)) => {
+                    let row = tx
+                        .query_typed_one(
+                            sql::SELECT_RESTRAINT_FISCAL_CUMULATIVE,
+                            &[
+                                (&tenant_id, Type::UUID),
+                                (&driver_id, Type::UUID),
+                                (&from, Type::DATE),
+                                (&to, Type::DATE),
+                            ],
+                        )
+                        .await?;
+                    row.get::<_, Option<i64>>(0).unwrap_or(0) as i32
+                }
+                None => 0,
+            };
+            let operation_times = tx
+                .query_typed(sql::LIST_RESTRAINT_OPERATION_TIMES, &month)
+                .await?
+                .iter()
+                .map(|r| OpTimesRow {
+                    operation_date: r.get(0),
+                    first_departure: r.get(1),
+                    last_seg_end: r.get(2),
+                })
+                .collect();
+            Ok(ReportInputs {
+                segments,
+                daily_work_hours,
+                prev_day_drive,
+                fiscal_cumulative,
+                operation_times,
+            })
+        })
+    })
+    .await
+}
+
+/// [`sql::LIST_RESTRAINT_DRIVERS_WITH_CD`]。
+pub async fn restraint_drivers_with_cd(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+) -> Result<Vec<DriverWithCd>, tokio_postgres::Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            let rows = tx
+                .query_typed(
+                    sql::LIST_RESTRAINT_DRIVERS_WITH_CD,
+                    &[(&tenant_id, Type::UUID)],
+                )
+                .await?;
+            Ok(rows
+                .iter()
+                .map(|r| DriverWithCd {
+                    id: r.get(0),
+                    driver_cd: r.get(1),
+                    name: r.get(2),
+                })
+                .collect())
         })
     })
     .await

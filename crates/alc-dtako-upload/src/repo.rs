@@ -703,4 +703,58 @@ pub mod sql {
                  AND data_date_time::timestamptz <= $3::timestamptz
                  AND ($4::INTEGER IS NULL OR vehicle_cd = $4)
                ORDER BY data_date_time DESC"#;
+
+    // ---- 拘束時間の帳票 `GET /restraint-report`・`POST /restraint-report/compare-csv` (W5c-3、Refs ippoan/rust-alc-api#680) ----
+    // **rust-alc-api の `PgDtakoRestraintReportRepository` の 7 つの文と同じ**。
+
+    /// 乗務員の名前。$1 driver_id / $2 tenant_id → name (無ければ 0 行)。
+    pub const SELECT_RESTRAINT_DRIVER_NAME: &str =
+        "SELECT name FROM alc_api.employees WHERE id = $1 AND tenant_id = $2";
+
+    /// 月の区間。$1 tenant_id / $2 driver_id / $3 月初 / $4 月末 →
+    /// work_date, unko_no, start_at, end_at, work_minutes, drive_minutes, cargo_minutes。
+    pub const LIST_RESTRAINT_SEGMENTS: &str = r#"SELECT work_date, unko_no, start_at, end_at, work_minutes, drive_minutes, cargo_minutes
+               FROM alc_api.dtako_daily_work_segments
+               WHERE tenant_id = $1 AND driver_id = $2
+                 AND work_date >= $3 AND work_date <= $4
+               ORDER BY work_date, start_at"#;
+
+    /// 月の日別。$1 tenant_id / $2 driver_id / $3 月初 / $4 月末 → work_date, start_time, total_work_minutes,
+    /// total_rest_minutes, late_night_minutes, drive_minutes, cargo_minutes, overlap_drive_minutes,
+    /// overlap_cargo_minutes, overlap_break_minutes, overlap_restraint_minutes, ot_late_night_minutes。
+    pub const LIST_RESTRAINT_DAILY_WORK_HOURS: &str = r#"SELECT work_date, start_time, total_work_minutes, total_rest_minutes, late_night_minutes,
+                      drive_minutes, cargo_minutes,
+                      overlap_drive_minutes, overlap_cargo_minutes,
+                      overlap_break_minutes, overlap_restraint_minutes,
+                      ot_late_night_minutes
+               FROM alc_api.dtako_daily_work_hours
+               WHERE tenant_id = $1 AND driver_id = $2
+                 AND work_date >= $3 AND work_date <= $4
+               ORDER BY work_date, start_time"#;
+
+    /// 前日の最初の区間の運転時間。$1 tenant_id / $2 driver_id / $3 前日 → drive_minutes (無ければ 0 行)。
+    pub const SELECT_RESTRAINT_PREV_DAY_DRIVE: &str = r#"SELECT drive_minutes FROM alc_api.dtako_daily_work_segments
+               WHERE tenant_id = $1 AND driver_id = $2 AND work_date = $3
+               ORDER BY start_at LIMIT 1"#;
+
+    /// 年度の始めから前月末までの拘束の合計。$1 tenant_id / $2 driver_id / $3 年度の始め / $4 前月末 → total (BIGINT)。
+    pub const SELECT_RESTRAINT_FISCAL_CUMULATIVE: &str = r#"SELECT COALESCE(SUM(total_work_minutes), 0)::BIGINT AS total
+               FROM alc_api.dtako_daily_work_hours
+               WHERE tenant_id = $1 AND driver_id = $2
+                 AND work_date >= $3 AND work_date <= $4"#;
+
+    /// 運行日ごとの始業 (最初の出発) と終業 (区間の最後の終わり)。$1 tenant_id / $2 driver_id / $3 月初 / $4 月末 →
+    /// operation_date, first_departure, last_seg_end。
+    pub const LIST_RESTRAINT_OPERATION_TIMES: &str = r#"SELECT o.operation_date,
+                      MIN(o.departure_at) AS first_departure,
+                      MAX(dws.end_at) AS last_seg_end
+               FROM alc_api.dtako_operations o
+               JOIN alc_api.dtako_daily_work_segments dws ON dws.driver_id = o.driver_id AND dws.unko_no = o.unko_no
+               WHERE o.tenant_id = $1 AND o.driver_id = $2
+                 AND o.operation_date >= $3 AND o.operation_date <= $4
+                 AND o.departure_at IS NOT NULL
+               GROUP BY o.operation_date"#;
+
+    /// 乗務員CD の在る乗務員 (論理削除済みは除く)。$1 tenant_id → id, driver_cd, name。
+    pub const LIST_RESTRAINT_DRIVERS_WITH_CD: &str = "SELECT id, driver_cd, name FROM alc_api.employees WHERE tenant_id = $1 AND driver_cd IS NOT NULL AND deleted_at IS NULL";
 }

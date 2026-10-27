@@ -85,7 +85,7 @@ jobs:
             | grep -Eq '^test result: ok\. 3 passed; 0 failed; 0 ignored'
           awk '/Running.*tests\/restraint_flow\.rs \(/{f=1} f && /^test result:/{print; exit}' "$RUNNER_TEMP/alc-dtako-upload-test.txt" \
             | grep -Eq '^test result: ok\. 8 passed; 0 failed; 0 ignored'
-          awk '/Running unittests src\/lib\.rs \(.*alc_pdf-/{f=1} f && /^test result:/{print; exit}' "$RUNNER_TEMP/alc-dtako-upload-test.txt" \
+          awk '/Running.*unittests src\/lib\.rs \(.*alc_pdf-/{f=1} f && /^test result:/{print; exit}' "$RUNNER_TEMP/alc-dtako-upload-test.txt" \
             | grep -Eq '^test result: ok\. 10 passed; 0 failed; 0 ignored'
           # -p を付けないと直下の package (worker) だけが対象になり、報告が空になる
           cargo llvm-cov report --locked -p alc-dtako-upload -p alc-pdf --text > "$RUNNER_TEMP/alc-dtako-upload-cov.txt"

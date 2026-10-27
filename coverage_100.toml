@@ -61,6 +61,22 @@ path = "crates/alc-dtako-upload/src/events.rs"
 [[files]]
 path = "crates/alc-dtako-upload/src/screen.rs"
 
+# Y時間 export の口と行の組み立て (tests/ytime_flow.rs が口から通し、組み立ての規則は rust-alc-api から写した単体テストが縛る。W5c-2)
+[[files]]
+path = "crates/alc-dtako-upload/src/ytime/mod.rs"
+
+[[files]]
+path = "crates/alc-dtako-upload/src/ytime/builder.rs"
+
+[[files]]
+path = "crates/alc-dtako-upload/src/ytime/from_shifts.rs"
+
+[[files]]
+path = "crates/alc-dtako-upload/src/ytime/models.rs"
+
+[[files]]
+path = "crates/alc-dtako-upload/src/ytime/segments.rs"
+
 # --- 共通の計算 crate 2 つ (正本はこの repo。ippoan/rust-alc-api 79029aa の coverage_100.toml から登録を写した。Refs ippoan/rust-alc-api#736) ---
 # 計測は crate ごとに別の回 (`cargo llvm-cov -p alc-compare` / `-p alc-csv-parser`。ci.yml)。crate 自身のテストだけで 100% にする。
 

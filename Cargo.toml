@@ -14,7 +14,7 @@ publish = false
 crate-type = ["cdylib"]
 
 [workspace]
-members = ["crates/alc-dtako-upload", "crates/alc-compare", "crates/alc-csv-parser"]
+members = ["crates/alc-dtako-upload", "crates/alc-compare", "crates/alc-csv-parser", "crates/alc-pdf"]
 
 # alc-core-wasm と alc-worker-db は ippoan/alc-worker-kit から引く (alc-core-wasm の正本は rust-alc-api から kit へ移した。
 # Refs ippoan/rust-alc-api#736)。git 依存・rev 固定で、**2 つとも同じ rev**。**書くのはここ 1 か所だけ**
@@ -30,6 +30,8 @@ alc-core-wasm = { git = "https://github.com/ippoan/alc-worker-kit", rev = "a256d
 alc-csv-parser = { path = "crates/alc-csv-parser", default-features = false }
 # 日別の集計の計算 (`upload_daily::compute_daily_hours`)。backend と同じ関数を呼ぶ
 alc-compare = { path = "crates/alc-compare" }
+# 拘束時間管理表の PDF の型と描画 (W5c-4。ippoan/rust-alc-api の 09b6c01 から写した。正本はこの repo)
+alc-pdf = { path = "crates/alc-pdf" }
 alc-worker-db = { git = "https://github.com/ippoan/alc-worker-kit", rev = "a256d2a84682d375dc649d3c4e0e2e91d38c17c2", features = ["chrono"] }
 
 # 使わない依存は入れない

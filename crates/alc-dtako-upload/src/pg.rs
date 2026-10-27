@@ -2707,6 +2707,41 @@ pub async fn restraint_inputs(
     .await
 }
 
+/// PDF の乗務員 (`driver_id` が在れば その 1 人、無ければ削除されていない全員を乗務員CD 順)。
+/// 列は位置で読む (rust-alc-api は列名 `name` を欄 `driver_name` で読もうとして 500 になっていた)。
+pub async fn restraint_pdf_drivers(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+    driver_id: Option<Uuid>,
+) -> Result<Vec<DriverWithCd>, tokio_postgres::Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            let rows = match driver_id {
+                Some(id) => {
+                    tx.query_typed(
+                        sql::SELECT_RESTRAINT_PDF_DRIVER,
+                        &[(&tenant_id, Type::UUID), (&id, Type::UUID)],
+                    )
+                    .await?
+                }
+                None => {
+                    tx.query_typed(sql::LIST_RESTRAINT_PDF_DRIVERS, &[(&tenant_id, Type::UUID)])
+                        .await?
+                }
+            };
+            Ok(rows
+                .iter()
+                .map(|r| DriverWithCd {
+                    id: r.get(0),
+                    driver_cd: r.get(1),
+                    name: r.get(2),
+                })
+                .collect())
+        })
+    })
+    .await
+}
+
 /// [`sql::LIST_RESTRAINT_DRIVERS_WITH_CD`]。
 pub async fn restraint_drivers_with_cd(
     pg: &mut PgClient,

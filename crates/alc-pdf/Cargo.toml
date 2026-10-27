@@ -1,0 +1,21 @@
+[package]
+name = "alc-pdf"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# 拘束時間管理表の PDF (型 `types` と printpdf の描画 `generate_pdf`)。ippoan/rust-alc-api の 09b6c01 の crates/alc-pdf を写した
+# (W5c-4、Refs ippoan/rust-alc-api#680)。正本はこの repo。フォントは NotoSansJP-Regular.ttf (SIL OFL 1.1、assets/fonts/OFL.txt) を同梱する。
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(coverage)'] }
+
+[dependencies]
+chrono = { version = "0.4", default-features = false, features = ["serde"] }
+# rust-alc-api の Cargo.lock と同じ版 (wasm32-unknown-unknown で動くことを ippoan/workers-rs-containers-lab の probe-unknown で確かめた版)
+printpdf = "=0.8.2"
+serde = { version = "1", features = ["derive"] }
+uuid = { version = "1", features = ["serde"] }
+
+[dev-dependencies]
+uuid = { version = "1", features = ["v4"] }

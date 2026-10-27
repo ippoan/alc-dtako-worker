@@ -10,7 +10,7 @@
 //! - [`events`] (W5b): 勤怠向けの読み取り `GET /dtako/events`・`GET /dtako/events/etags` の組み立て
 //! - [`screen`] (W5c-1): 画面向けの読み取り (乗務員・車両・日別・運行・CSV・変更記録・分類・スクレイプの履歴・車両の現在地のログ) と分類の更新
 //! - [`ytime`] (W5c-2): Y時間 export (`GET /dtako/y-time-export`・`POST /dtako/y-time-rows`)。行の組み立ては rust-alc-api から写した純粋な部分
-//! - [`restraint`] (W5c-3): 拘束時間の帳票 (`GET /restraint-report`・`POST /restraint-report/compare-csv`)。組み立ては rust-alc-api から写した純粋な部分
+//! - [`restraint`] (W5c-3・W5c-4): 拘束時間の帳票 (`GET /restraint-report`・`POST /restraint-report/compare-csv`) と その PDF (`GET /restraint-report/pdf`・`GET /restraint-report/pdf-stream`)。組み立ては rust-alc-api から写した純粋な部分、描画は `alc_pdf`
 //! - [`logs`] / [`dvr`]: 機械の取り込み (車両の現在地のログの一括 upsert・DVR の動画通知と実体) の入力の型・検査・応答の形 (W5a)
 //!
 //! tenant ヘッダーの layer (`alc_core_wasm::require_tenant_header`) は載せる側 (直下の worker) が掛ける。

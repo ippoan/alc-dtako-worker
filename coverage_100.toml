@@ -93,6 +93,10 @@ path = "crates/alc-dtako-upload/src/restraint/compare.rs"
 [[files]]
 path = "crates/alc-dtako-upload/src/restraint/pdf.rs"
 
+# 車両のエラーの起票の口 (tests/tickets_flow.rs が組み込みの PostgreSQL で通す。W5c-5)
+[[files]]
+path = "crates/alc-dtako-upload/src/tickets.rs"
+
 # --- 共通の計算 crate 2 つ (正本はこの repo。ippoan/rust-alc-api 79029aa の coverage_100.toml から登録を写した。Refs ippoan/rust-alc-api#736) ---
 # 計測は crate ごとに別の回 (`cargo llvm-cov -p alc-compare` / `-p alc-csv-parser`。ci.yml)。crate 自身のテストだけで 100% にする。
 

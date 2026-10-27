@@ -90,6 +90,7 @@ impl Ctx {
     }
 
     /// 区間 1 行。日時は `+00` の壁時計 (取り込みは JST の壁時計を UTC として保存する)。
+    #[allow(clippy::too_many_arguments)]
     async fn segment(
         &self,
         t: Uuid,
@@ -456,7 +457,8 @@ async fn compare_csv_matches_drivers() {
     assert_eq!(rows[0]["system"]["total_drive"], "1:00");
     assert_eq!(
         rows[0]["diffs"],
-        json!([{"date": "2月2日", "field": "運転", "csv_val": "1:30", "sys_val": "1:00", "known_bug": null}])
+        // known_bug は無ければ欄ごと出ない (alc-compare の skip_serializing_if)
+        json!([{"date": "2月2日", "field": "運転", "csv_val": "1:30", "sys_val": "1:00"}])
     );
     assert_eq!(
         (

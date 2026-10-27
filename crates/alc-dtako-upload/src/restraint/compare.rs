@@ -141,3 +141,111 @@ pub fn compare_result(
         unknown_diffs,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alc_compare::CsvDayRow;
+
+    fn csv_day(date: &str, is_holiday: bool, drive: &str) -> CsvDayRow {
+        CsvDayRow {
+            date: date.to_string(),
+            is_holiday,
+            start_time: String::new(),
+            end_time: String::new(),
+            drive: drive.to_string(),
+            overlap_drive: String::new(),
+            cargo: String::new(),
+            overlap_cargo: String::new(),
+            break_time: String::new(),
+            overlap_break: String::new(),
+            subtotal: String::new(),
+            overlap_subtotal: String::new(),
+            total: String::new(),
+            cumulative: String::new(),
+            rest: String::new(),
+            actual_work: String::new(),
+            overtime: String::new(),
+            late_night: String::new(),
+            ot_late_night: String::new(),
+            remarks: String::new(),
+        }
+    }
+
+    fn sys_day(date: &str, drive: &str) -> SystemDayRow {
+        SystemDayRow {
+            date: date.to_string(),
+            start_time: String::new(),
+            end_time: String::new(),
+            drive: drive.to_string(),
+            overlap_drive: String::new(),
+            cargo: String::new(),
+            overlap_cargo: String::new(),
+            subtotal: String::new(),
+            overlap_subtotal: String::new(),
+            total: String::new(),
+            cumulative: String::new(),
+            actual_work: String::new(),
+            overtime: String::new(),
+            late_night: String::new(),
+        }
+    }
+
+    #[test]
+    fn detect_diffs_matched_skips_holidays_and_missing_days() {
+        // 休日行・システムに無い日は比べない。同じ日付が 2 行あれば順に当てる。前後の空白は無視
+        let csv = vec![
+            csv_day("2月1日", true, ""),
+            csv_day("2月2日", false, "5:00"),
+            csv_day("2月2日", false, "3:00"),
+            csv_day("2月3日", false, "4:00"),
+            csv_day("2月4日", false, " 2:00 "),
+        ];
+        let sys = vec![
+            sys_day("2月1日", "9:99"),
+            sys_day("2月2日", "5:00"),
+            sys_day("2月2日", "3:30"),
+            sys_day("2月4日", "2:00"),
+        ];
+        let diffs = detect_diffs_matched(&csv, &sys);
+        assert_eq!(diffs.len(), 1);
+        assert_eq!(
+            (
+                diffs[0].date.as_str(),
+                diffs[0].field.as_str(),
+                diffs[0].csv_val.as_str(),
+                diffs[0].sys_val.as_str()
+            ),
+            ("2月2日", "運転", "3:00", "3:30")
+        );
+        assert!(diffs[0].known_bug.is_none());
+    }
+
+    #[test]
+    fn csv_year_month_reads_the_first_date() {
+        let driver = |days: Vec<CsvDayRow>| CsvDriverData {
+            driver_name: String::new(),
+            driver_cd: String::new(),
+            days,
+            total_drive: String::new(),
+            total_cargo: String::new(),
+            total_break: String::new(),
+            total_restraint: String::new(),
+            total_actual_work: String::new(),
+            total_overtime: String::new(),
+            total_late_night: String::new(),
+            total_ot_late_night: String::new(),
+        };
+        assert_eq!(
+            csv_year_month(&[driver(vec![csv_day("3月1日", true, "")])]),
+            (2026, 3)
+        );
+        // 読めなければ 2026 年 1 月
+        assert_eq!(
+            csv_year_month(&[driver(vec![csv_day("x月1日", true, "")])]),
+            (2026, 1)
+        );
+        assert_eq!(csv_year_month(&[driver(vec![])]), (2026, 1));
+        assert_eq!(csv_year_month(&[]), (2026, 1));
+    }
+}

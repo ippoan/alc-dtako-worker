@@ -355,3 +355,113 @@ fn push_weekly_if_needed(
         });
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    fn date(y: i32, m: u32, d: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(y, m, d).unwrap()
+    }
+
+    #[test]
+    fn month_range_covers_the_month_and_the_fiscal_year() {
+        // 12 月は翌年の 1/1 の前日が月末。年度の累計は 4/1 〜 11/30
+        let dec = MonthRange::new(2025, 12).unwrap();
+        assert_eq!(
+            dec,
+            MonthRange {
+                month_start: date(2025, 12, 1),
+                month_end: date(2025, 12, 31),
+                prev_day: date(2025, 11, 30),
+                fiscal: Some((date(2025, 4, 1), date(2025, 11, 30))),
+            }
+        );
+        // 1 月の年度は前年の 4/1 から
+        assert_eq!(
+            MonthRange::new(2026, 1).unwrap().fiscal,
+            Some((date(2025, 4, 1), date(2025, 12, 31)))
+        );
+        // 4 月は年度の始めなので累計を読まない
+        assert_eq!(MonthRange::new(2026, 4).unwrap().fiscal, None);
+        // 日付にならない年月
+        assert_eq!(MonthRange::new(2026, 13), None);
+        assert_eq!(MonthRange::new(2026, 0), None);
+        // 翌月が日付の範囲を超える
+        assert_eq!(MonthRange::new(NaiveDate::MAX.year(), 12), None);
+    }
+
+    /// 前日の運転が無い (`None`) と、1 日目の前運転平均は当日の運転そのもの・`drive_avg_before` は無し。
+    #[test]
+    fn first_day_without_prev_drive_uses_its_own_drive() {
+        let range = MonthRange::new(2026, 2).unwrap();
+        let at = |h: u32| Utc.with_ymd_and_hms(2026, 2, 1, h, 0, 0).unwrap();
+        let inputs = ReportInputs {
+            segments: vec![SegmentRow {
+                work_date: date(2026, 2, 1),
+                unko_no: "U1".to_owned(),
+                start_at: at(8),
+                end_at: at(17),
+                work_minutes: 540,
+                drive_minutes: 300,
+                cargo_minutes: 60,
+            }],
+            ..ReportInputs::default()
+        };
+        let r = build_report(Uuid::nil(), "名前", 2026, 2, range, &inputs);
+        let day1 = &r.days[0];
+        assert_eq!(
+            (day1.start_time.as_deref(), day1.end_time.as_deref()),
+            (Some("8:00"), Some("17:00"))
+        );
+        assert_eq!(day1.drive_avg_before, None);
+        assert_eq!(day1.drive_average_minutes, 300.0);
+        // 翌日 (休み) の運転は 0 なので後運転平均は半分
+        assert_eq!(day1.drive_avg_after, Some(150));
+        // 実働 360 は 8 時間未満なので時間外なし
+        assert_eq!(day1.overtime_minutes, 0);
+        assert_eq!(r.max_restraint_minutes, MAX_RESTRAINT_MINUTES);
+        assert_eq!(r.weekly_subtotals.len(), 1);
+        assert_eq!(r.monthly_total.restraint_minutes, 540);
+    }
+
+    /// 実働が 8 時間を超えた分が時間外。時間外深夜の分は時間外から引く。
+    #[test]
+    fn overtime_excludes_overtime_late_night() {
+        let range = MonthRange::new(2026, 2).unwrap();
+        let inputs = ReportInputs {
+            segments: vec![SegmentRow {
+                work_date: date(2026, 2, 3),
+                unko_no: "U1".to_owned(),
+                start_at: Utc.with_ymd_and_hms(2026, 2, 3, 1, 0, 0).unwrap(),
+                end_at: Utc.with_ymd_and_hms(2026, 2, 3, 15, 0, 0).unwrap(),
+                work_minutes: 840,
+                drive_minutes: 500,
+                cargo_minutes: 100,
+            }],
+            daily_work_hours: vec![DailyWorkHoursRow {
+                work_date: date(2026, 2, 3),
+                start_time: chrono::NaiveTime::from_hms_opt(1, 0, 0).unwrap(),
+                total_work_minutes: 840,
+                total_rest_minutes: Some(0),
+                late_night_minutes: 0,
+                drive_minutes: 500,
+                cargo_minutes: 100,
+                overlap_drive_minutes: 0,
+                overlap_cargo_minutes: 0,
+                overlap_break_minutes: 0,
+                overlap_restraint_minutes: 0,
+                ot_late_night_minutes: 30,
+            }],
+            prev_day_drive: Some(200),
+            ..ReportInputs::default()
+        };
+        let r = build_report(Uuid::nil(), "", 2026, 2, range, &inputs);
+        let day = &r.days[2];
+        assert_eq!(day.actual_work_minutes, 600);
+        assert_eq!(day.overtime_minutes, 90);
+        // 休息 0 は載せない
+        assert_eq!(day.rest_period_minutes, None);
+    }
+}

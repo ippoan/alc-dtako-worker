@@ -24,6 +24,7 @@
 //!   `/internal/operations`・`/dtako/operation-changes`・`/event-classifications/*`・`/scraper/history`・`/dtako-logs/*` の読み取り) は
 //!   [`crate::screen`] (W5c-1)
 //! - Y時間 export (`GET /dtako/y-time-export`・`POST /dtako/y-time-rows`) は [`crate::ytime`] (W5c-2)
+//! - 拘束時間の帳票 (`GET /restraint-report`・`POST /restraint-report/compare-csv`) は [`crate::restraint`] (W5c-3)
 //!
 //! 認可は `TenantId` の Extension だけを見る (直下の worker が `alc_core_wasm::require_tenant_header` の layer で入れる。
 //! 役割は auth-worker の許可表が決める)。DB は、テナントを設定した接続で、テナントでも絞って引く。
@@ -134,6 +135,7 @@ pub fn tenant_router_with(limits: IngestLimits) -> Router<DtakoState> {
         .route("/dtako/events/etags", get(dtako_events_etags))
         .merge(crate::screen::router())
         .merge(crate::ytime::router())
+        .merge(crate::restraint::router())
 }
 
 type ApiError = (StatusCode, Json<Value>);

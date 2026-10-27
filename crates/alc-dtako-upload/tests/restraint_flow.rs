@@ -566,12 +566,15 @@ async fn compare_csv_rejects_bad_uploads() {
     ctx.finish().await;
 }
 
-/// PDF の乗務員 (削除済みと名前の空の人は一覧に出さない。1 人の指定なら削除済みでも出す)。無ければ 404、年月の誤りは 400。
+/// PDF の乗務員: 一覧はその月に運行のある乗務員 (削除済み・名前の空の人・その月に運行の無い人は出さない)。
+/// 1 人の指定なら削除済みでも出す。無ければ 404、年月の誤りは 400。
 #[tokio::test(flavor = "multi_thread")]
 async fn restraint_pdf_renders_drivers() {
     let ctx = Ctx::start().await;
     let t = ctx.tenant("restraint-pdf").await;
     let d1 = ctx.driver(t, "R1", "テスト 甲").await;
+    ctx.operation(t, d1, "U1", "2026-02-02", "2026-02-02 08:00:00")
+        .await;
     ctx.segment(
         t,
         d1,
@@ -608,43 +611,59 @@ async fn restraint_pdf_renders_drivers() {
     assert_eq!(status, StatusCode::OK);
     assert!(body.starts_with(b"%PDF"));
 
-    let (status, body) = ctx
-        .get(
-            t,
-            &format!(
-                "/restraint-report/pdf?year=2026&month=2&driver_id={}",
-                Uuid::new_v4()
-            ),
-        )
-        .await;
-    assert_eq!(
-        (status, body.as_str()),
-        (StatusCode::NOT_FOUND, "ドライバーが見つかりません")
-    );
-    let (status, body) = ctx
-        .get(
-            t,
-            &format!("/restraint-report/pdf?year=2026&month=13&driver_id={d1}"),
-        )
-        .await;
-    assert_eq!(
-        (status, body.as_str()),
-        (StatusCode::BAD_REQUEST, "invalid year/month")
-    );
+    // その月に運行の無い月・居ない乗務員の指定は 404
+    for path in [
+        "/restraint-report/pdf?year=2026&month=3".to_owned(),
+        format!(
+            "/restraint-report/pdf?year=2026&month=2&driver_id={}",
+            Uuid::new_v4()
+        ),
+    ] {
+        let (status, body) = ctx.get(t, &path).await;
+        assert_eq!(
+            (status, body.as_str()),
+            (StatusCode::NOT_FOUND, "ドライバーが見つかりません"),
+            "{path}"
+        );
+    }
+    for path in [
+        "/restraint-report/pdf?year=2026&month=13".to_owned(),
+        format!("/restraint-report/pdf?year=2026&month=13&driver_id={d1}"),
+    ] {
+        let (status, body) = ctx.get(t, &path).await;
+        assert_eq!(
+            (status, body.as_str()),
+            (StatusCode::BAD_REQUEST, "invalid year/month"),
+            "{path}"
+        );
+    }
     ctx.finish().await;
 }
 
-/// 進み具合は乗務員CD 順に 1 人ずつ、描画、最後に PDF (base64)。組み立てられない乗務員は飛ばしてログに status だけ。
+/// 進み具合はその月に運行のある乗務員を乗務員CD 順に 1 人ずつ、描画、最後に PDF (base64)。年月の誤りは error 1 つ。
 #[tokio::test(flavor = "multi_thread")]
 async fn restraint_pdf_stream_reports_progress() {
     let ctx = Ctx::start().await;
     let t = ctx.tenant("restraint-pdf-stream").await;
-    ctx.driver(t, "R2", "テスト 乙").await;
-    ctx.driver(t, "R1", "テスト 甲").await;
-    ctx.driver(t, "R4", "").await;
-    {
+    let d2 = ctx.driver(t, "R2", "テスト 乙").await;
+    let d1 = ctx.driver(t, "R1", "テスト 甲").await;
+    let nameless = ctx.driver(t, "R4", "").await;
+    let march_only = ctx.driver(t, "R5", "テスト 三月").await;
+    let retired = {
         let mut c = ctx.pg.inner.lock().await;
-        employee(&mut c, t, None, Some("R3"), "テスト 退職", true).await;
+        employee(&mut c, t, None, Some("R3"), "テスト 退職", true).await
+    };
+    // R1 は同じ月に 2 運行 (一覧には 1 回だけ)
+    for (d, unko_no, day) in [
+        (d2, "U2", "2026-02-03"),
+        (d1, "U1", "2026-02-02"),
+        (d1, "U3", "2026-02-10"),
+        (nameless, "U4", "2026-02-04"),
+        (retired, "U5", "2026-02-05"),
+        (march_only, "U6", "2026-03-01"),
+    ] {
+        ctx.operation(t, d, unko_no, day, &format!("{day} 08:00:00"))
+            .await;
     }
 
     let events = ctx
@@ -676,27 +695,24 @@ async fn restraint_pdf_stream_reports_progress() {
     let events = ctx
         .get_events(t, "/restraint-report/pdf-stream?year=2026&month=13")
         .await;
-    assert_eq!(events.len(), 4, "{events:?}");
-    assert_eq!(events[3]["event"], "done");
     assert_eq!(
-        ctx.logs.all(),
-        vec![
-            (
-                LogLevel::Warn,
-                "restraint-report pdf-stream skip driver: 400 Bad Request".to_owned()
-            );
-            2
+        events,
+        [
+            json!({"event": "error", "current": null, "total": null, "driver_name": null, "step": null, "message": "invalid year/month"})
         ]
     );
     ctx.finish().await;
 }
 
-/// PDF の DB の失敗: 乗務員を読めなければ 500 / event-stream は error 1 つ。帳票の入力を読めなければ 500。
+/// PDF の DB の失敗: 帳票の入力を読めなければ 500 / event-stream はその乗務員を飛ばしてログに status だけ。
+/// 乗務員を読めなければ 500 / event-stream は error 1 つ。
 #[tokio::test(flavor = "multi_thread")]
 async fn restraint_pdf_db_failures() {
     let ctx = Ctx::start().await;
     let t = ctx.tenant("restraint-pdf-fail").await;
-    ctx.driver(t, "R1", "テスト 甲").await;
+    let d1 = ctx.driver(t, "R1", "テスト 甲").await;
+    ctx.operation(t, d1, "U1", "2026-02-02", "2026-02-02 08:00:00")
+        .await;
     let ctx = ctx
         .run_as_superuser("REVOKE SELECT ON alc_api.dtako_daily_work_segments FROM alc_api_app")
         .await;
@@ -710,6 +726,21 @@ async fn restraint_pdf_db_failures() {
         (
             LogLevel::Error,
             "restraint-report inputs failed: db (42501)".to_owned()
+        )
+    );
+    let events = ctx
+        .get_events(t, "/restraint-report/pdf-stream?year=2026&month=2")
+        .await;
+    assert_eq!(events.len(), 3, "{events:?}");
+    assert_eq!(
+        (&events[2]["event"], &events[2]["current"]),
+        (&json!("done"), &json!(1))
+    );
+    assert_eq!(
+        ctx.logs.all().pop().unwrap(),
+        (
+            LogLevel::Warn,
+            "restraint-report pdf-stream skip driver: 500 Internal Server Error".to_owned()
         )
     );
 

@@ -10,10 +10,12 @@
 //!
 //! **組み立て (`report`・`compare`・`models`) は rust-alc-api の `alc_dtako::dtako_restraint_report` を写したもの**。
 //! 応答の形・status・本文も rust と同じ。DB の失敗の本文は rust と同じ `internal server error` で、原因は `log` に段の名前と
-//! kind だけを出す。PDF (`/restraint-report/pdf*`) は W5c-4 で移す (まだ rust-alc-api)。
+//! kind だけを出す。
+//! - `GET /restraint-report/pdf`・`GET /restraint-report/pdf-stream` (W5c-4) → 同じ帳票を PDF にする ([`pdf`])
 
 pub mod compare;
 pub mod models;
+pub mod pdf;
 pub mod report;
 
 use alc_compare::parse_restraint_csv;
@@ -39,6 +41,11 @@ pub fn router() -> Router<DtakoState> {
         .route(
             "/restraint-report/compare-csv",
             post(compare_csv).layer(DefaultBodyLimit::max(UPLOAD_BODY_LIMIT)),
+        )
+        .route("/restraint-report/pdf", get(pdf::restraint_report_pdf))
+        .route(
+            "/restraint-report/pdf-stream",
+            get(pdf::restraint_report_pdf_stream),
         )
 }
 

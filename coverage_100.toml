@@ -1,7 +1,8 @@
 # 行カバレッジ 100% の登録簿 (ippoan/alc-vein-worker の同名のファイルの形。Refs ippoan/rust-alc-api#725)。
 #
 #   bash scripts/fetch-migrations.sh
-#   for p in alc-dtako-upload alc-compare alc-csv-parser; do
+#   cargo llvm-cov clean --workspace && cargo llvm-cov --locked -p alc-dtako-upload -p alc-pdf --text > cov-alc-dtako-upload.txt
+#   for p in alc-compare alc-csv-parser; do
 #     cargo llvm-cov clean --workspace && cargo llvm-cov --locked -p $p --text > cov-$p.txt
 #   done
 #   bash scripts/check_coverage_100.sh --use-cache cov-alc-dtako-upload.txt --use-cache cov-alc-compare.txt --use-cache cov-alc-csv-parser.txt
@@ -88,6 +89,10 @@ path = "crates/alc-dtako-upload/src/restraint/report.rs"
 [[files]]
 path = "crates/alc-dtako-upload/src/restraint/compare.rs"
 
+# 拘束時間管理表の PDF の口 (tests/restraint_flow.rs が組み込みの PostgreSQL で通す。W5c-4)
+[[files]]
+path = "crates/alc-dtako-upload/src/restraint/pdf.rs"
+
 # --- 共通の計算 crate 2 つ (正本はこの repo。ippoan/rust-alc-api 79029aa の coverage_100.toml から登録を写した。Refs ippoan/rust-alc-api#736) ---
 # 計測は crate ごとに別の回 (`cargo llvm-cov -p alc-compare` / `-p alc-csv-parser`。ci.yml)。crate 自身のテストだけで 100% にする。
 
@@ -116,3 +121,10 @@ path = "crates/alc-csv-parser/src/work_segments.rs"
 
 [[files]]
 path = "crates/alc-compare/src/upload_daily.rs"
+
+# --- alc-pdf (W5c-4。ippoan/rust-alc-api 09b6c01 の coverage_100.toml の登録を写した) ---
+# 計測は dtako-upload と同じ回 (`cargo llvm-cov -p alc-dtako-upload -p alc-pdf`。ci.yml。rust でも type = "combined")。
+# 1 ファイルだけの crate を単独で測ると報告にファイル名の行が出ず gate が読めない。types.rs は型だけで実行行が無いので登録しない。
+
+[[files]]
+path = "crates/alc-pdf/src/render.rs"

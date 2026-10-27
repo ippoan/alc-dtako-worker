@@ -757,4 +757,13 @@ pub mod sql {
 
     /// 乗務員CD の在る乗務員 (論理削除済みは除く)。$1 tenant_id → id, driver_cd, name。
     pub const LIST_RESTRAINT_DRIVERS_WITH_CD: &str = "SELECT id, driver_cd, name FROM alc_api.employees WHERE tenant_id = $1 AND driver_cd IS NOT NULL AND deleted_at IS NULL";
+
+    /// PDF の乗務員の一覧。$1 tenant_id → id, driver_cd, name (乗務員CD 順)。
+    /// soft-delete 済み (重複統合で畳まれた敗者・退職者) を一覧に出さない (Refs ippoan/rust-alc-api#669)。
+    pub const LIST_RESTRAINT_PDF_DRIVERS: &str = "SELECT id, driver_cd, name FROM alc_api.employees WHERE tenant_id = $1 AND deleted_at IS NULL ORDER BY driver_cd";
+
+    /// PDF の乗務員 1 人。$1 tenant_id / $2 id → id, driver_cd, name。
+    /// soft-delete 済みでも返す (退職者の過去の帳票を出し直せるように)。
+    pub const SELECT_RESTRAINT_PDF_DRIVER: &str =
+        "SELECT id, driver_cd, name FROM alc_api.employees WHERE tenant_id = $1 AND id = $2";
 }

@@ -1,4 +1,5 @@
-//! 拘束時間の帳票の口 (`GET /restraint-report`・`POST /restraint-report/compare-csv`、W5c-3) を、口から DB まで通して確かめる (native)。
+//! 拘束時間の帳票の口 (`GET /restraint-report`・`POST /restraint-report/compare-csv`、W5c-3) と PDF の口
+//! (`GET /restraint-report/pdf`・`GET /restraint-report/pdf-stream`、W5c-4) を、口から DB まで通して確かめる (native)。
 //!
 //! DB はテストの process の中で起こす組み込みの PostgreSQL (`embedded/mod.rs`)、保存先・ログは偽物 (`fakes/mod.rs`)。
 //! 期待値は rust-alc-api の同じ口 (`tests/mock_tests/mock_dtako_restraint_report_test.rs`) と同じ。乗務員CD・名前・運行NO は作り物。
@@ -17,8 +18,9 @@ use alc_dtako_upload::routes::{tenant_router, DtakoState};
 use alc_dtako_upload::split::LogLevel;
 use alc_worker_db::PgClient;
 use axum::body::Body;
-use axum::http::{Method, Request, StatusCode};
+use axum::http::{HeaderMap, Method, Request, StatusCode};
 use axum::{Extension, Router};
+use base64::Engine as _;
 use embedded::{employee, exec, tenant, Embedded, Held, APP_ROLE};
 use fakes::{FakeClock, FakeSleeper, FakeStore, Logs};
 use futures_util::lock::Mutex;
@@ -139,6 +141,31 @@ impl Ctx {
         let status = res.status();
         let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await;
         (status, String::from_utf8(bytes.unwrap().to_vec()).unwrap())
+    }
+
+    /// 本文をバイト列のまま返す (PDF)。
+    async fn get_raw(&self, t: Uuid, path: &str) -> (StatusCode, HeaderMap, Vec<u8>) {
+        let req = Request::builder().method(Method::GET).uri(path);
+        let res = self
+            .app(t)
+            .oneshot(req.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let (status, headers) = (res.status(), res.headers().clone());
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await;
+        (status, headers, bytes.unwrap().to_vec())
+    }
+
+    /// event-stream の `data:` を順に JSON にする。
+    async fn get_events(&self, t: Uuid, path: &str) -> Vec<Value> {
+        let (status, headers, body) = self.get_raw(t, path).await;
+        assert_eq!(status, StatusCode::OK, "{path}");
+        assert_eq!(headers["content-type"], "text/event-stream");
+        String::from_utf8(body)
+            .unwrap()
+            .split_terminator("\n\n")
+            .map(|e| serde_json::from_str(e.strip_prefix("data: ").unwrap()).unwrap())
+            .collect()
     }
 
     async fn get(&self, t: Uuid, path: &str) -> (StatusCode, String) {
@@ -536,5 +563,186 @@ async fn compare_csv_rejects_bad_uploads() {
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(body.starts_with("field read error: "), "{body}");
+    ctx.finish().await;
+}
+
+/// PDF の乗務員 (削除済みと名前の空の人は一覧に出さない。1 人の指定なら削除済みでも出す)。無ければ 404、年月の誤りは 400。
+#[tokio::test(flavor = "multi_thread")]
+async fn restraint_pdf_renders_drivers() {
+    let ctx = Ctx::start().await;
+    let t = ctx.tenant("restraint-pdf").await;
+    let d1 = ctx.driver(t, "R1", "テスト 甲").await;
+    ctx.segment(
+        t,
+        d1,
+        "2026-02-02",
+        "U1",
+        0,
+        "2026-02-02 08:00:00",
+        "2026-02-02 17:00:00",
+        (540, 300, 60),
+    )
+    .await;
+    let retired = {
+        let mut c = ctx.pg.inner.lock().await;
+        employee(&mut c, t, None, Some("R3"), "テスト 退職", true).await
+    };
+
+    let (status, headers, body) = ctx
+        .get_raw(t, "/restraint-report/pdf?year=2026&month=2")
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers["content-type"], "application/pdf");
+    assert_eq!(
+        headers["content-disposition"],
+        "attachment; filename=\"restraint_report_2026_02.pdf\""
+    );
+    assert!(body.starts_with(b"%PDF"));
+
+    let (status, _, body) = ctx
+        .get_raw(
+            t,
+            &format!("/restraint-report/pdf?year=2026&month=2&driver_id={retired}"),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.starts_with(b"%PDF"));
+
+    let (status, body) = ctx
+        .get(
+            t,
+            &format!(
+                "/restraint-report/pdf?year=2026&month=2&driver_id={}",
+                Uuid::new_v4()
+            ),
+        )
+        .await;
+    assert_eq!(
+        (status, body.as_str()),
+        (StatusCode::NOT_FOUND, "ドライバーが見つかりません")
+    );
+    let (status, body) = ctx
+        .get(
+            t,
+            &format!("/restraint-report/pdf?year=2026&month=13&driver_id={d1}"),
+        )
+        .await;
+    assert_eq!(
+        (status, body.as_str()),
+        (StatusCode::BAD_REQUEST, "invalid year/month")
+    );
+    ctx.finish().await;
+}
+
+/// 進み具合は乗務員CD 順に 1 人ずつ、描画、最後に PDF (base64)。組み立てられない乗務員は飛ばしてログに status だけ。
+#[tokio::test(flavor = "multi_thread")]
+async fn restraint_pdf_stream_reports_progress() {
+    let ctx = Ctx::start().await;
+    let t = ctx.tenant("restraint-pdf-stream").await;
+    ctx.driver(t, "R2", "テスト 乙").await;
+    ctx.driver(t, "R1", "テスト 甲").await;
+    ctx.driver(t, "R4", "").await;
+    {
+        let mut c = ctx.pg.inner.lock().await;
+        employee(&mut c, t, None, Some("R3"), "テスト 退職", true).await;
+    }
+
+    let events = ctx
+        .get_events(t, "/restraint-report/pdf-stream?year=2026&month=2")
+        .await;
+    assert_eq!(events.len(), 4, "{events:?}");
+    assert_eq!(
+        events[..3],
+        [
+            json!({"event": "progress", "current": 1, "total": 2, "driver_name": "テスト 甲", "step": "fetch"}),
+            json!({"event": "progress", "current": 2, "total": 2, "driver_name": "テスト 乙", "step": "fetch"}),
+            json!({"event": "progress", "current": 2, "total": 2, "driver_name": null, "step": "render", "message": "PDF生成中..."}),
+        ]
+    );
+    assert_eq!(
+        (
+            &events[3]["event"],
+            &events[3]["current"],
+            &events[3]["step"]
+        ),
+        (&json!("done"), &json!(2), &json!("save"))
+    );
+    let pdf = base64::engine::general_purpose::STANDARD
+        .decode(events[3]["data"].as_str().unwrap())
+        .unwrap();
+    assert!(pdf.starts_with(b"%PDF"));
+    assert!(ctx.logs.all().is_empty());
+
+    let events = ctx
+        .get_events(t, "/restraint-report/pdf-stream?year=2026&month=13")
+        .await;
+    assert_eq!(events.len(), 4, "{events:?}");
+    assert_eq!(events[3]["event"], "done");
+    assert_eq!(
+        ctx.logs.all(),
+        vec![
+            (
+                LogLevel::Warn,
+                "restraint-report pdf-stream skip driver: 400 Bad Request".to_owned()
+            );
+            2
+        ]
+    );
+    ctx.finish().await;
+}
+
+/// PDF の DB の失敗: 乗務員を読めなければ 500 / event-stream は error 1 つ。帳票の入力を読めなければ 500。
+#[tokio::test(flavor = "multi_thread")]
+async fn restraint_pdf_db_failures() {
+    let ctx = Ctx::start().await;
+    let t = ctx.tenant("restraint-pdf-fail").await;
+    ctx.driver(t, "R1", "テスト 甲").await;
+    let ctx = ctx
+        .run_as_superuser("REVOKE SELECT ON alc_api.dtako_daily_work_segments FROM alc_api_app")
+        .await;
+    let (status, body) = ctx.get(t, "/restraint-report/pdf?year=2026&month=2").await;
+    assert_eq!(
+        (status, body.as_str()),
+        (StatusCode::INTERNAL_SERVER_ERROR, "internal server error")
+    );
+    assert_eq!(
+        ctx.logs.all().pop().unwrap(),
+        (
+            LogLevel::Error,
+            "restraint-report inputs failed: db (42501)".to_owned()
+        )
+    );
+
+    let ctx = ctx
+        .run_as_superuser("REVOKE SELECT ON alc_api.employees FROM alc_api_app")
+        .await;
+    let (status, body) = ctx.get(t, "/restraint-report/pdf?year=2026&month=2").await;
+    assert_eq!(
+        (status, body.as_str()),
+        (StatusCode::INTERNAL_SERVER_ERROR, "internal server error")
+    );
+    assert_eq!(
+        ctx.logs.all().pop().unwrap(),
+        (
+            LogLevel::Error,
+            "restraint-report pdf drivers failed: db (42501)".to_owned()
+        )
+    );
+    let events = ctx
+        .get_events(t, "/restraint-report/pdf-stream?year=2026&month=2")
+        .await;
+    assert_eq!(
+        events,
+        [
+            json!({"event": "error", "current": null, "total": null, "driver_name": null, "step": null, "message": "ドライバー取得エラー: db (42501)"})
+        ]
+    );
+    assert_eq!(
+        ctx.logs.all().pop().unwrap(),
+        (
+            LogLevel::Error,
+            "restraint-report pdf-stream drivers failed: db (42501)".to_owned()
+        )
+    );
     ctx.finish().await;
 }

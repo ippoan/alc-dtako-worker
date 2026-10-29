@@ -2,7 +2,29 @@
 //! DB と偽の保存先まで通して確かめる (native。W9、Refs ippoan/rust-alc-api#680)。
 //!
 //! DB はテストの process の中で起こす組み込みの PostgreSQL (`embedded/mod.rs`)、保存先・ログは偽物 (`fakes/mod.rs`)。
-//! SQL は migration 084 の SECURITY DEFINER の関数。失敗は、superuser で関数の名前を変えて作る。
+//! DB はテナントごとの transaction (RLS)。migration 084 の archive_* 関数と archive_mode のポリシーは使わない
+//! (使っていないことは、最初のテストが両方を消してから流して固定する)。失敗は、superuser で権限・列名・trigger を変えて作る。
+
+/// 084 の archive_mode のポリシー 4 本と archive_* 関数 5 本 (rust の archive Job 専用。worker は使わない)
+const DROP_ARCHIVE_084: &str = "DROP POLICY archive_select ON alc_api.dtakologs; \
+     DROP POLICY archive_insert ON alc_api.dtakologs; \
+     DROP POLICY archive_update ON alc_api.dtakologs; \
+     DROP POLICY archive_delete ON alc_api.dtakologs; \
+     DROP FUNCTION alc_api.archive_list_dtako_dates(); \
+     DROP FUNCTION alc_api.archive_fetch_dtako_rows_json(text, text, bigint, bigint); \
+     DROP FUNCTION alc_api.archive_list_old_dtako_dates(text); \
+     DROP FUNCTION alc_api.archive_delete_dtako_date(text, text); \
+     DROP FUNCTION alc_api.archive_upsert_dtako_batch(jsonb)";
+
+/// `op` (INSERT / DELETE) の文を、dtakologs で必ず失敗させる trigger
+fn fail_on(op: &str) -> String {
+    format!(
+        "CREATE FUNCTION alc_api.ci_fail_{op}() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN RAISE EXCEPTION 'ci: {op} fails'; END $$; \
+         CREATE TRIGGER ci_fail_{op} BEFORE {op} ON alc_api.dtakologs \
+         FOR EACH ROW EXECUTE FUNCTION alc_api.ci_fail_{op}()"
+    )
+}
 
 // 共用の土台・偽物のうち、このファイルが使わないものが在る
 #[allow(dead_code)]
@@ -179,7 +201,7 @@ fn gz(text: &str) -> Vec<u8> {
 /// rust-alc-api と同じ形で、画面の範囲の読み取りが退避から読める。2 回目は何もしない (目録も書かない)。
 #[tokio::test(flavor = "multi_thread")]
 async fn run_archives_old_days_then_deletes_them() {
-    let ctx = Ctx::start().await;
+    let ctx = Ctx::start().await.run_as_superuser(DROP_ARCHIVE_084).await;
     let a = ctx.tenant("archive-a").await;
     let b = ctx.tenant("archive-b").await;
     ctx.log_row(a, "2026-03-01T09:00:00+09:00", 2).await;
@@ -384,9 +406,7 @@ async fn run_stops_without_deleting_when_manifest_or_list_fails() {
 
     // DB の一覧が引けない
     let ctx = ctx
-        .run_as_superuser(
-            "ALTER FUNCTION alc_api.archive_list_old_dtako_dates(text) RENAME TO archive_list_old_dtako_dates_x",
-        )
+        .run_as_superuser("REVOKE ALL ON alc_api.tenants FROM alc_api_app, PUBLIC")
         .await;
     assert_eq!(ctx.run().await, None);
     let last = ctx.logs.all().pop().unwrap();
@@ -404,21 +424,17 @@ async fn run_skips_days_whose_fetch_or_delete_fails() {
     ctx.log_row(a, "2026-03-02T09:00:00+09:00", 1).await;
 
     let ctx = ctx
-        .run_as_superuser(
-            "ALTER FUNCTION alc_api.archive_fetch_dtako_rows_json(text, text, bigint, bigint) \
-             RENAME TO archive_fetch_dtako_rows_json_x",
-        )
+        .run_as_superuser("ALTER TABLE alc_api.dtakologs RENAME COLUMN vehicle_cd TO vehicle_cd_x")
         .await;
     let got = ctx.run().await.unwrap();
     assert_eq!((got.archived, got.deleted, got.failed), (0, 0, 2));
     assert!(ctx.store.object(MANIFEST_KEY).is_none());
 
     let ctx = ctx
-        .run_as_superuser(
-            "ALTER FUNCTION alc_api.archive_fetch_dtako_rows_json_x(text, text, bigint, bigint) \
-             RENAME TO archive_fetch_dtako_rows_json; \
-             ALTER FUNCTION alc_api.archive_delete_dtako_date(text, text) RENAME TO archive_delete_dtako_date_x",
-        )
+        .run_as_superuser(&format!(
+            "ALTER TABLE alc_api.dtakologs RENAME COLUMN vehicle_cd_x TO vehicle_cd; {}",
+            fail_on("DELETE")
+        ))
         .await;
     let got = ctx.run().await.unwrap();
     assert_eq!((got.archived, got.deleted, got.failed), (2, 0, 2));
@@ -446,7 +462,7 @@ async fn archive_rows_reads_all_pages() {
     }
     let mut c = ctx.pg.inner.lock().await;
     for batch in [1, 2, 3, 10] {
-        let rows = pg::archive_rows(&mut c, a.to_string(), "2026-03-01".to_owned(), batch)
+        let rows = pg::archive_rows(&mut c, a, "2026-03-01".to_owned(), batch)
             .await
             .unwrap();
         let cds: Vec<_> = rows.0.iter().map(|r| r["vehicle_cd"].clone()).collect();
@@ -593,11 +609,7 @@ async fn restore_rejects_bad_requests_and_foreign_rows() {
     // DB の失敗 (1 行も書かない)
     let text = format!("{}\n{}\n", header(a), row(a, at));
     ctx.store.seed(&key, gz(&text), "application/gzip");
-    let ctx = ctx
-        .run_as_superuser(
-            "ALTER FUNCTION alc_api.archive_upsert_dtako_batch(jsonb) RENAME TO archive_upsert_dtako_batch_x",
-        )
-        .await;
+    let ctx = ctx.run_as_superuser(&fail_on("INSERT")).await;
     assert_eq!(ctx.restore(a, "2026-03-01").await, internal);
     let last = ctx.logs.all().pop().unwrap();
     assert!(

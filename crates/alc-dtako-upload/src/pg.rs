@@ -1757,13 +1757,13 @@ pub async fn unsplit_operations(
     .await
 }
 
-// ---- 車両の現在地のログの退避と書き戻し (`crate::logs_archive`。migration 084 の関数だけを流す) ----
-// 退避は特定のテナントに属さない定時実行なので、transaction のテナントは nil (関数が中で archive_mode を立てる)。
+// ---- 車両の現在地のログの退避と書き戻し (`crate::logs_archive`) ----
+// テナントを列挙し、テナントごとの transaction (RLS の tenant_isolation) で dtakologs を読み消しする。
 
-/// 退避の対象の (テナント, 日付) 1 つ ([`sql::ARCHIVE_LIST_OLD_DATES`])。
+/// 退避の対象の (テナント, 日付) 1 つ ([`sql::ARCHIVE_OLD_DATES`])。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArchiveDate {
-    pub tenant_id: String,
+    pub tenant_id: Uuid,
     /// `YYYY-MM-DD`
     pub date: String,
     pub row_count: i64,
@@ -1771,25 +1771,40 @@ pub struct ArchiveDate {
 
 impl TxOutput for ArchiveDate {}
 
-/// [`sql::ARCHIVE_LIST_OLD_DATES`]。`cutoff` より前の日の (テナント, 日付) と行数 (日付の順)。
+/// [`sql::LIST_TENANT_IDS`] → テナントごとに [`sql::ARCHIVE_OLD_DATES`]。`cutoff` より前の日の (テナント, 日付) と行数
+/// (テナント・日付の順)。テナントの列挙は nil の transaction、日付はテナントごとの transaction。
 pub async fn archive_old_dates(
     pg: &mut PgClient,
     cutoff: String,
 ) -> Result<Vec<ArchiveDate>, tokio_postgres::Error> {
-    pg.tenant_tx(Uuid::nil(), move |tx| {
-        Box::pin(async move {
-            let rows = tx
-                .query_typed(sql::ARCHIVE_LIST_OLD_DATES, &[(&cutoff, Type::TEXT)])
-                .await?;
-            let date = |r: tokio_postgres::Row| ArchiveDate {
-                tenant_id: r.get(0),
-                date: r.get(1),
-                row_count: r.get(2),
-            };
-            Ok(rows.into_iter().map(date).collect())
+    let tenants: Vec<Uuid> = pg
+        .tenant_tx(Uuid::nil(), move |tx| {
+            Box::pin(async move {
+                let rows = tx.query_typed(sql::LIST_TENANT_IDS, &[]).await?;
+                Ok(rows.into_iter().map(|r| r.get(0)).collect())
+            })
         })
-    })
-    .await
+        .await?;
+    let mut out = Vec::new();
+    for tenant_id in tenants {
+        let cutoff = cutoff.clone();
+        let dates: Vec<ArchiveDate> = pg
+            .tenant_tx(tenant_id, move |tx| {
+                Box::pin(async move {
+                    let params: [Param; 2] = [(&tenant_id, Type::UUID), (&cutoff, Type::TEXT)];
+                    let rows = tx.query_typed(sql::ARCHIVE_OLD_DATES, &params).await?;
+                    let date = |r: tokio_postgres::Row| ArchiveDate {
+                        tenant_id,
+                        date: r.get(0),
+                        row_count: r.get(1),
+                    };
+                    Ok(rows.into_iter().map(date).collect())
+                })
+            })
+            .await?;
+        out.extend(dates);
+    }
+    Ok(out)
 }
 
 /// (テナント, 日付) の行の JSON (時刻の順)。`serde_json::Value` は `TxOutput` を持たないので包む。
@@ -1798,20 +1813,20 @@ pub struct ArchiveRows(pub Vec<serde_json::Value>);
 
 impl TxOutput for ArchiveRows {}
 
-/// [`sql::ARCHIVE_FETCH_ROWS`]。(テナント, 日付) の行を `batch` 件ずつ読み切る (1 つの transaction)。
+/// [`sql::ARCHIVE_FETCH_ROWS`]。テナントの 1 日の行を `batch` 件ずつ読み切る (そのテナントの 1 つの transaction)。
 pub async fn archive_rows(
     pg: &mut PgClient,
-    tenant_id: String,
+    tenant_id: Uuid,
     date: String,
     batch: i64,
 ) -> Result<ArchiveRows, tokio_postgres::Error> {
-    pg.tenant_tx(Uuid::nil(), move |tx| {
+    pg.tenant_tx(tenant_id, move |tx| {
         Box::pin(async move {
             let mut out = Vec::new();
             loop {
                 let offset = out.len() as i64;
                 let params: [Param; 4] = [
-                    (&tenant_id, Type::TEXT),
+                    (&tenant_id, Type::UUID),
                     (&date, Type::TEXT),
                     (&batch, Type::INT8),
                     (&offset, Type::INT8),
@@ -1828,26 +1843,23 @@ pub async fn archive_rows(
     .await
 }
 
-/// [`sql::ARCHIVE_DELETE_DATE`]。(テナント, 日付) の行を消し、消した行数を返す。
+/// [`sql::ARCHIVE_DELETE_DATE`]。テナントの 1 日の行を消し、消した行数を返す。
 pub async fn archive_delete_date(
     pg: &mut PgClient,
-    tenant_id: String,
+    tenant_id: Uuid,
     date: String,
-) -> Result<i64, tokio_postgres::Error> {
-    pg.tenant_tx(Uuid::nil(), move |tx| {
+) -> Result<u64, tokio_postgres::Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
         Box::pin(async move {
-            let params: [Param; 2] = [(&tenant_id, Type::TEXT), (&date, Type::TEXT)];
-            let row = tx
-                .query_typed_one(sql::ARCHIVE_DELETE_DATE, &params)
-                .await?;
-            Ok(row.get(0))
+            let params: [Param; 2] = [(&tenant_id, Type::UUID), (&date, Type::TEXT)];
+            tx.execute_typed(sql::ARCHIVE_DELETE_DATE, &params).await
         })
     })
     .await
 }
 
-/// [`sql::ARCHIVE_UPSERT_BATCH`]。`batches` (行の JSON の配列) を 1 つの transaction で順に流す
-/// (途中で落ちたら 1 行も書かない)。transaction のテナントは書き戻すテナント。
+/// [`sql::ARCHIVE_UPSERT_BATCH`]。`batches` (行の JSON の配列) を、書き戻すテナントの 1 つの transaction で順に流す
+/// (途中で落ちたら 1 行も書かない)。
 pub async fn archive_restore(
     pg: &mut PgClient,
     tenant_id: Uuid,
@@ -1856,7 +1868,7 @@ pub async fn archive_restore(
     pg.tenant_tx(tenant_id, move |tx| {
         Box::pin(async move {
             for batch in &batches {
-                tx.query_typed(sql::ARCHIVE_UPSERT_BATCH, &[(batch, Type::JSONB)])
+                tx.execute_typed(sql::ARCHIVE_UPSERT_BATCH, &[(batch, Type::JSONB)])
                     .await?;
             }
             Ok(())

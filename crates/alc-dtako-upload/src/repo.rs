@@ -858,22 +858,86 @@ pub mod sql {
     pub const CLOSE_TICKET_BY_TOKEN: &str = "SELECT alc_api.close_dtako_ticket_by_token($1, $2)";
 
     // ---- 車両の現在地のログ (dtakologs) の退避 (定時実行) と書き戻し (内部の口)。`crate::logs_archive` ----
-    // どれも migration 084 の SECURITY DEFINER の関数 (中で `alc_api.archive_mode` を立て、テナントをまたいで読み書きする)。
-    // 表を直に触る文は書かない。関数の EXECUTE は alc_api_app と alc_api_rt だけ (migration 192)。
+    // テナントを列挙し、テナントごとの transaction (RLS の tenant_isolation) の中で dtakologs を読み消しする。
+    // migration 084 の archive_* 関数と archive_mode のポリシーは使わない (どちらも alc_api_app だけのもの。migration 192)。
 
-    /// 指定の日 (UTC の日付の文字列) より前の (テナント, 日付) ごとの行数 (日付の順)。$1 cutoff (TEXT, `YYYY-MM-DD`) →
-    /// tenant_id (TEXT), date_str (TEXT), row_count (BIGINT)。
-    pub const ARCHIVE_LIST_OLD_DATES: &str =
-        "SELECT tenant_id, date_str, row_count FROM alc_api.archive_list_old_dtako_dates($1)";
+    /// テナントの id の全部 (tenants は RLS の無い表)。→ id。
+    pub const LIST_TENANT_IDS: &str = "SELECT id FROM alc_api.tenants ORDER BY id";
 
-    /// (テナント, 日付) の行を 1 行 1 つの JSON で (時刻の順)。$1 tenant_id (TEXT) / $2 date (TEXT) / $3 limit / $4 offset → row_json (JSONB)。
-    pub const ARCHIVE_FETCH_ROWS: &str =
-        "SELECT row_json FROM alc_api.archive_fetch_dtako_rows_json($1, $2, $3, $4)";
+    /// テナントの、指定の日 (UTC の日付の文字列) より前の日ごとの行数 (日付の順)。$1 tenant_id / $2 cutoff (TEXT, `YYYY-MM-DD`) →
+    /// date (TEXT), row_count (BIGINT)。日付は 084 の関数と同じ `data_date_time::DATE`。
+    pub const ARCHIVE_OLD_DATES: &str = r#"SELECT d.data_date_time::DATE::TEXT, COUNT(*)
+               FROM alc_api.dtakologs d
+               WHERE d.tenant_id = $1 AND d.data_date_time::DATE < $2::DATE
+               GROUP BY 1 ORDER BY 1"#;
 
-    /// (テナント, 日付) の行を消す。$1 tenant_id (TEXT) / $2 date (TEXT) → 消した行数 (BIGINT)。
-    pub const ARCHIVE_DELETE_DATE: &str = "SELECT alc_api.archive_delete_dtako_date($1, $2)";
+    /// テナントの 1 日の行を 1 行 1 つの JSON で (時刻・車両CD の順)。$1 tenant_id / $2 date (TEXT) / $3 limit / $4 offset → row_json (JSONB)。
+    pub const ARCHIVE_FETCH_ROWS: &str = r#"SELECT row_to_json(d)::JSONB
+               FROM alc_api.dtakologs d
+               WHERE d.tenant_id = $1 AND d.data_date_time::DATE = $2::DATE
+               ORDER BY d.data_date_time, d.vehicle_cd
+               LIMIT $3 OFFSET $4"#;
 
-    /// 行の JSON の配列を upsert する (tenant_id は各行の JSON から入る。RLS を通らないので、呼び手が揃っていることを確かめる)。
-    /// $1 行の配列 (JSONB) → なし。
-    pub const ARCHIVE_UPSERT_BATCH: &str = "SELECT alc_api.archive_upsert_dtako_batch($1)";
+    /// テナントの 1 日の行を消す。$1 tenant_id / $2 date (TEXT) → 消した行数。
+    pub const ARCHIVE_DELETE_DATE: &str =
+        "DELETE FROM alc_api.dtakologs WHERE tenant_id = $1 AND data_date_time::DATE = $2::DATE";
+
+    /// 行の JSON の配列を upsert する (列の対応と ON CONFLICT は 084 の archive_upsert_dtako_batch と同じ)。$1 行の配列 (JSONB) → なし。
+    /// tenant_id は行の JSON から入るが、テナントの transaction の中で流すので、別のテナントの行は RLS の WITH CHECK が 42501 で止める。
+    pub const ARCHIVE_UPSERT_BATCH: &str = r#"INSERT INTO alc_api.dtakologs (
+          tenant_id, data_date_time, vehicle_cd,
+          type, all_state_font_color_index, all_state_ryout_color,
+          branch_cd, branch_name, current_work_cd, data_filter_type,
+          disp_flag, driver_cd, gps_direction, gps_enable,
+          gps_latitude, gps_longitude, gps_satellite_num,
+          operation_state, recive_event_type, recive_packet_type,
+          recive_work_cd, revo, setting_temp, setting_temp1,
+          setting_temp3, setting_temp4, speed, sub_driver_cd,
+          temp_state, vehicle_name,
+          address_disp_c, address_disp_p, all_state, all_state_ex,
+          all_state_font_color, comu_date_time, current_work_name,
+          driver_name, event_val, gps_lati_and_long, odometer,
+          recive_type_color_name, recive_type_name,
+          start_work_date_time, state, state1, state2, state3,
+          state_flag, temp1, temp2, temp3, temp4,
+          vehicle_icon_color, vehicle_icon_label_for_datetime,
+          vehicle_icon_label_for_driver, vehicle_icon_label_for_vehicle
+        )
+        SELECT
+          (j->>'tenant_id')::UUID, j->>'data_date_time', (j->>'vehicle_cd')::INTEGER,
+          COALESCE(j->>'type', ''),
+          COALESCE((j->>'all_state_font_color_index')::INTEGER, 0),
+          COALESCE(j->>'all_state_ryout_color', 'Transparent'),
+          COALESCE((j->>'branch_cd')::INTEGER, 0), COALESCE(j->>'branch_name', ''),
+          COALESCE((j->>'current_work_cd')::INTEGER, 0),
+          COALESCE((j->>'data_filter_type')::INTEGER, 0),
+          COALESCE((j->>'disp_flag')::INTEGER, 0), COALESCE((j->>'driver_cd')::INTEGER, 0),
+          COALESCE((j->>'gps_direction')::DOUBLE PRECISION, 0),
+          COALESCE((j->>'gps_enable')::INTEGER, 0),
+          COALESCE((j->>'gps_latitude')::DOUBLE PRECISION, 0),
+          COALESCE((j->>'gps_longitude')::DOUBLE PRECISION, 0),
+          COALESCE((j->>'gps_satellite_num')::INTEGER, 0),
+          COALESCE((j->>'operation_state')::INTEGER, 0),
+          COALESCE((j->>'recive_event_type')::INTEGER, 0),
+          COALESCE((j->>'recive_packet_type')::INTEGER, 0),
+          COALESCE((j->>'recive_work_cd')::INTEGER, 0),
+          COALESCE((j->>'revo')::INTEGER, 0),
+          COALESCE(j->>'setting_temp', ''), COALESCE(j->>'setting_temp1', ''),
+          COALESCE(j->>'setting_temp3', ''), COALESCE(j->>'setting_temp4', ''),
+          COALESCE((j->>'speed')::REAL, 0), COALESCE((j->>'sub_driver_cd')::INTEGER, 0),
+          COALESCE((j->>'temp_state')::INTEGER, 0), COALESCE(j->>'vehicle_name', ''),
+          j->>'address_disp_c', j->>'address_disp_p', j->>'all_state', j->>'all_state_ex',
+          j->>'all_state_font_color', j->>'comu_date_time', j->>'current_work_name',
+          j->>'driver_name', j->>'event_val', j->>'gps_lati_and_long', j->>'odometer',
+          j->>'recive_type_color_name', j->>'recive_type_name',
+          j->>'start_work_date_time', j->>'state', j->>'state1',
+          j->>'state2', j->>'state3', j->>'state_flag',
+          j->>'temp1', j->>'temp2', j->>'temp3', j->>'temp4',
+          j->>'vehicle_icon_color', j->>'vehicle_icon_label_for_datetime',
+          j->>'vehicle_icon_label_for_driver', j->>'vehicle_icon_label_for_vehicle'
+        FROM jsonb_array_elements($1) AS j
+        ON CONFLICT (tenant_id, data_date_time, vehicle_cd) DO UPDATE SET
+          type = EXCLUDED.type, speed = EXCLUDED.speed,
+          gps_latitude = EXCLUDED.gps_latitude, gps_longitude = EXCLUDED.gps_longitude,
+          gps_direction = EXCLUDED.gps_direction"#;
 }

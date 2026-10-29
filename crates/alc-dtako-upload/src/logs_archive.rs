@@ -8,8 +8,9 @@
 //!   (auth-worker の振り分け表はこの path を拾わない)
 //!
 //! **保存先の形 (key・目録・見出しの行・gzip) は rust-alc-api と同じ** (過去の退避と互換。画面の
-//! [`crate::screen::archived_dtakologs`] も同じものを読む)。SQL は migration 084 の SECURITY DEFINER の関数だけ
-//! ([`crate::pg::archive_old_dates`] ほか)。
+//! [`crate::screen::archived_dtakologs`] も同じものを読む)。DB は、テナントを列挙してからテナントごとの transaction
+//! (RLS の tenant_isolation) で読み消しする ([`crate::pg::archive_old_dates`] ほか)。rust が使っていた migration 084 の
+//! archive_* 関数と archive_mode のポリシーは使わない (どちらも alc_api_app だけのもの。migration 192)。
 //!
 //! rust-alc-api からの違い (消した行を退避から取りこぼさないため):
 //! - 退避するのは、消す対象 (保持期間より前の日) だけ。rust は今日を含む全部の日を退避していたので、退避の後に届いた行は
@@ -78,7 +79,7 @@ impl Manifest {
     fn matches(&self, d: &ArchiveDate) -> bool {
         let info = self
             .archived_dates
-            .get(&d.tenant_id)
+            .get(&d.tenant_id.to_string())
             .and_then(|dates| dates.get(&d.date));
         info.is_some_and(|i| i.row_count as i64 == d.row_count)
     }
@@ -183,28 +184,28 @@ pub async fn run(
     summary.deferred = stale.len().saturating_sub(MAX_DATES_PER_RUN);
     let archived_at = now.to_rfc3339();
     for d in stale.into_iter().take(MAX_DATES_PER_RUN) {
-        let rows =
-            match pg::archive_rows(pg, d.tenant_id.clone(), d.date.clone(), FETCH_BATCH).await {
-                Ok(rows) => rows.0,
-                Err(e) => {
-                    let kind = alc_worker_db::kind(&e);
-                    log(
-                        LogLevel::Warn,
-                        &format!("dtakologs archive: fetch db ({kind})"),
-                    );
-                    summary.failed += 1;
-                    continue;
-                }
-            };
+        let tenant = d.tenant_id.to_string();
+        let rows = match pg::archive_rows(pg, d.tenant_id, d.date.clone(), FETCH_BATCH).await {
+            Ok(rows) => rows.0,
+            Err(e) => {
+                let kind = alc_worker_db::kind(&e);
+                log(
+                    LogLevel::Warn,
+                    &format!("dtakologs archive: fetch db ({kind})"),
+                );
+                summary.failed += 1;
+                continue;
+            }
+        };
         let header = json!({
             "_archive_header": true,
             "schema_version": 1,
             "table": "alc_api.dtakologs",
-            "tenant_id": d.tenant_id,
+            "tenant_id": tenant,
             "date": d.date,
             "archived_at": archived_at,
         });
-        let key = r2_key(&d.tenant_id, &d.date);
+        let key = r2_key(&tenant, &d.date);
         let body = gzip(&jsonl(&header, &rows));
         if let Err(e) = store.put(&key, body, "application/gzip").await {
             log(LogLevel::Warn, &format!("dtakologs archive: {e}"));
@@ -216,7 +217,7 @@ pub async fn run(
             archived_at: archived_at.clone(),
             r2_key: key,
         };
-        let dates = manifest.archived_dates.entry(d.tenant_id.clone());
+        let dates = manifest.archived_dates.entry(tenant);
         dates.or_default().insert(d.date.clone(), info);
         summary.archived += 1;
         summary.archived_rows += rows.len();
@@ -231,10 +232,10 @@ pub async fn run(
     }
 
     for d in old.iter().filter(|d| manifest.matches(d)) {
-        match pg::archive_delete_date(pg, d.tenant_id.clone(), d.date.clone()).await {
+        match pg::archive_delete_date(pg, d.tenant_id, d.date.clone()).await {
             Ok(n) => {
                 summary.deleted += 1;
-                summary.deleted_rows += n;
+                summary.deleted_rows += n as i64;
             }
             Err(e) => {
                 let kind = alc_worker_db::kind(&e);
@@ -272,7 +273,7 @@ pub enum ArchiveFileError {
 
 /// 1 日ぶんの gzip の JSON Lines を、書き戻す行にする (見出しの行は除く)。
 /// 見出しと全部の行の `tenant_id` が `tenant_id` と一致しない限り、1 行も返さない
-/// (書き戻しの関数は RLS を通らず、tenant_id は行の JSON から入るため)。
+/// (tenant_id は行の JSON から入る。RLS の WITH CHECK も止めるが、ここで先に断って 1 行も書かない)。
 pub fn restore_rows(gz: &[u8], tenant_id: Uuid) -> Result<Vec<Value>, ArchiveFileError> {
     let mut text = String::new();
     flate2::read::GzDecoder::new(gz)

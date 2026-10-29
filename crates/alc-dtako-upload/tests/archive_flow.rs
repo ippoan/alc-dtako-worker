@@ -3,18 +3,15 @@
 //!
 //! DB はテストの process の中で起こす組み込みの PostgreSQL (`embedded/mod.rs`)、保存先・ログは偽物 (`fakes/mod.rs`)。
 //! DB はテナントごとの transaction (RLS)。migration 084 の archive_* 関数と archive_mode のポリシーは使わない
-//! (使っていないことは、最初のテストが両方を消してから流して固定する)。失敗は、superuser で権限・列名・trigger を変えて作る。
+//! (どちらも migration 194 で消えた。最初のテストが、無いことを確かめてから流して固定する)。失敗は、superuser で権限・列名・trigger を変えて作る。
 
-/// 084 の archive_mode のポリシー 4 本と archive_* 関数 5 本 (rust の archive Job 専用。worker は使わない)
-const DROP_ARCHIVE_084: &str = "DROP POLICY archive_select ON alc_api.dtakologs; \
-     DROP POLICY archive_insert ON alc_api.dtakologs; \
-     DROP POLICY archive_update ON alc_api.dtakologs; \
-     DROP POLICY archive_delete ON alc_api.dtakologs; \
-     DROP FUNCTION alc_api.archive_list_dtako_dates(); \
-     DROP FUNCTION alc_api.archive_fetch_dtako_rows_json(text, text, bigint, bigint); \
-     DROP FUNCTION alc_api.archive_list_old_dtako_dates(text); \
-     DROP FUNCTION alc_api.archive_delete_dtako_date(text, text); \
-     DROP FUNCTION alc_api.archive_upsert_dtako_batch(jsonb)";
+/// 084 の archive_mode のポリシーと archive_* 関数が 1 つでも残っていれば失敗する (194 で消えた。テストで消す必要はない)
+const ASSERT_NO_ARCHIVE_084: &str = "DO $$ BEGIN \
+     IF EXISTS (SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+                WHERE n.nspname = 'alc_api' AND p.proname LIKE 'archive\\_%') \
+        OR EXISTS (SELECT 1 FROM pg_policies \
+                   WHERE schemaname = 'alc_api' AND tablename = 'dtakologs' AND policyname LIKE 'archive\\_%') \
+     THEN RAISE EXCEPTION 'ci: archive of 084 remains'; END IF; END $$";
 
 /// `op` (INSERT / DELETE) の文を、dtakologs で必ず失敗させる trigger
 fn fail_on(op: &str) -> String {
@@ -201,7 +198,10 @@ fn gz(text: &str) -> Vec<u8> {
 /// rust-alc-api と同じ形で、画面の範囲の読み取りが退避から読める。2 回目は何もしない (目録も書かない)。
 #[tokio::test(flavor = "multi_thread")]
 async fn run_archives_old_days_then_deletes_them() {
-    let ctx = Ctx::start().await.run_as_superuser(DROP_ARCHIVE_084).await;
+    let ctx = Ctx::start()
+        .await
+        .run_as_superuser(ASSERT_NO_ARCHIVE_084)
+        .await;
     let a = ctx.tenant("archive-a").await;
     let b = ctx.tenant("archive-b").await;
     ctx.log_row(a, "2026-03-01T09:00:00+09:00", 2).await;

@@ -85,6 +85,12 @@ for name, e in envs.items():
         if b.get("bucket_name") in ("ohishi-dtako-apac", "ohishi-dtako"):
             err(f"env.{name} の r2_buckets が本番の bucket {b['bucket_name']} を指している (env 用の bucket を指すこと)")
 
+# 定時実行 (車両の現在地のログの退避) は本番だけ。triggers は env に継承されるので、トップレベルに crons があれば
+# どの env も crons = [] で止めていること (staging が staging の DB で退避して消さない・二重に動かない)
+if cfg.get("triggers", {}).get("crons"):
+    for name, e in envs.items():
+        if e.get("triggers", {}).get("crons") != []:
+            err(f"env.{name} が triggers を crons = [] で止めていない (トップレベルの定時実行を継承する。本番だけにする)")
 if errors:
     sys.exit(1)
 print(f"OK: {path} は本番が workers_dev / preview_urls = false・route 無しで、公開する env は staging だけ")

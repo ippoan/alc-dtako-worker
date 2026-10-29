@@ -97,6 +97,10 @@ path = "crates/alc-dtako-upload/src/restraint/pdf.rs"
 [[files]]
 path = "crates/alc-dtako-upload/src/tickets.rs"
 
+# 車両の現在地のログの退避 (定時実行) と書き戻しの口 (tests/archive_flow.rs が組み込みの PostgreSQL と偽の保存先で通す。W9)
+[[files]]
+path = "crates/alc-dtako-upload/src/logs_archive.rs"
+
 # --- 共通の計算 crate 2 つ (正本はこの repo。ippoan/rust-alc-api 79029aa の coverage_100.toml から登録を写した。Refs ippoan/rust-alc-api#736) ---
 # 計測は crate ごとに別の回 (`cargo llvm-cov -p alc-compare` / `-p alc-csv-parser`。ci.yml)。crate 自身のテストだけで 100% にする。
 

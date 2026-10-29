@@ -16,6 +16,9 @@
 //! scripts/check-exposure.sh が保証する。ippoan/rust-alc-api#556 と同じ穴を開けないため)。
 //! staging だけはテストから叩くため `workers_dev = true` で、その workers.dev は Cloudflare Access で
 //! 保護する (Access を通らないリクエストは Worker に届かない。README 参照)。
+//!
+//! 定時実行 (`scheduled`、wrangler.toml の `[triggers]`。本番だけ) は、車両の現在地のログの退避
+//! ([`alc_dtako_upload::logs_archive::run`]。rust-alc-api の archive Job を移したもの、W9)。ログは件数だけ。
 
 mod db;
 mod r2;
@@ -24,6 +27,7 @@ mod tcp;
 use std::sync::Arc;
 
 use alc_core_wasm::require_tenant_header;
+use alc_dtako_upload::logs_archive;
 use alc_dtako_upload::routes::{tenant_router, DtakoState};
 use alc_dtako_upload::split::{LogLevel, LogSink};
 use alc_dtako_upload::timing::Clock;
@@ -33,8 +37,8 @@ use axum::{middleware, Router};
 use futures_util::lock::Mutex;
 use tower_service::Service;
 use worker::{
-    console_error, console_warn, event, Context, Date, Env, HttpRequest, Result,
-    WorkerVersionMetadata,
+    console_error, console_log, console_warn, event, Context, Date, Env, HttpRequest, Result,
+    ScheduleContext, ScheduledEvent, WorkerVersionMetadata,
 };
 
 use crate::r2::{R2Store, WorkerSleeper};
@@ -139,4 +143,30 @@ async fn fetch(req: HttpRequest, env: Env, _ctx: Context) -> Result<Response<Bod
         }
     }
     Ok(resp)
+}
+
+/// 定時実行 (本番だけ。wrangler.toml の `[triggers]`): 車両の現在地のログの退避 ([`alc_dtako_upload::logs_archive::run`])。
+/// DB と R2 の経路は fetch と同じ。時刻は予定の時刻 (`event.schedule()`) を使う
+#[event(scheduled)]
+async fn scheduled(event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
+    let mut pg = match db::connect(&env).await {
+        Ok(c) => c,
+        Err(e) => {
+            console_error!("dtako: scheduled {e}");
+            return;
+        }
+    };
+    let Ok(bucket) = env.bucket(DTAKO_R2_BINDING) else {
+        console_error!("dtako: scheduled no {DTAKO_R2_BINDING} binding");
+        return;
+    };
+    let Some(now) = chrono::DateTime::from_timestamp_millis(event.schedule() as i64) else {
+        console_error!("dtako: scheduled no time");
+        return;
+    };
+    let store = R2Store::new(bucket);
+    let log = log_sink();
+    if let Some(summary) = logs_archive::run(&mut pg, &store, &log, now).await {
+        console_log!("dtako: {}", summary.line());
+    }
 }

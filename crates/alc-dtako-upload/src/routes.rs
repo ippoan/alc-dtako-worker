@@ -138,6 +138,7 @@ pub fn tenant_router_with(limits: IngestLimits) -> Router<DtakoState> {
         .merge(crate::ytime::router())
         .merge(crate::restraint::router())
         .merge(crate::tickets::router())
+        .merge(crate::logs_archive::router())
 }
 
 type ApiError = (StatusCode, Json<Value>);

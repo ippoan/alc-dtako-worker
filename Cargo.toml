@@ -40,6 +40,8 @@ alc-core-wasm = { workspace = true }
 alc-dtako-upload = { path = "crates/alc-dtako-upload" }
 alc-worker-db = { workspace = true }
 axum = { version = "0.8", default-features = false }
+# 定時実行の予定の時刻 (ms) を退避の境目の日付にする (`scheduled`)。alc-dtako-upload と同じ版
+chrono = { version = "0.4", default-features = false }
 # state に持たせる `PgClient` の async の Mutex と、R2 の future を返す `BoxFuture`
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 tokio-postgres = { version = "0.7", default-features = false, features = ["js"] }

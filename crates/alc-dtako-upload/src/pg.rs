@@ -1757,6 +1757,126 @@ pub async fn unsplit_operations(
     .await
 }
 
+// ---- 車両の現在地のログの退避と書き戻し (`crate::logs_archive`) ----
+// テナントを列挙し、テナントごとの transaction (RLS の tenant_isolation) で dtakologs を読み消しする。
+
+/// 退避の対象の (テナント, 日付) 1 つ ([`sql::ARCHIVE_OLD_DATES`])。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArchiveDate {
+    pub tenant_id: Uuid,
+    /// `YYYY-MM-DD`
+    pub date: String,
+    pub row_count: i64,
+}
+
+impl TxOutput for ArchiveDate {}
+
+/// [`sql::LIST_TENANT_IDS`] → テナントごとに [`sql::ARCHIVE_OLD_DATES`]。`cutoff` より前の日の (テナント, 日付) と行数
+/// (テナント・日付の順)。テナントの列挙は nil の transaction、日付はテナントごとの transaction。
+pub async fn archive_old_dates(
+    pg: &mut PgClient,
+    cutoff: String,
+) -> Result<Vec<ArchiveDate>, tokio_postgres::Error> {
+    let tenants: Vec<Uuid> = pg
+        .tenant_tx(Uuid::nil(), move |tx| {
+            Box::pin(async move {
+                let rows = tx.query_typed(sql::LIST_TENANT_IDS, &[]).await?;
+                Ok(rows.into_iter().map(|r| r.get(0)).collect())
+            })
+        })
+        .await?;
+    let mut out = Vec::new();
+    for tenant_id in tenants {
+        let cutoff = cutoff.clone();
+        let dates: Vec<ArchiveDate> = pg
+            .tenant_tx(tenant_id, move |tx| {
+                Box::pin(async move {
+                    let params: [Param; 2] = [(&tenant_id, Type::UUID), (&cutoff, Type::TEXT)];
+                    let rows = tx.query_typed(sql::ARCHIVE_OLD_DATES, &params).await?;
+                    let date = |r: tokio_postgres::Row| ArchiveDate {
+                        tenant_id,
+                        date: r.get(0),
+                        row_count: r.get(1),
+                    };
+                    Ok(rows.into_iter().map(date).collect())
+                })
+            })
+            .await?;
+        out.extend(dates);
+    }
+    Ok(out)
+}
+
+/// (テナント, 日付) の行の JSON (時刻の順)。`serde_json::Value` は `TxOutput` を持たないので包む。
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ArchiveRows(pub Vec<serde_json::Value>);
+
+impl TxOutput for ArchiveRows {}
+
+/// [`sql::ARCHIVE_FETCH_ROWS`]。テナントの 1 日の行を `batch` 件ずつ読み切る (そのテナントの 1 つの transaction)。
+pub async fn archive_rows(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+    date: String,
+    batch: i64,
+) -> Result<ArchiveRows, tokio_postgres::Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            let mut out = Vec::new();
+            loop {
+                let offset = out.len() as i64;
+                let params: [Param; 4] = [
+                    (&tenant_id, Type::UUID),
+                    (&date, Type::TEXT),
+                    (&batch, Type::INT8),
+                    (&offset, Type::INT8),
+                ];
+                let rows = tx.query_typed(sql::ARCHIVE_FETCH_ROWS, &params).await?;
+                let n = rows.len() as i64;
+                out.extend(rows.into_iter().map(|r| r.get::<_, serde_json::Value>(0)));
+                if n < batch {
+                    return Ok(ArchiveRows(out));
+                }
+            }
+        })
+    })
+    .await
+}
+
+/// [`sql::ARCHIVE_DELETE_DATE`]。テナントの 1 日の行を消し、消した行数を返す。
+pub async fn archive_delete_date(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+    date: String,
+) -> Result<u64, tokio_postgres::Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            let params: [Param; 2] = [(&tenant_id, Type::UUID), (&date, Type::TEXT)];
+            tx.execute_typed(sql::ARCHIVE_DELETE_DATE, &params).await
+        })
+    })
+    .await
+}
+
+/// [`sql::ARCHIVE_UPSERT_BATCH`]。`batches` (行の JSON の配列) を、書き戻すテナントの 1 つの transaction で順に流す
+/// (途中で落ちたら 1 行も書かない)。
+pub async fn archive_restore(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+    batches: Vec<serde_json::Value>,
+) -> Result<(), tokio_postgres::Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            for batch in &batches {
+                tx.execute_typed(sql::ARCHIVE_UPSERT_BATCH, &[(batch, Type::JSONB)])
+                    .await?;
+            }
+            Ok(())
+        })
+    })
+    .await
+}
+
 // ---- 画面向けの読み取りと分類の更新 (W5c-1、Refs ippoan/rust-alc-api#680) ----
 // 行の型は応答の JSON の形を兼ねる (欄の名前と並びは rust-alc-api の同名の型と同じ)。
 

@@ -39,6 +39,12 @@ enabled = true
 [limits]
 cpu_ms = 300000
 
+# 定時実行: 車両の現在地のログの退避 (src/lib.rs の scheduled → crates/alc-dtako-upload の logs_archive。rust-alc-api の
+# archive Job を移したもの、W9)。毎日 UTC 18:00 (日本時間 3:00)、本番だけ。triggers は env に継承されるので、
+# env.staging / env.local では crons = [] で止める (scripts/check-exposure.sh が検査する)
+[triggers]
+crons = ["0 18 * * *"]
+
 # 本番の DB: Cloudflare Hyperdrive の binding DTAKO_HYPERDRIVE (src/db.rs。Refs ippoan/rust-alc-api#723)。
 # 設定は実行用ロールのもの 1 つを複数の worker で共有する (worker ごとに作らない。id は ippoan/alc-vein-worker と同じ)。
 # 接続先・資格情報・TLS (証明書の検証) は設定の側に在り、ここに書くのは設定の ID だけ。
@@ -87,6 +93,10 @@ remote = true
 binding = "DTAKO_R2"
 bucket_name = "ohishi-dtako-staging"
 
+# 退避は本番だけ (トップレベルの triggers を継承させない。staging の bucket の目録を staging の DB で書き換えない)
+[env.staging.triggers]
+crons = []
+
 # ローカル (`wrangler dev --env local`) 専用。deploy しない。
 # binding を持たない (binding は env に継承されない) ので、src/db.rs は文字列 DATABASE_URL の段で繋ぐ。
 # --env なしの `wrangler dev` は、トップレベルの DTAKO_HYPERDRIVE の段に入り、ローカルの DATABASE_URL の段へは進まない
@@ -94,3 +104,7 @@ bucket_name = "ohishi-dtako-staging"
 name = "alc-dtako-local"
 workers_dev = false
 preview_urls = false
+
+# 退避は本番だけ (トップレベルの triggers を継承させない)
+[env.local.triggers]
+crons = []

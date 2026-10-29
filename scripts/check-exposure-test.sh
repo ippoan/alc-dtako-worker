@@ -60,5 +60,9 @@ mutate "staging の r2_buckets が本番の bucket ohishi-dtako-apac を指す" 
   's = s.replace("bucket_name = \"ohishi-dtako-staging\"", "bucket_name = \"ohishi-dtako-apac\"", 1)'
 mutate "staging の r2_buckets が旧の本番の bucket ohishi-dtako を指す" \
   's = s.replace("bucket_name = \"ohishi-dtako-staging\"", "bucket_name = \"ohishi-dtako\"", 1)'
+mutate "staging が本番の定時実行 (退避) を継承する" \
+  's = s.replace("[env.staging.triggers]\ncrons = []\n", "", 1)'
+mutate "local が本番の定時実行 (退避) を継承する" \
+  's = s.replace("[env.local.triggers]\ncrons = []\n", "", 1)'
 
 exit "$fail"

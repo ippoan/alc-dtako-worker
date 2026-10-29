@@ -1757,6 +1757,114 @@ pub async fn unsplit_operations(
     .await
 }
 
+// ---- 車両の現在地のログの退避と書き戻し (`crate::logs_archive`。migration 084 の関数だけを流す) ----
+// 退避は特定のテナントに属さない定時実行なので、transaction のテナントは nil (関数が中で archive_mode を立てる)。
+
+/// 退避の対象の (テナント, 日付) 1 つ ([`sql::ARCHIVE_LIST_OLD_DATES`])。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArchiveDate {
+    pub tenant_id: String,
+    /// `YYYY-MM-DD`
+    pub date: String,
+    pub row_count: i64,
+}
+
+impl TxOutput for ArchiveDate {}
+
+/// [`sql::ARCHIVE_LIST_OLD_DATES`]。`cutoff` より前の日の (テナント, 日付) と行数 (日付の順)。
+pub async fn archive_old_dates(
+    pg: &mut PgClient,
+    cutoff: String,
+) -> Result<Vec<ArchiveDate>, tokio_postgres::Error> {
+    pg.tenant_tx(Uuid::nil(), move |tx| {
+        Box::pin(async move {
+            let rows = tx
+                .query_typed(sql::ARCHIVE_LIST_OLD_DATES, &[(&cutoff, Type::TEXT)])
+                .await?;
+            let date = |r: tokio_postgres::Row| ArchiveDate {
+                tenant_id: r.get(0),
+                date: r.get(1),
+                row_count: r.get(2),
+            };
+            Ok(rows.into_iter().map(date).collect())
+        })
+    })
+    .await
+}
+
+/// (テナント, 日付) の行の JSON (時刻の順)。`serde_json::Value` は `TxOutput` を持たないので包む。
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ArchiveRows(pub Vec<serde_json::Value>);
+
+impl TxOutput for ArchiveRows {}
+
+/// [`sql::ARCHIVE_FETCH_ROWS`]。(テナント, 日付) の行を `batch` 件ずつ読み切る (1 つの transaction)。
+pub async fn archive_rows(
+    pg: &mut PgClient,
+    tenant_id: String,
+    date: String,
+    batch: i64,
+) -> Result<ArchiveRows, tokio_postgres::Error> {
+    pg.tenant_tx(Uuid::nil(), move |tx| {
+        Box::pin(async move {
+            let mut out = Vec::new();
+            loop {
+                let offset = out.len() as i64;
+                let params: [Param; 4] = [
+                    (&tenant_id, Type::TEXT),
+                    (&date, Type::TEXT),
+                    (&batch, Type::INT8),
+                    (&offset, Type::INT8),
+                ];
+                let rows = tx.query_typed(sql::ARCHIVE_FETCH_ROWS, &params).await?;
+                let n = rows.len() as i64;
+                out.extend(rows.into_iter().map(|r| r.get::<_, serde_json::Value>(0)));
+                if n < batch {
+                    return Ok(ArchiveRows(out));
+                }
+            }
+        })
+    })
+    .await
+}
+
+/// [`sql::ARCHIVE_DELETE_DATE`]。(テナント, 日付) の行を消し、消した行数を返す。
+pub async fn archive_delete_date(
+    pg: &mut PgClient,
+    tenant_id: String,
+    date: String,
+) -> Result<i64, tokio_postgres::Error> {
+    pg.tenant_tx(Uuid::nil(), move |tx| {
+        Box::pin(async move {
+            let params: [Param; 2] = [(&tenant_id, Type::TEXT), (&date, Type::TEXT)];
+            let row = tx
+                .query_typed_one(sql::ARCHIVE_DELETE_DATE, &params)
+                .await?;
+            Ok(row.get(0))
+        })
+    })
+    .await
+}
+
+/// [`sql::ARCHIVE_UPSERT_BATCH`]。`batches` (行の JSON の配列) を 1 つの transaction で順に流す
+/// (途中で落ちたら 1 行も書かない)。transaction のテナントは書き戻すテナント。
+pub async fn archive_restore(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+    batches: Vec<serde_json::Value>,
+) -> Result<(), tokio_postgres::Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            for batch in &batches {
+                tx.query_typed(sql::ARCHIVE_UPSERT_BATCH, &[(batch, Type::JSONB)])
+                    .await?;
+            }
+            Ok(())
+        })
+    })
+    .await
+}
+
 // ---- 画面向けの読み取りと分類の更新 (W5c-1、Refs ippoan/rust-alc-api#680) ----
 // 行の型は応答の JSON の形を兼ねる (欄の名前と並びは rust-alc-api の同名の型と同じ)。
 

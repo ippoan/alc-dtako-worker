@@ -856,4 +856,24 @@ pub mod sql {
     /// close_token で閉じる。$1 close_token / $2 閉じた人 (NULL 可) → 閉じた起票の id (無い・閉じ済みなら NULL)。
     /// SECURITY DEFINER の関数 (migration 115) が token からテナントを逆引きする (呼び手のテナントでは絞らない。rust-alc-api と同じ)。
     pub const CLOSE_TICKET_BY_TOKEN: &str = "SELECT alc_api.close_dtako_ticket_by_token($1, $2)";
+
+    // ---- 車両の現在地のログ (dtakologs) の退避 (定時実行) と書き戻し (内部の口)。`crate::logs_archive` ----
+    // どれも migration 084 の SECURITY DEFINER の関数 (中で `alc_api.archive_mode` を立て、テナントをまたいで読み書きする)。
+    // 表を直に触る文は書かない。関数の EXECUTE は alc_api_app と alc_api_rt だけ (migration 192)。
+
+    /// 指定の日 (UTC の日付の文字列) より前の (テナント, 日付) ごとの行数 (日付の順)。$1 cutoff (TEXT, `YYYY-MM-DD`) →
+    /// tenant_id (TEXT), date_str (TEXT), row_count (BIGINT)。
+    pub const ARCHIVE_LIST_OLD_DATES: &str =
+        "SELECT tenant_id, date_str, row_count FROM alc_api.archive_list_old_dtako_dates($1)";
+
+    /// (テナント, 日付) の行を 1 行 1 つの JSON で (時刻の順)。$1 tenant_id (TEXT) / $2 date (TEXT) / $3 limit / $4 offset → row_json (JSONB)。
+    pub const ARCHIVE_FETCH_ROWS: &str =
+        "SELECT row_json FROM alc_api.archive_fetch_dtako_rows_json($1, $2, $3, $4)";
+
+    /// (テナント, 日付) の行を消す。$1 tenant_id (TEXT) / $2 date (TEXT) → 消した行数 (BIGINT)。
+    pub const ARCHIVE_DELETE_DATE: &str = "SELECT alc_api.archive_delete_dtako_date($1, $2)";
+
+    /// 行の JSON の配列を upsert する (tenant_id は各行の JSON から入る。RLS を通らないので、呼び手が揃っていることを確かめる)。
+    /// $1 行の配列 (JSONB) → なし。
+    pub const ARCHIVE_UPSERT_BATCH: &str = "SELECT alc_api.archive_upsert_dtako_batch($1)";
 }

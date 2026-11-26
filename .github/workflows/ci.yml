@@ -76,7 +76,7 @@ jobs:
           awk '/Running.*tests\/upload_flow\.rs \(/{f=1} f && /^test result:/{print; exit}' "$RUNNER_TEMP/alc-dtako-upload-test.txt" \
             | grep -Eq '^test result: ok\. 22 passed; 0 failed; 0 ignored'
           awk '/Running.*tests\/machine_flow\.rs \(/{f=1} f && /^test result:/{print; exit}' "$RUNNER_TEMP/alc-dtako-upload-test.txt" \
-            | grep -Eq '^test result: ok\. 8 passed; 0 failed; 0 ignored'
+            | grep -Eq '^test result: ok\. 9 passed; 0 failed; 0 ignored'
           awk '/Running.*tests\/events_flow\.rs \(/{f=1} f && /^test result:/{print; exit}' "$RUNNER_TEMP/alc-dtako-upload-test.txt" \
             | grep -Eq '^test result: ok\. 6 passed; 0 failed; 0 ignored'
           awk '/Running.*tests\/screen_flow\.rs \(/{f=1} f && /^test result:/{print; exit}' "$RUNNER_TEMP/alc-dtako-upload-test.txt" \

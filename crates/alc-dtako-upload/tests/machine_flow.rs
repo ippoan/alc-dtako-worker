@@ -1,4 +1,5 @@
-//! 機械の取り込みの口 (`POST /dtako-logs/bulk`・`POST /dvr/notifications`・`POST /dvr/files/{id}`、W5a) を、
+//! 機械の取り込みの口 (`POST /dtako-logs/bulk`・`POST /dvr/notifications`・`POST /dvr/files/{id}`、W5a) と
+//! その読み返し (`GET /dvr/file`) を、
 //! 口から DB・保存先まで通して確かめる (native)。
 //!
 //! DB はテストの process の中で起こす組み込みの PostgreSQL (`embedded/mod.rs`)、保存先・待ち・ログは偽物 (`fakes/mod.rs`)。
@@ -106,6 +107,22 @@ impl Ctx {
         let status = res.status();
         let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await;
         (status, String::from_utf8(bytes.unwrap().to_vec()).unwrap())
+    }
+
+    /// GET して status と生のバイト列・content-type を返す。
+    async fn get(&self, tenant_id: Uuid, path: &str) -> (StatusCode, Vec<u8>, Option<String>) {
+        let req = Request::builder().method("GET").uri(path);
+        let res = self
+            .app(tenant_id)
+            .oneshot(req.body(Body::empty()).unwrap());
+        let res = res.await.unwrap();
+        let status = res.status();
+        let content_type = res
+            .headers()
+            .get("content-type")
+            .map(|v| v.to_str().unwrap().to_owned());
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await;
+        (status, bytes.unwrap().to_vec(), content_type)
     }
 
     async fn post_json(&self, tenant_id: Uuid, path: &str, body: &Value) -> (StatusCode, String) {
@@ -636,4 +653,69 @@ fn dvr_validation_matches_backend_rules() {
         }
         assert!(!validate(&over), "field {field}");
     }
+}
+
+/// 保存先の DVR の key を読んだ回数の合計。
+fn dvr_reads(ctx: &Ctx) -> u32 {
+    ctx.store
+        .get_calls_containing("/dvr/")
+        .iter()
+        .map(|(_, n)| n)
+        .sum()
+}
+
+/// 読み返し: 置いた `.vdf` をそのまま返す。key はヘッダーのテナントで作るので、別テナントからは同じ自然キーでも 404。
+/// 置いていない = 404、key の部品として使えない query = 400 (保存先を引かない)、保存先が読めない = 502 (本文は空)。
+#[tokio::test(flavor = "multi_thread")]
+async fn dvr_file_read_returns_the_stored_bytes() {
+    let ctx = Ctx::start().await;
+    let t = ctx.tenant("dvr-read").await;
+    let other = ctx.tenant("dvr-read-other").await;
+    let id = ctx.ingest(t, json!([dvr_item("SN-5", "r.vdf")])).await[0];
+    let (status, _) = ctx
+        .post(t, &format!("/dvr/files/{id}"), Body::from(vec![9u8; 300]))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let path = "/dvr/file?serial_no=SN-5&file_name=r.vdf";
+    let (status, bytes, content_type) = ctx.get(t, path).await;
+    assert_eq!(
+        (status, bytes, content_type.as_deref()),
+        (
+            StatusCode::OK,
+            vec![9u8; 300],
+            Some("application/octet-stream")
+        )
+    );
+
+    for (tenant_id, path) in [
+        (other, path),
+        (t, "/dvr/file?serial_no=SN-5&file_name=none.vdf"),
+    ] {
+        let (status, bytes, _) = ctx.get(tenant_id, path).await;
+        assert_eq!((status, bytes.is_empty()), (StatusCode::NOT_FOUND, true));
+    }
+
+    let reads_before = dvr_reads(&ctx);
+    for path in [
+        "/dvr/file?serial_no=SN-5",
+        "/dvr/file?serial_no=..&file_name=r.vdf",
+        "/dvr/file?serial_no=SN-5&file_name=a%2Fb.vdf",
+    ] {
+        let (status, _, _) = ctx.get(t, path).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{path}");
+    }
+    assert_eq!(dvr_reads(&ctx), reads_before);
+
+    ctx.store.fail_gets_containing("/dvr/SN-5/r.vdf", 1);
+    let (status, bytes, _) = ctx.get(t, path).await;
+    assert_eq!((status, bytes.is_empty()), (StatusCode::BAD_GATEWAY, true));
+    assert_eq!(
+        ctx.last_log(),
+        (
+            LogLevel::Error,
+            "dvr file read failed: object store error (get)".to_owned()
+        )
+    );
+    ctx.finish().await;
 }

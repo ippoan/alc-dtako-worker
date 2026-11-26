@@ -20,6 +20,7 @@
 //! - `POST /dvr/notifications` (JSON `{items}`) → DVR の動画通知を起票し、実体を取りに行くべき行を返す ([`crate::dvr`])
 //! - `POST /dvr/files/{id}` (生のバイト列) → `.vdf` を保存先に置き、行を `stored` にする
 //!   (この 3 つは機械の取り込み。失敗の応答は rust-alc-api と同じく status だけで本文は空)
+//! - `GET /dvr/file?serial_no=&file_name=` → 保存先に置いた `.vdf` をそのまま返す (無ければ 404。失敗の応答は本文が空)
 //! - 画面向けの読み取りと分類の更新 (`/drivers`・`/vehicles`・`/work-times`・`/daily-hours/*`・`/operations/*`・
 //!   `/internal/operations`・`/dtako/operation-changes`・`/event-classifications/*`・`/scraper/history`・`/dtako-logs/*` の読み取り) は
 //!   [`crate::screen`] (W5c-1)
@@ -52,8 +53,8 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::dvr::{
-    r2_key, read_capped, validate, DvrFileStoredResponse, DvrIngestBody, DvrIngestResponse,
-    ReadError, ERROR_BODY_STREAM, ERROR_STORE, ERROR_TOO_LARGE, MAX_BATCH_ITEMS,
+    r2_key, read_capped, validate, DvrFileQuery, DvrFileStoredResponse, DvrIngestBody,
+    DvrIngestResponse, ReadError, ERROR_BODY_STREAM, ERROR_STORE, ERROR_TOO_LARGE, MAX_BATCH_ITEMS,
 };
 use crate::events::{collect_etags, collect_events, EtagsQuery, EventsError, EventsQuery};
 use crate::ingest::{ingest_upload, rerun_upload, IngestError, IngestLimits, IngestOutcome};
@@ -132,6 +133,7 @@ pub fn tenant_router_with(limits: IngestLimits) -> Router<DtakoState> {
             post(dvr_notifications).layer(DefaultBodyLimit::max(UPLOAD_BODY_LIMIT)),
         )
         .route("/dvr/files/{id}", post(dvr_file))
+        .route("/dvr/file", get(dvr_file_read))
         .route("/dtako/events", get(dtako_events))
         .route("/dtako/events/etags", get(dtako_events_etags))
         .merge(crate::screen::router())
@@ -779,6 +781,36 @@ async fn dvr_file(
         size,
         r2_key: key,
     }))
+}
+
+/// 保存先に置いた `.vdf` を返す。key は**ヘッダーのテナント**と query の自然キーから作る (別テナントの物は key が違うので
+/// 読めない)。行は引かない (置けた物だけが保存先に在る)。無い = 404、query の誤り = 400、保存先が読めない = 502。
+async fn dvr_file_read(
+    State(state): State<DtakoState>,
+    Extension(TenantId(tenant_id)): Extension<TenantId>,
+    query: Result<Query<DvrFileQuery>, QueryRejection>,
+) -> Result<Response, StatusCode> {
+    let Ok(Query(query)) = query else {
+        return Err(StatusCode::BAD_REQUEST);
+    };
+    if !query.is_valid() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let key = r2_key(tenant_id, &query.serial_no, &query.file_name);
+    match state.store.get(&key).await {
+        Ok(Some(bytes)) => {
+            let headers = [
+                (CONTENT_TYPE, "application/octet-stream"),
+                (CACHE_CONTROL, "no-store"),
+            ];
+            Ok((headers, bytes).into_response())
+        }
+        Ok(None) => Err(StatusCode::NOT_FOUND),
+        Err(e) => {
+            (state.log)(LogLevel::Error, &format!("dvr file read failed: {e}"));
+            Err(StatusCode::BAD_GATEWAY)
+        }
+    }
 }
 
 // ---- 勤怠向けの読み取り (W5b、Refs ippoan/rust-alc-api#680) ----

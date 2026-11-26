@@ -6,7 +6,7 @@ ippoan/alc-vein-worker に合わせている。
 
 口は 16 本 (どれも `/api` 付きでも受ける): **`POST /upload`** (zip の取り込み)・**`POST /internal/rerun/{upload_id}`** (やり直し)・**`POST /split-csv/{upload_id}`** (アップロード 1 件の分割)・
 **`POST /split-csv-all`** (一括分割)・**`POST /recalculate`** (月の全員の再計算)・**`POST /recalculate-driver`** (乗務員 1 人の再計算)・
-**`POST /recalculate-drivers`** (乗務員の一括の再計算)・**`POST /recalculate-pending`** (日別の要再計算の印の付いた 乗務員 × 月 の再計算) と、履歴の読み取りの **`GET /uploads`**・**`GET /internal/pending`**・**`GET /internal/download/{upload_id}`**、機械の取り込みの **`POST /dtako-logs/bulk`**・**`POST /dvr/notifications`**・**`POST /dvr/files/{id}`** (W5a。下の「機械の取り込み」)、勤怠向けの読み取りの **`GET /dtako/events`**・**`GET /dtako/events/etags`** (W5b。下の「勤怠向けの読み取り」)。それ以外の path は、
+**`POST /recalculate-drivers`** (乗務員の一括の再計算)・**`POST /recalculate-pending`** (日別の要再計算の印の付いた 乗務員 × 月 の再計算) と、履歴の読み取りの **`GET /uploads`**・**`GET /internal/pending`**・**`GET /internal/download/{upload_id}`**、機械の取り込みの **`POST /dtako-logs/bulk`**・**`POST /dvr/notifications`**・**`POST /dvr/files/{id}`** (W5a。下の「機械の取り込み」) とその読み返しの **`GET /dvr/file`**、勤怠向けの読み取りの **`GET /dtako/events`**・**`GET /dtako/events/etags`** (W5b。下の「勤怠向けの読み取り」)。それ以外の path は、
 tenant ヘッダー無しが 401・有りが 404 (どのリクエストも、その前に DB へ繋ぐので、繋げなければ 503 / 500)。
 アップロード (`/upload`)・分割の 2 口・やり直しの口・履歴の読み取りの 3 口・印の再計算の口 (`/api/recalculate-pending`。ippoan/auth-worker#617) は、
 auth-worker の振り分けから呼ばれる。再計算の 3 口は、まだ振り分けに無い (呼ばれない)。
@@ -576,6 +576,7 @@ rust-alc-api から移した 3 口 (Refs ippoan/rust-alc-api#680)。**入力・�
 | `POST /dtako-logs/bulk` | nuxt-dtako-admin の dtako-scraper-relay (RPC `forwardAlcTenantData`) | 車両の現在地のログ (PascalCase の JSON の配列) を `dtakologs` に upsert。500 行ずつ、全部を 1 つの transaction で。空の配列は 0 件で返す。応答 `{success, records_added, total_records, message}` |
 | `POST /dvr/notifications` | 同 relay (内部用 proxy、shared-secret) | DVR の動画通知 (`{items}`、1〜200 件) を `dvr_notifications` に起票。検査に通らない行が 1 つでも在れば 400。応答 `{inserted, skipped, pending}` (`pending` = 実体をまだ取りに行くべき行) |
 | `POST /dvr/files/{id}` | 同上 | `.vdf` の生のバイト列 (32MB まで) を `{tenant_id}/dvr/{serial_no}/{file_name}` に置き、行を `stored` にする。`{id}` はヘッダーのテナントの行だけ (違えば 404)。大きすぎる = 413 (`failed`)・body が壊れた = 400・置けない = 502 (どれも試行回数を進め、固定の語を `last_error` に残す) |
+| `GET /dvr/file?serial_no=&file_name=` | 同上 | `POST /dvr/files/{id}` が置いた `.vdf` をそのまま返す (`application/octet-stream`)。key はヘッダーのテナントと query から作る (別テナントの物は読めない。行は引かない)。無い = 404・key の部品として使えない query = 400 (保存先を引かない)・保存先が読めない = 502 (本文は空)。relay の DVR 動画ビューアが theearth から取り直す前に見る |
 
 ## 勤怠向けの読み取り (W5b)
 

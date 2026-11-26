@@ -6,6 +6,9 @@
 //! 1. `POST /dvr/notifications` — 一覧をバッチで起票する。応答の `pending` (新規 + まだ取りに行く価値のある既存行) を relay が回り、
 //! 2. `POST /dvr/files/{id}` — `.vdf` の生バイトを送る。ここで保存先 (R2) に置く。
 //!
+//! 置いた `.vdf` は `GET /dvr/file?serial_no=&file_name=` で読み返せる (relay の DVR 動画ビューアが、theearth から
+//! 取り直す前にまずここを見る。ohishi-exp/nuxt-dtako-admin の DVR 動画ビューアが遅い件)。
+//!
 //! どちらも auth-worker の内部用 proxy (shared-secret のクラス) から届く = **呼び手がテナントを名乗る**ので、行を引く文は
 //! RLS 任せにせず `tenant_id` も明示する (SQL は `repo::sql`)。**値の上限・検査・key の形・応答の形は rust-alc-api の
 //! `alc_dtako::dvr_notifications` と同じ**。通知 (LINE WORKS) はここでは出さない (relay が出す)。
@@ -87,6 +90,21 @@ pub struct DvrFileStoredResponse {
     pub file_status: &'static str,
     pub size: i64,
     pub r2_key: String,
+}
+
+/// `GET /dvr/file` の query (theearth の一覧の 1 行を指す自然キー)。
+#[derive(Debug, Deserialize)]
+pub struct DvrFileQuery {
+    pub serial_no: String,
+    pub file_name: String,
+}
+
+impl DvrFileQuery {
+    /// 保存先の key の部品として使えるか (起票の検査と同じ規則・同じ上限)。
+    pub fn is_valid(&self) -> bool {
+        valid_key_component(&self.serial_no, MAX_SERIAL_NO_LEN)
+            && valid_key_component(&self.file_name, MAX_FILE_NAME_LEN)
+    }
 }
 
 /// 保存先の key の部品として安全か (英数字と `-` `_` `.` だけ、`..` を含まない)。

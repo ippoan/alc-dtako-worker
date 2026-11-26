@@ -4,7 +4,7 @@
 //! - `GET /work-times`・`GET /daily-hours` → 日別のセグメント・労働時間のページ (`GET /daily-hours/{driver_id}/{date}/segments` で 1 日ぶん)
 //! - `GET /operations`・`GET /internal/operations` (同じ口) → 運行の一覧のページ。`GET /operations/calendar` → 読取日ごとの件数
 //! - `GET /operations/{unko_no}` → 運行の行 (crew_role ごと)。`DELETE /operations/{unko_no}` → 消して変更記録 (`manual_delete`) に残す
-//! - `GET /operations/{unko_no}/csv/{csv_type}` → 保存先の CSV を `{headers, rows}` にして返す
+//! - `GET /operations/{unko_no}/csv/{csv_type}`・`GET /internal/operations/{unko_no}/csv/{csv_type}` (同じ口) → 保存先の CSV を `{headers, rows}` にして返す
 //! - `GET /dtako/operation-changes` → 乗務員の運行の変更記録 (期間は運行の日付で絞る)
 //! - `GET /event-classifications`・`PUT /event-classifications/{id}` → イベントの分類の一覧と更新
 //! - `GET /scraper/history`・`POST /scraper/history` → スクレイプの履歴の一覧と記録
@@ -64,6 +64,10 @@ pub fn router() -> Router<DtakoState> {
             get(operation).delete(delete_operation),
         )
         .route("/operations/{unko_no}/csv/{csv_type}", get(operation_csv))
+        .route(
+            "/internal/operations/{unko_no}/csv/{csv_type}",
+            get(operation_csv),
+        )
         .route("/dtako/operation-changes", get(operation_changes))
         .route("/event-classifications", get(event_classifications))
         .route(

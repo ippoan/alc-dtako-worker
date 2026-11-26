@@ -544,6 +544,45 @@ async fn operation_csv_reads_store_as_json() {
     ctx.finish().await;
 }
 
+/// 内部用の別名 (`/internal/operations/{unko_no}/csv/{csv_type}`) は画面用の口と同じ応答を返し、別のテナントの運行は 404。
+#[tokio::test(flavor = "multi_thread")]
+async fn internal_operation_csv_matches_screen_route() {
+    let ctx = Ctx::start().await;
+    let t = ctx.tenant("screen-csv-internal").await;
+    let other = ctx.tenant("screen-csv-internal-other").await;
+    ctx.exec(
+        t,
+        &op_sql("U1", 1, "2026-03-01", None, None, None, Some("p/U1")),
+    )
+    .await;
+    ctx.store.seed(
+        "p/U1/KUDGSIR.csv",
+        "運行NO,料金所\r\nU1,A\r\nU1,B\r\n".as_bytes().to_vec(),
+        "text/csv",
+    );
+
+    let screen = ctx.get(t, "/operations/U1/csv/kudgsir").await;
+    let internal = ctx.get(t, "/internal/operations/U1/csv/kudgsir").await;
+    assert_eq!(screen.0, StatusCode::OK);
+    assert_eq!(internal, screen);
+    assert_eq!(
+        ctx.get_json(t, "/internal/operations/U1/csv/tolls").await,
+        json!({ "headers": ["運行NO", "料金所"], "rows": [["U1", "A"], ["U1", "B"]] })
+    );
+    // 別のテナントからは、運行の接頭辞も既定の key も自分の下にしか向かない
+    assert_eq!(
+        ctx.get(other, "/internal/operations/U1/csv/kudgsir")
+            .await
+            .0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        ctx.get(t, "/internal/operations/U1/csv/zip").await.0,
+        StatusCode::BAD_REQUEST
+    );
+    ctx.finish().await;
+}
+
 /// 変更記録: 乗務員CD (列・before・after のどれか) で引き、期間は運行の日付 (運行NO の先頭 6 桁、読めなければ出発日)。
 #[tokio::test(flavor = "multi_thread")]
 async fn operation_changes_filter_by_operation_date() {

@@ -22,7 +22,7 @@
 //!   (この 3 つは機械の取り込み。失敗の応答は rust-alc-api と同じく status だけで本文は空)
 //! - `GET /dvr/file?serial_no=&file_name=` → 保存先に置いた `.vdf` をそのまま返す (無ければ 404。失敗の応答は本文が空)
 //! - 画面向けの読み取りと分類の更新 (`/drivers`・`/vehicles`・`/work-times`・`/daily-hours/*`・`/operations/*`・
-//!   `/internal/operations`・`/dtako/operation-changes`・`/event-classifications/*`・`/scraper/history`・`/dtako-logs/*` の読み取り) は
+//!   `/internal/operations/*`・`/dtako/operation-changes`・`/event-classifications/*`・`/scraper/history`・`/dtako-logs/*` の読み取り) は
 //!   [`crate::screen`] (W5c-1)
 //! - Y時間 export (`GET /dtako/y-time-export`・`POST /dtako/y-time-rows`) は [`crate::ytime`] (W5c-2)
 //! - 拘束時間の帳票 (`GET /restraint-report`・`POST /restraint-report/compare-csv`) とその PDF は [`crate::restraint`] (W5c-3・W5c-4)

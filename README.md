@@ -4,7 +4,7 @@
 rust-alc-api を Cloudflare Workers へ段階移行する 2 本目 (Refs ippoan/rust-alc-api#725) で、型は 1 本目の
 ippoan/alc-vein-worker に合わせている。
 
-口は 16 本 (どれも `/api` 付きでも受ける): **`POST /upload`** (zip の取り込み)・**`POST /internal/rerun/{upload_id}`** (やり直し)・**`POST /split-csv/{upload_id}`** (アップロード 1 件の分割)・
+口は 50 本 (どれも `/api` 付きでも受ける。下の一覧のほかは「画面向けの読み取り」以降の節): **`POST /upload`** (zip の取り込み)・**`POST /internal/rerun/{upload_id}`** (やり直し)・**`POST /split-csv/{upload_id}`** (アップロード 1 件の分割)・
 **`POST /split-csv-all`** (一括分割)・**`POST /recalculate`** (月の全員の再計算)・**`POST /recalculate-driver`** (乗務員 1 人の再計算)・
 **`POST /recalculate-drivers`** (乗務員の一括の再計算)・**`POST /recalculate-pending`** (日別の要再計算の印の付いた 乗務員 × 月 の再計算) と、履歴の読み取りの **`GET /uploads`**・**`GET /internal/pending`**・**`GET /internal/download/{upload_id}`**、機械の取り込みの **`POST /dtako-logs/bulk`**・**`POST /dvr/notifications`**・**`POST /dvr/files/{id}`** (W5a。下の「機械の取り込み」) とその読み返しの **`GET /dvr/file`**、勤怠向けの読み取りの **`GET /dtako/events`**・**`GET /dtako/events/etags`** (W5b。下の「勤怠向けの読み取り」)。それ以外の path は、
 tenant ヘッダー無しが 401・有りが 404 (どのリクエストも、その前に DB へ繋ぐので、繋げなければ 503 / 500)。
@@ -593,7 +593,7 @@ rust-alc-api から移した 2 口 (Refs ippoan/rust-alc-api#680)。呼び手は
 
 ## 画面向けの読み取りと分類の更新 (W5c-1)
 
-rust-alc-api から移した 20 口 (Refs ippoan/rust-alc-api#680)。呼び手は nuxt-dtako-admin などの画面 (auth-worker の画面用の proxy) と RPC。
+rust-alc-api から移した 20 口に、内部用の別名 1 口を足した 21 口 (Refs ippoan/rust-alc-api#680)。呼び手は nuxt-dtako-admin などの画面 (auth-worker の画面用の proxy) と RPC。`/internal/operations`・`/internal/operations/{unko_no}/csv/{csv_type}` は画面用の口と同じ handler で、auth-worker の内部用の proxy (dtako-scraper-relay など) から呼ばれる (Refs ohishi-exp/nuxt-dtako-admin#1287)。
 **応答の形・既定値・上限・並び・失敗の status は rust-alc-api の同じ口 (`alc_dtako::dtako_*`) と同じ**。実装は `crates/alc-dtako-upload/src/screen.rs`。
 
 | 口 | 中身 |
@@ -604,7 +604,7 @@ rust-alc-api から移した 20 口 (Refs ippoan/rust-alc-api#680)。呼び手�
 | `GET /operations`・`GET /internal/operations` | 運行の一覧のページ (読取日の新しい順。`date_from`・`date_to`・`driver_cd`・`vehicle_cd`) |
 | `GET /operations/calendar?year=&month=` | 読取日ごとの運行の件数 (月が読めなければ 400) |
 | `GET /operations/{unko_no}`・`DELETE /operations/{unko_no}` | 運行の全欄 (crew_role の順。無ければ 404)・全 crew_role を消して、消す前の行を `manual_delete` で変更記録に残す (204 / 404) |
-| `GET /operations/{unko_no}/csv/{csv_type}` | 保存先の CSV (`kudguri`・`kudgivt`/`events`・`kudgfry`/`ferry`/`ferries`・`kudgsir`/`tolls`・`speed`/`sokudo`) を `{headers, rows}` に。種類が違えば 400、無い・読めないは 404 |
+| `GET /operations/{unko_no}/csv/{csv_type}`・`GET /internal/operations/{unko_no}/csv/{csv_type}` | 保存先の CSV (`kudguri`・`kudgivt`/`events`・`kudgfry`/`ferry`/`ferries`・`kudgsir`/`tolls`・`speed`/`sokudo`) を `{headers, rows}` に。種類が違えば 400、無い・読めないは 404 |
 | `GET /dtako/operation-changes?driver_cd=&from=&to=` | 乗務員の運行の変更記録 (期間は運行の日付で絞る)・記録を始めた時点 |
 | `GET /event-classifications`・`PUT /event-classifications/{id}` | イベントの分類の一覧と更新 (値が違えば 400 と文、無ければ 404 `Not found`) |
 | `GET /scraper/history`・`POST /scraper/history` | スクレイプの履歴の一覧 (新しい順、既定 50 件)・記録 (204) |
